@@ -79,7 +79,7 @@ const ENDPOINTS: Record<string, string> = {
   "dashboard.pricing": "/dashboard/pricing",
   "dashboard.subscription_success": "/dashboard/subscription_success",
   "dashboard.coupon_route": "/dashboard/coupon",
-  "dashboard.lifetime_licence": "/dashboard/lifetime-licence",
+  "dashboard.lifetime_licence": "/dashboard/lifetime_licence",
   "dashboard.referral_route": "/dashboard/referral",
   "dashboard.support_route": "/dashboard/support",
   "dashboard.app_route": "/dashboard/app",

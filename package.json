@@ -17,6 +17,7 @@
     "pretypecheck": "node scripts/build-templates.mjs"
   },
   "dependencies": {
+    "@noble/hashes": "^2.2.0",
     "bcryptjs": "^3.0.3",
     "hono": "^4.12.27",
     "otpauth": "^9.5.1",
