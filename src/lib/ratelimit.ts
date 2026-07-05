@@ -72,7 +72,7 @@ export function rateLimit(
     let subject: string;
     if (keyBy === "user") {
       subject = `user:${c.get("user").id}`;
-    } else if (keyBy === "default" && c.get("session")) {
+    } else if (keyBy === "default" && c.get("session")?.user_id != null) {
       subject = `user:${c.get("session")!.user_id}`;
     } else {
       subject = `ip:${clientIp(c.req.raw.headers)}`;

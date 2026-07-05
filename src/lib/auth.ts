@@ -49,7 +49,7 @@ async function authorizeRequest(
 
   if (!apiKey) {
     session = await getSession(c);
-    if (session && c.req.header(HEADER_ALLOW_API_COOKIES)) {
+    if (session?.user_id != null && c.req.header(HEADER_ALLOW_API_COOKIES)) {
       user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1")
         .bind(session.user_id)
         .first<UserRow>();

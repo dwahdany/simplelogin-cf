@@ -11,9 +11,16 @@ export const SESSION_COOKIE = "slapp";
 const SESSION_TTL_SECS = 7 * 24 * 3600; // Flask REMEMBER_COOKIE_DURATION = 7 days
 
 export interface SessionData {
-  user_id: number;
+  /** absent = anonymous session (pre-login flash messages / CSRF) */
+  user_id?: number;
   /** unix seconds when sudo mode was entered from the web dashboard */
   sudo_time?: number;
+  /** pending flash messages, consumed on next page render */
+  flashes?: Array<{ category: string; message: string }>;
+  /** per-session CSRF secret (flask-wtf session["csrf_token"] equivalent) */
+  csrf?: string;
+  /** interstitial state (MFA-in-progress user id, next URL, ...) */
+  extra?: Record<string, unknown>;
 }
 
 function randomToken(): string {
@@ -28,10 +35,11 @@ function randomToken(): string {
 export async function createSession<E extends { Bindings: Env }>(
   c: Context<E>,
   userId: number,
+  data: Omit<SessionData, "user_id"> = {},
 ): Promise<void> {
   const token = randomToken();
-  const data: SessionData = { user_id: userId };
-  await c.env.KV.put(`session:${token}`, JSON.stringify(data), {
+  const full: SessionData = { ...data, user_id: userId };
+  await c.env.KV.put(`session:${token}`, JSON.stringify(full), {
     expirationTtl: SESSION_TTL_SECS,
   });
   setCookie(c, SESSION_COOKIE, token, {
@@ -40,6 +48,32 @@ export async function createSession<E extends { Bindings: Env }>(
     secure: true,
     sameSite: "Lax",
     maxAge: SESSION_TTL_SECS,
+  });
+}
+
+/**
+ * Persist changes to the CURRENT session (same token). When no session
+ * cookie exists yet, an anonymous session is created — Flask equivalent:
+ * writing to `session` from a pre-login view (flashes, CSRF secret, MFA
+ * interstitial state).
+ */
+export async function saveSession<E extends { Bindings: Env }>(
+  c: Context<E>,
+  data: SessionData,
+): Promise<void> {
+  let token = getCookie(c, SESSION_COOKIE);
+  if (!token) {
+    token = randomToken();
+    setCookie(c, SESSION_COOKIE, token, {
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "Lax",
+      maxAge: SESSION_TTL_SECS,
+    });
+  }
+  await c.env.KV.put(`session:${token}`, JSON.stringify(data), {
+    expirationTtl: SESSION_TTL_SECS,
   });
 }
 
