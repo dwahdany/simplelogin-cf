@@ -13,6 +13,11 @@ const SESSION_TTL_SECS = 7 * 24 * 3600; // Flask REMEMBER_COOKIE_DURATION = 7 da
 export interface SessionData {
   /** absent = anonymous session (pre-login flash messages / CSRF) */
   user_id?: number;
+  /**
+   * users.alternative_id at login time; regenerated on password reset to
+   * kill other sessions, so the web user-loader compares it per request.
+   */
+  alternative_id?: string;
   /** unix seconds when sudo mode was entered from the web dashboard */
   sudo_time?: number;
   /** pending flash messages, consumed on next page render */
@@ -84,6 +89,30 @@ export async function getSession<E extends { Bindings: Env }>(
   if (!token) return null;
   const raw = await c.env.KV.get(`session:${token}`);
   return raw ? (JSON.parse(raw) as SessionData) : null;
+}
+
+/**
+ * Rotate the session token (Flask regenerates the session id on login) —
+ * deletes the old KV entry, stores `data` under a fresh token, sets the
+ * cookie. Existing session data the caller wants to keep must be passed in.
+ */
+export async function rotateSession<E extends { Bindings: Env }>(
+  c: Context<E>,
+  data: SessionData,
+): Promise<void> {
+  const old = getCookie(c, SESSION_COOKIE);
+  if (old) await c.env.KV.delete(`session:${old}`);
+  const token = randomToken();
+  await c.env.KV.put(`session:${token}`, JSON.stringify(data), {
+    expirationTtl: SESSION_TTL_SECS,
+  });
+  setCookie(c, SESSION_COOKIE, token, {
+    path: "/",
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax",
+    maxAge: SESSION_TTL_SECS,
+  });
 }
 
 export async function destroySession<E extends { Bindings: Env }>(

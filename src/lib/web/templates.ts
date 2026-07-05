@@ -35,6 +35,27 @@ env.addFilter("enumerate", (iterable: unknown[]) =>
   (iterable ?? []).map((item, i) => [i, item] as const),
 );
 env.addTest("none", (v: unknown) => v === null || v === undefined);
+// Jinja `tojson` — Nunjucks calls it `dump`; register an alias.
+env.addFilter("tojson", (v: unknown) => {
+  return markSafe(
+    JSON.stringify(v)
+      .replaceAll("<", "\\u003c")
+      .replaceAll(">", "\\u003e")
+      .replaceAll("&", "\\u0026"),
+  );
+});
+
+/** Duck-type of nunjucks' SafeString (the real class, so autoescape skips it). */
+export interface SafeStringLike {
+  val: string;
+  length: number;
+  toString(): string;
+}
+
+/** Mark pre-escaped HTML as safe for autoescaping (nunjucks SafeString). */
+export function markSafe(html: string): SafeStringLike {
+  return new (nunjucks as any).runtime.SafeString(html) as SafeStringLike;
+}
 
 /** Render a template by its path relative to cloudflare/templates/. */
 export function renderTemplate(

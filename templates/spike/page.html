@@ -1,0 +1,14 @@
+{% extends "default.html" %}
+{% from "_formhelpers.html" import render_field %}
+{% set active_page = "setting" %}
+{% block title %}Spike{% endblock %}
+{% block default_content %}
+  <div id="pagebody">
+    {{ render_field(form.email) }}
+    <span id="direct-label">{{ form.email.label.html }}</span><span id="direct-errors">{{ form.email.errors }}</span>
+    {{ form.email.render(class="form-control", placeholder="you@example.com") }}
+    {{ csrf_form.csrf_token }}
+    <span id="premium">{{ current_user.is_premium() }}</span>
+    <span id="args">{{ request.args.get("q", "none") }}</span>
+  </div>
+{% endblock %}
