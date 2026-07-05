@@ -9,7 +9,12 @@
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:templates": "node scripts/build-templates.mjs",
+    "build:assets": "node scripts/build-assets.mjs",
+    "pretest": "node scripts/build-templates.mjs",
+    "predeploy": "node scripts/build-templates.mjs && node scripts/build-assets.mjs",
+    "pretypecheck": "node scripts/build-templates.mjs"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
@@ -21,6 +26,8 @@
     "@biomejs/biome": "^2.5.2",
     "@cloudflare/vitest-pool-workers": "^0.18.0",
     "@cloudflare/workers-types": "^4.20260702.1",
+    "@types/nunjucks": "^3.2.6",
+    "nunjucks": "^3.2.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9",
     "wrangler": "^4.107.0"

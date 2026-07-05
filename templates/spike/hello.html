@@ -1,0 +1,12 @@
+{% extends "spike/base.html" %}
+{% block content %}
+  <h1>Hello {{ name }}</h1>
+  {% if user and user.is_premium() %}<span class="badge">Premium</span>{% endif %}
+  <ul>
+    {% for i, item in items | enumerate %}
+      <li data-i="{{ i }}">{{ item }}{% if item is none %} (none){% endif %}</li>
+    {% endfor %}
+  </ul>
+  <p>{{ created_at | dt }}</p>
+  <a href="{{ url_for('dashboard.index', page=2) }}">next</a>
+{% endblock %}
