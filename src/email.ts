@@ -85,6 +85,18 @@ const ALERT_SEND_EMAIL_CYCLE = "cycle";
 const ALERT_MAILBOX_IS_ALIAS = "mailbox_is_alias";
 const ALERT_TO_NOREPLY = "to_noreply";
 
+// SenderFormatEnum (app/models.py) — how Contact.new_addr() formats the From.
+const SENDER_FORMAT_AT = 0; // "John Wick - john at wick.com"
+const SENDER_FORMAT_A = 2; // "John Wick - john(a)wick.com"
+const SENDER_FORMAT_NAME_ONLY = 5; // "John Wick"
+const SENDER_FORMAT_AT_ONLY = 6; // "john at wick.com"
+const SENDER_FORMAT_NO_NAME = 7; // reply_email only
+
+// UnsubscribeBehaviourEnum (app/models.py).
+const UNSUB_DISABLE_ALIAS = 0;
+const UNSUB_BLOCK_CONTACT = 1;
+const UNSUB_PRESERVE_ORIGINAL = 2;
+
 type EmailEnv = Env & { VERP_EMAIL_SECRET?: string };
 
 interface HandleResult {
@@ -303,18 +315,21 @@ async function handleForwardPhase(
   );
   if (!contact) return rejectWith(E504);
 
-  // Reply-To contacts (kept for DB parity; the forwarded header itself
-  // cannot be rewritten on Cloudflare).
+  // Reply-To contacts (step 2.5): a reverse-alias contact is created for each
+  // Reply-To address; they are collected so the Reply-To header can be
+  // rewritten to their reverse aliases in forwardToMailbox (max 5).
+  const replyToContacts: ContactRow[] = [];
   const replyToHeader = getHeaderValue(message.headers, "Reply-To");
   if (replyToHeader) {
     for (const part of splitAddressList(replyToHeader)) {
       const parsed = parseOneAddress(part);
       if (!parsed || parsed.address === alias.email) continue;
       if (!isValidEmail(parsed.address)) continue;
-      await createContact(db, env, parsed.address, alias, user, {
+      const rtc = await createContact(db, env, parsed.address, alias, user, {
         name: parsed.name,
         allowEmptyEmail: false,
       });
+      if (rtc) replyToContacts.push(rtc);
     }
   }
 
@@ -335,6 +350,12 @@ async function handleForwardPhase(
     if (await shouldIgnoreBounce(db, mailFrom)) return accept(E207);
     return rejectWith(E516);
   }
+
+  // `message.raw` is single-use, but the forward phase rebuilds and sends one
+  // copy per mailbox. Buffer the raw bytes once here and hand a fresh header
+  // copy to each mailbox. Only needed on the SEND_EMAIL rebuild path; the
+  // message.forward() fallback (no binding) reads the message internally.
+  const buffered = env.SEND_EMAIL ? await readRawMessage(message) : null;
 
   const results: Delivery[] = [];
   for (const mailbox of mailboxes) {
@@ -368,6 +389,8 @@ async function handleForwardPhase(
         mailbox,
         user,
         mailFrom,
+        replyToContacts,
+        buffered,
       ),
     );
   }
@@ -377,6 +400,14 @@ async function handleForwardPhase(
   return rejectWith(results[0]?.status ?? E404);
 }
 
+/**
+ * forward_email_to_mailbox (email_handler.py §2.8). Rebuilds the message so the
+ * mailbox sees a reverse-alias From (and To/Cc/Reply-To rewritten to reverse
+ * aliases) and clicking Reply reaches the reverse alias, then sends it through
+ * the SEND_EMAIL binding with a VERP envelope sender. When the binding is not
+ * bound (local dev) it falls back to message.forward(), which cannot rewrite
+ * headers — see the fallback branch.
+ */
 async function forwardToMailbox(
   message: ForwardableEmailMessage,
   env: EmailEnv,
@@ -385,6 +416,8 @@ async function forwardToMailbox(
   mailbox: MailboxRow,
   user: UserRow,
   mailFrom: string,
+  replyToContacts: ContactRow[],
+  buffered: { headerLines: HeaderLine[]; body: Uint8Array } | null,
 ): Promise<Delivery> {
   const db = env.DB;
 
@@ -419,36 +452,359 @@ async function forwardToMailbox(
     messageId: messageId ?? null,
   });
 
-  // Recipient limit on To + Cc.
-  const toHeader = getHeaderValue(message.headers, "To") ?? "";
-  const ccHeader = getHeaderValue(message.headers, "Cc") ?? "";
+  // Recipient limit on the original To + Cc (step 13, before To/Cc rewriting).
+  const origToHeader = getHeaderValue(message.headers, "To") ?? "";
+  const origCcHeader = getHeaderValue(message.headers, "Cc") ?? "";
   const nbRcpt =
-    splitAddressList(toHeader).length + splitAddressList(ccHeader).length;
+    splitAddressList(origToHeader).length +
+    splitAddressList(origCcHeader).length;
   if (nbRcpt > MAX_EMAIL_FORWARD_RECIPIENTS)
     return { success: false, status: E526 };
 
-  const xHeaders = new Headers();
-  xHeaders.set("X-SimpleLogin-Type", "Forward");
-  xHeaders.set("X-SimpleLogin-EmailLog-ID", String(emailLog.id));
+  // Fallback for local dev without the SEND_EMAIL binding: forward as-is with
+  // the X-SimpleLogin-* headers. This CANNOT rewrite From/To/Cc, so Reply from
+  // the mailbox reaches the original sender — the binding path below is the
+  // faithful one.
+  if (!buffered) {
+    const xHeaders = new Headers();
+    xHeaders.set("X-SimpleLogin-Type", "Forward");
+    xHeaders.set("X-SimpleLogin-EmailLog-ID", String(emailLog.id));
+    if (user.include_header_email_header) {
+      xHeaders.set("X-SimpleLogin-Envelope-From", mailFrom);
+      xHeaders.set(
+        "X-SimpleLogin-Original-From",
+        formatAddr(contact.name, contact.website_email),
+      );
+    }
+    xHeaders.set("X-SimpleLogin-Envelope-To", alias.email);
+    try {
+      await message.forward(mailbox.email, xHeaders);
+    } catch (e) {
+      console.error(`cannot forward to ${mailbox.email}:`, e);
+      if (await shouldIgnoreBounce(db, mailFrom))
+        return { success: true, status: E207 };
+      await deleteEmailLogRow(db, emailLog.id);
+      return { success: false, status: E407 };
+    }
+    return { success: true, status: E200 };
+  }
+
+  // ---- rebuild the message (steps 5-18) ----
+  const hs = filterHeaders(buffered.headerLines, forwardKeptHeaders(user));
+  if (!getHeader(hs, "Content-Transfer-Encoding"))
+    hs.push({ name: "Content-Transfer-Encoding", value: "7bit" });
+
+  // Step 7: generic subject (header only; the explanatory body banner is
+  // skipped — this port does not rewrite MIME bodies, like the reply phase).
+  if (mailbox.generic_subject)
+    setHeader(hs, "Subject", mailbox.generic_subject);
+
+  // Step 5 (invalid_email banner) and step 8 (PGP) are body rewrites: skipped
+  // like the reply phase. Step 4 (SpamAssassin) is config-gated off.
+
+  // Step 9: X-SimpleLogin-* headers (added after the whitelist so they stay).
+  setHeader(hs, "X-SimpleLogin-Type", "Forward");
+  setHeader(hs, "X-SimpleLogin-EmailLog-ID", String(emailLog.id));
   if (user.include_header_email_header) {
-    xHeaders.set("X-SimpleLogin-Envelope-From", mailFrom);
-    xHeaders.set(
+    setHeader(hs, "X-SimpleLogin-Envelope-From", mailFrom);
+    setHeader(
+      hs,
       "X-SimpleLogin-Original-From",
-      formatAddr(contact.name, contact.website_email),
+      contact.name
+        ? `${contact.name} <${contact.website_email}>`
+        : contact.website_email,
     );
   }
-  xHeaders.set("X-SimpleLogin-Envelope-To", alias.email);
+  setHeader(hs, "X-SimpleLogin-Envelope-To", alias.email);
+  if (!getHeader(hs, "Date"))
+    setHeader(hs, "Date", formatDateRfc2822(new Date()));
 
+  // Step 10: thread-fix — restore original ids so the mailbox sees its thread.
+  await replaceSlMessageIdByOriginal(db, hs);
+
+  // Step 11: From becomes the contact's reverse-alias display address.
+  setHeader(hs, "From", contactNewAddr(contact, user));
+
+  // Step 12: Reply-To rewritten to the reply-to contacts' reverse aliases (max
+  // 5). Without reply-to contacts the whitelist already dropped Reply-To.
+  if (replyToContacts.length > 0) {
+    setHeader(
+      hs,
+      "Reply-To",
+      replyToContacts
+        .slice(0, 5)
+        .map((c) => contactNewAddr(c, user))
+        .join(", "),
+    );
+  }
+
+  // Step 14: rewrite To then Cc to reverse aliases (Cc first, matching Flask).
   try {
-    await message.forward(mailbox.email, xHeaders);
+    await replaceHeaderWhenForward(db, env, hs, alias, user, "Cc");
+    await replaceHeaderWhenForward(db, env, hs, alias, user, "To");
+  } catch (e) {
+    if (e instanceof CannotCreateContactForReverseAlias) {
+      await deleteEmailLogRow(db, emailLog.id);
+    }
+    throw e;
+  }
+
+  // Step 15: make sure the alias appears in To (BCC-delivered mail).
+  addAliasToHeaderIfNeeded(hs, alias);
+
+  // Step 16: List-Unsubscribe handling.
+  addUnsubscribeHeaders(env, alias, contact, user, hs);
+
+  // Step 17: DKIM signing is skipped — Cloudflare signs binding sends for the
+  // routed domain, so no add_dkim_signature equivalent is needed here.
+
+  // Step 18: send with a per-forward VERP envelope sender on the contact's
+  // reverse-alias domain.
+  const rawOut = serializeMessage(hs, buffered.body);
+  const verpFrom = await generateVerpEmail(
+    env,
+    VERP_TYPE_BOUNCE_FORWARD,
+    emailLog.id,
+    domainPart(contact.reply_email),
+  );
+  try {
+    await sendRawEmail(env, verpFrom, mailbox.email, rawOut);
   } catch (e) {
     console.error(`cannot forward to ${mailbox.email}:`, e);
-    await deleteEmailLogRow(db, emailLog.id);
     if (await shouldIgnoreBounce(db, mailFrom))
       return { success: true, status: E207 };
+    await deleteEmailLogRow(db, emailLog.id);
     return { success: false, status: E407 };
   }
   return { success: true, status: E200 };
+}
+
+/** Header whitelist for the forward phase (email_handler.py §2.8 step 6). */
+function forwardKeptHeaders(user: UserRow): string[] {
+  const kept = [
+    "from",
+    "to",
+    "cc",
+    "subject",
+    "date",
+    "message-id",
+    "references",
+    "in-reply-to",
+    "x-sl-queue-id",
+    "list-unsubscribe",
+    "list-id",
+    "list-unsubscribe-post",
+    "mime-version",
+    "content-type",
+    "content-disposition",
+    "content-transfer-encoding",
+  ];
+  if (user.include_header_email_header) kept.push("authentication-results");
+  return kept;
+}
+
+/** Contact.new_addr() (app/models.py) — the reverse-alias From/To/Cc display. */
+function contactNewAddr(contact: ContactRow, user: UserRow): string {
+  const senderFormat = user ? user.sender_format : SENDER_FORMAT_AT;
+  if (senderFormat === SENDER_FORMAT_NO_NAME) return contact.reply_email;
+
+  const websiteEmail = contact.website_email;
+  const name = contact.name;
+  let newName: string;
+  if (senderFormat === SENDER_FORMAT_NAME_ONLY) {
+    newName = name ?? "";
+  } else if (senderFormat === SENDER_FORMAT_AT_ONLY) {
+    newName = websiteEmail.replaceAll("@", " at ").trim();
+  } else if (senderFormat === SENDER_FORMAT_A) {
+    const formatted = websiteEmail.replaceAll("@", "(a)").trim();
+    newName =
+      name && name !== websiteEmail.trim()
+        ? `${name} - ${formatted}`
+        : formatted;
+  } else {
+    // SENDER_FORMAT_AT (default) and any unknown value
+    const formatted = websiteEmail.replaceAll("@", " at ").trim();
+    newName =
+      name && name !== websiteEmail.trim()
+        ? `${name} - ${formatted}`
+        : formatted;
+  }
+  return formatAddr(newName, contact.reply_email).trim();
+}
+
+/**
+ * replace_header_when_forward (email_handler.py): rewrite a To/Cc header,
+ * substituting each non-alias recipient with a get-or-created reverse alias.
+ */
+async function replaceHeaderWhenForward(
+  db: D1Database,
+  env: Env,
+  hs: HeaderLine[],
+  alias: AliasRow,
+  user: UserRow,
+  headerName: string,
+): Promise<void> {
+  const value = getHeader(hs, headerName);
+  if (value === null) return;
+
+  const newAddrs: string[] = [];
+  for (const part of splitAddressList(value)) {
+    const parsed = parseOneAddress(part);
+    const rawAddr = parsed ? parsed.address : part;
+    const contactEmail = sanitizeEmail(rawAddr, true); // case-preserved
+    // Alias already present (Reply-All) is kept verbatim.
+    if (contactEmail.toLowerCase() === alias.email) {
+      newAddrs.push(formatAddr(parsed?.name ?? "", contactEmail));
+      continue;
+    }
+    // Non-ASCII / invalid contact addresses are skipped.
+    if (!isValidEmail(contactEmail)) continue;
+    const contact = await createContact(db, env, contactEmail, alias, user, {
+      name: parsed?.name ?? "",
+      isCc: headerName.toLowerCase() === "cc",
+      allowEmptyEmail: false,
+    });
+    if (contact) newAddrs.push(contactNewAddr(contact, user));
+  }
+
+  if (newAddrs.length > 0) setHeader(hs, headerName, newAddrs.join(","));
+  else deleteHeader(hs, headerName);
+}
+
+/** add_alias_to_header_if_needed (email_handler.py) — BCC-delivered mail. */
+function addAliasToHeaderIfNeeded(hs: HeaderLine[], alias: AliasRow): void {
+  const toHeader = getHeader(hs, "To");
+  const ccHeader = getHeader(hs, "Cc");
+  if (toHeader?.includes(alias.email)) return;
+  if (ccHeader?.includes(alias.email)) return;
+  if (toHeader) setHeader(hs, "To", `${toHeader},${alias.email}`);
+  else setHeader(hs, "To", alias.email);
+}
+
+/**
+ * replace_sl_message_id_by_original_message_id (email_handler.py): the forward
+ * direction of the reply phase's Message-ID rewriting — SL ids in In-Reply-To
+ * and References are mapped back to the sender's original ids.
+ */
+async function replaceSlMessageIdByOriginal(
+  db: D1Database,
+  hs: HeaderLine[],
+): Promise<void> {
+  const inReplyTo = getHeader(hs, "In-Reply-To");
+  if (inReplyTo) {
+    const m = await db
+      .prepare(
+        "SELECT original_message_id FROM message_id_matching WHERE sl_message_id = ?1",
+      )
+      .bind(inReplyTo)
+      .first<{ original_message_id: string }>();
+    if (m) setHeader(hs, "In-Reply-To", m.original_message_id);
+  }
+
+  const refs = getHeader(hs, "References");
+  if (refs) {
+    const tokens = refs.split(/\s+/).filter(Boolean);
+    const out: string[] = [];
+    for (const token of tokens) {
+      const m = await db
+        .prepare(
+          "SELECT original_message_id FROM message_id_matching WHERE sl_message_id = ?1",
+        )
+        .bind(token)
+        .first<{ original_message_id: string }>();
+      out.push(m ? m.original_message_id : token);
+    }
+    setHeader(hs, "References", out.join(" "));
+  }
+}
+
+/**
+ * UnsubscribeGenerator.add_header_to_message (app/handler/unsubscribe_generator.py).
+ * The mailto UNSUBSCRIBER address is not configured on this port, so
+ * DisableAlias/BlockContact use the https unsubscribe link (encode_url), and
+ * the PreserveOriginal path proxies only http(s) methods of the original
+ * List-Unsubscribe (mailto-only originals require a signed link we can't build
+ * without UNSUBSCRIBE_SECRET, so they are dropped).
+ */
+function addUnsubscribeHeaders(
+  env: Env,
+  alias: AliasRow,
+  contact: ContactRow,
+  user: UserRow,
+  hs: HeaderLine[],
+): void {
+  const behaviour = user.unsub_behaviour;
+  const proxied = calculateOriginalUnsubHeaders(hs);
+
+  // __preserve_original_headers: stash the sender's originals + X-SL-Proxy-*.
+  const origLu = getHeader(hs, "List-Unsubscribe");
+  if (origLu) setHeader(hs, "X-SimpleLogin-Original-List-Unsubscribe", origLu);
+  const origLup = getHeader(hs, "List-Unsubscribe-Post");
+  if (origLup)
+    setHeader(hs, "X-SimpleLogin-Original-List-Unsubscribe-Post", origLup);
+  const origLi = getHeader(hs, "List-Id");
+  if (origLi) {
+    setHeader(hs, "X-SimpleLogin-Original-List-Id", origLi);
+    deleteHeader(hs, "List-Id");
+  }
+  for (const [k, v] of Object.entries(proxied))
+    setHeader(hs, `X-SL-Proxy-${k}`, v);
+
+  if (behaviour === UNSUB_PRESERVE_ORIGINAL) {
+    deleteHeader(hs, "List-Unsubscribe");
+    deleteHeader(hs, "List-Unsubscribe-Post");
+    for (const [k, v] of Object.entries(proxied)) setHeader(hs, k, v);
+  } else if (behaviour === UNSUB_DISABLE_ALIAS) {
+    setHeader(
+      hs,
+      "List-Unsubscribe",
+      `<${env.URL}/dashboard/unsubscribe/${alias.id}>`,
+    );
+    setHeader(hs, "List-Unsubscribe-Post", "List-Unsubscribe=One-Click");
+  } else {
+    setHeader(
+      hs,
+      "List-Unsubscribe",
+      `<${env.URL}/dashboard/block_contact/${contact.id}>`,
+    );
+    setHeader(hs, "List-Unsubscribe-Post", "List-Unsubscribe=One-Click");
+  }
+
+  const headerValue =
+    behaviour === UNSUB_DISABLE_ALIAS
+      ? "alias-disable"
+      : behaviour === UNSUB_BLOCK_CONTACT
+        ? "contact-block"
+        : behaviour === UNSUB_PRESERVE_ORIGINAL
+          ? "original-behaviour"
+          : null;
+  if (headerValue) setHeader(hs, "X-SimpleLogin-Unsub-Behaviour", headerValue);
+}
+
+/**
+ * _calculate_header_with_original_behaviour: keep only the http(s) unsubscribe
+ * methods of the original List-Unsubscribe (dropping mailto methods so the real
+ * mailbox is never leaked). Returns the proxied header dict, or {} to drop.
+ */
+function calculateOriginalUnsubHeaders(
+  hs: HeaderLine[],
+): Record<string, string> {
+  const value = getHeader(hs, "List-Unsubscribe");
+  if (!value) return {};
+  const otherUnsubs: string[] = [];
+  for (const rawMethod of value.split(",")) {
+    const start = rawMethod.indexOf("<");
+    const end = rawMethod.lastIndexOf(">");
+    if (start === -1 || end === -1 || start >= end) continue;
+    const method = rawMethod.slice(start + 1, end);
+    // mailto methods are dropped (would leak the mailbox / need a signed link).
+    if (!method.toLowerCase().startsWith("mailto:")) otherUnsubs.push(method);
+  }
+  if (otherUnsubs.length === 0) return {};
+  return {
+    "List-Unsubscribe": otherUnsubs.map((m) => `<${m}>`).join(", "),
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+  };
 }
 
 async function handleEmailSentToOurself(

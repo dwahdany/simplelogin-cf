@@ -97,6 +97,25 @@ function buildRaw(headers: [string, string][], body = "test body\r\n"): string {
   return `${headers.map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n${body}`;
 }
 
+/** Read a single header value (case-insensitive, unfolded) from a raw message. */
+function rawHeader(raw: string, name: string): string | null {
+  const lines = raw.split(/\r?\n\r?\n/)[0].split(/\r?\n/);
+  const lower = name.toLowerCase();
+  for (let i = 0; i < lines.length; i++) {
+    const colon = lines[i].indexOf(":");
+    if (colon === -1) continue;
+    if (lines[i].slice(0, colon).trim().toLowerCase() !== lower) continue;
+    let value = lines[i].slice(colon + 1).trim();
+    while (i + 1 < lines.length && /^[ \t]/.test(lines[i + 1]))
+      value += ` ${lines[++i].trim()}`;
+    return value;
+  }
+  return null;
+}
+
+/** Escape a domain for use inside a RegExp. */
+const reDomain = (d: string) => d.replace(/\./g, "\\.");
+
 async function deliver(message: MockMessage, testEnv: Env = env) {
   const ctx = createExecutionContext();
   await handleEmail(message, testEnv, ctx);
@@ -114,6 +133,16 @@ function envWithSendMock(): {
     },
   } as unknown as SendEmail;
   return { testEnv: { ...env, SEND_EMAIL: mock }, sends };
+}
+
+/** Env whose SEND_EMAIL binding always fails (SMTP error during send). */
+function envWithFailingSend(): Env {
+  const mock = {
+    send: async () => {
+      throw new Error("smtp down");
+    },
+  } as unknown as SendEmail;
+  return { ...env, SEND_EMAIL: mock };
 }
 
 function one<T>(sql: string, ...binds: unknown[]): Promise<T | null> {
@@ -188,8 +217,9 @@ beforeEach(() => {
 // ============================ forward phase ===============================
 
 describe("forward phase", () => {
-  it("forwards to the verified mailbox, creating contact and email log", async () => {
+  it("rewrites From to the reverse alias and sends via the binding", async () => {
     const { user, mailbox, alias } = await forwardSetup();
+    const { testEnv, sends } = envWithSendMock();
     const msg = makeMessage({
       from: "john@wick.example",
       to: alias.email,
@@ -200,15 +230,16 @@ describe("forward phase", () => {
           ["Subject", "hello"],
           ["Message-ID", "<orig-1@wick.example>"],
           ["Content-Type", "text/plain"],
+          ["X-Mailer", "EvilMailer 1.0"],
+          ["DKIM-Signature", "v=1; a=rsa-sha256; d=wick.example; s=sel"],
         ],
         "hi there\r\n",
       ),
     });
-    await deliver(msg);
+    await deliver(msg, testEnv);
 
     expect(msg.rejectReason).toBeNull();
-    expect(msg.forwards).toHaveLength(1);
-    expect(msg.forwards[0].to).toBe(mailbox.email);
+    expect(msg.forwards).toHaveLength(0); // no longer message.forward()
 
     const contact = await one<ContactRow>(
       "SELECT * FROM contact WHERE alias_id = ?1",
@@ -222,7 +253,9 @@ describe("forward phase", () => {
     expect(contact?.invalid_email).toBe(0);
     // new-format reverse alias with the sender included (user default).
     expect(contact?.reply_email).toMatch(
-      /^john_at_wick_example_[a-z]{5,10}@sl\.example\.com$/,
+      new RegExp(
+        `^john_at_wick_example_[a-z]{5,10}@${reDomain(env.EMAIL_DOMAIN)}$`,
+      ),
     );
 
     const emailLog = await one<EmailLogRow>(
@@ -243,18 +276,41 @@ describe("forward phase", () => {
     );
     expect(aliasAfter?.last_email_log_id).toBe(emailLog?.id);
 
-    const h = msg.forwards[0].headers;
-    expect(h["x-simplelogin-type"]).toBe("Forward");
-    expect(h["x-simplelogin-emaillog-id"]).toBe(String(emailLog?.id));
-    expect(h["x-simplelogin-envelope-to"]).toBe(alias.email);
-    expect(h["x-simplelogin-envelope-from"]).toBe("john@wick.example");
-    expect(h["x-simplelogin-original-from"]).toBe(
+    // delivered through the SEND_EMAIL binding with a VERP envelope sender.
+    expect(sends).toHaveLength(1);
+    expect(sends[0].to).toBe(mailbox.email);
+    expect(sends[0].from).toMatch(
+      new RegExp(`^sl\\.[a-z2-7]+\\.[a-z2-7]+@${reDomain(env.EMAIL_DOMAIN)}$`),
+    );
+
+    const out = outboundEmails[0];
+    expect(out.to).toBe(mailbox.email);
+    // From is the reverse alias (default AT sender_format), NOT the sender.
+    expect(rawHeader(out.raw, "From")).toBe(
+      `"John Wick - john at wick.example" <${contact?.reply_email}>`,
+    );
+    expect(rawHeader(out.raw, "To")).toBe(alias.email);
+    expect(rawHeader(out.raw, "Subject")).toBe("hello");
+    expect(rawHeader(out.raw, "X-SimpleLogin-Type")).toBe("Forward");
+    expect(rawHeader(out.raw, "X-SimpleLogin-EmailLog-ID")).toBe(
+      String(emailLog?.id),
+    );
+    expect(rawHeader(out.raw, "X-SimpleLogin-Envelope-To")).toBe(alias.email);
+    expect(rawHeader(out.raw, "X-SimpleLogin-Envelope-From")).toBe(
+      "john@wick.example",
+    );
+    expect(rawHeader(out.raw, "X-SimpleLogin-Original-From")).toBe(
       "John Wick <john@wick.example>",
     );
+    // header whitelist strips non-allowed headers.
+    expect(rawHeader(out.raw, "X-Mailer")).toBeNull();
+    expect(rawHeader(out.raw, "DKIM-Signature")).toBeNull();
+    expect(out.raw).toContain("hi there");
   });
 
   it("reuses the existing contact on subsequent emails (no duplicate rows)", async () => {
     const { alias } = await forwardSetup();
+    const { testEnv, sends } = envWithSendMock();
     const raw = buildRaw([
       ["From", "John Wick <john@wick.example>"],
       ["To", alias.email],
@@ -265,7 +321,7 @@ describe("forward phase", () => {
       to: alias.email,
       raw,
     });
-    await deliver(first);
+    await deliver(first, testEnv);
     const firstContact = await one<ContactRow>(
       "SELECT * FROM contact WHERE alias_id = ?1",
       alias.id,
@@ -276,9 +332,9 @@ describe("forward phase", () => {
       to: alias.email,
       raw,
     });
-    await deliver(second);
+    await deliver(second, testEnv);
 
-    expect(second.forwards).toHaveLength(1);
+    expect(sends).toHaveLength(2);
     expect(
       await count(
         "SELECT COUNT(*) AS n FROM contact WHERE alias_id = ?1",
@@ -415,6 +471,7 @@ describe("forward phase", () => {
       ownership_verified: 1,
       catch_all: 1,
     });
+    const { testEnv, sends } = envWithSendMock();
     const msg = makeMessage({
       from: "someone@ext.example",
       to: "anything@catch.example",
@@ -423,7 +480,7 @@ describe("forward phase", () => {
         ["To", "anything@catch.example"],
       ]),
     });
-    await deliver(msg);
+    await deliver(msg, testEnv);
 
     expect(msg.rejectReason).toBeNull();
     const alias = await one<AliasRow>(
@@ -435,8 +492,8 @@ describe("forward phase", () => {
     expect(alias?.automatic_creation).toBe(1);
     expect(alias?.note).toBe("Created by catchall option");
     expect(alias?.mailbox_id).toBe(user.default_mailbox_id);
-    expect(msg.forwards).toHaveLength(1);
-    expect(msg.forwards[0].to).toBe(user.email);
+    expect(sends).toHaveLength(1);
+    expect(sends[0].to).toBe(user.email);
 
     // a second email reuses the alias
     const again = makeMessage({
@@ -447,7 +504,7 @@ describe("forward phase", () => {
         ["To", "anything@catch.example"],
       ]),
     });
-    await deliver(again);
+    await deliver(again, testEnv);
     expect(
       await count(
         "SELECT COUNT(*) AS n FROM alias WHERE email = ?1",
@@ -471,6 +528,7 @@ describe("forward phase", () => {
       order: 0,
     });
 
+    const { testEnv } = envWithSendMock();
     const matching = makeMessage({
       from: "a@ext.example",
       to: "prefix-abc@rules.example",
@@ -479,7 +537,7 @@ describe("forward phase", () => {
         ["To", "prefix-abc@rules.example"],
       ]),
     });
-    await deliver(matching);
+    await deliver(matching, testEnv);
     expect(matching.rejectReason).toBeNull();
     const alias = await one<AliasRow>(
       "SELECT * FROM alias WHERE email = ?1",
@@ -506,7 +564,9 @@ describe("forward phase", () => {
       user_id: user.id,
       name,
     });
-    const address = `${name}+shop@sl.example.com`;
+    const aliasDomain = env.ALIAS_DOMAINS.split(",")[0].trim();
+    const address = `${name}+shop@${aliasDomain}`;
+    const { testEnv, sends } = envWithSendMock();
     const msg = makeMessage({
       from: "shop@ext.example",
       to: address,
@@ -515,7 +575,7 @@ describe("forward phase", () => {
         ["To", address],
       ]),
     });
-    await deliver(msg);
+    await deliver(msg, testEnv);
 
     expect(msg.rejectReason).toBeNull();
     const alias = await one<AliasRow>(
@@ -526,8 +586,8 @@ describe("forward phase", () => {
     expect(alias?.directory_id).toBe(directory.id);
     expect(alias?.note).toBe(`Created by directory ${name}`);
     expect(alias?.mailbox_id).toBe(user.default_mailbox_id);
-    expect(msg.forwards).toHaveLength(1);
-    expect(msg.forwards[0].to).toBe(user.email);
+    expect(sends).toHaveLength(1);
+    expect(sends[0].to).toBe(user.email);
   });
 
   it("detects an email cycle from the alias's own mailbox", async () => {
@@ -697,6 +757,378 @@ describe("forward phase", () => {
         alias.id,
       ),
     ).toBe(0);
+  });
+});
+
+// =================== forward phase — header rewriting =====================
+
+describe("forward phase header rewriting", () => {
+  /** Forward a message with the given From header; return the outbound From
+   *  header, the created sender Contact, and the raw outbound message. */
+  async function forwardWithFrom(
+    fromHeader: string,
+    userOverrides: Record<string, unknown> = {},
+    extraHeaders: [string, string][] = [],
+  ) {
+    const { alias } = await forwardSetup(userOverrides);
+    const { testEnv, sends } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", fromHeader],
+        ["To", alias.email],
+        ["Subject", "s"],
+        ["Content-Type", "text/plain"],
+        ...extraHeaders,
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const contact = await one<ContactRow>(
+      "SELECT * FROM contact WHERE alias_id = ?1 AND website_email = ?2",
+      alias.id,
+      "john@wick.example",
+    );
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    return {
+      from: rawHeader(out, "From") ?? "",
+      contact: contact as ContactRow,
+      alias,
+      out,
+      sends,
+    };
+  }
+
+  it("sender_format AT (default): 'Name - user at domain'", async () => {
+    const { from, contact } = await forwardWithFrom(
+      "John Wick <john@wick.example>",
+    );
+    expect(from).toBe(
+      `"John Wick - john at wick.example" <${contact.reply_email}>`,
+    );
+  });
+
+  it("sender_format A: 'Name - user(a)domain'", async () => {
+    const { from, contact } = await forwardWithFrom(
+      "John Wick <john@wick.example>",
+      { sender_format: 2 },
+    );
+    expect(from).toBe(
+      `"John Wick - john(a)wick.example" <${contact.reply_email}>`,
+    );
+  });
+
+  it("sender_format NAME_ONLY: just the display name", async () => {
+    const { from, contact } = await forwardWithFrom(
+      "John Wick <john@wick.example>",
+      { sender_format: 5 },
+    );
+    expect(from).toBe(`John Wick <${contact.reply_email}>`);
+  });
+
+  it("sender_format AT_ONLY: 'user at domain'", async () => {
+    const { from, contact } = await forwardWithFrom(
+      "John Wick <john@wick.example>",
+      { sender_format: 6 },
+    );
+    expect(from).toBe(`"john at wick.example" <${contact.reply_email}>`);
+  });
+
+  it("sender_format NO_NAME: the reverse alias only", async () => {
+    const { from, contact } = await forwardWithFrom(
+      "John Wick <john@wick.example>",
+      { sender_format: 7 },
+    );
+    expect(from).toBe(contact.reply_email);
+  });
+
+  it("dedupes the name when it equals the sender's email address", async () => {
+    const { from, contact } = await forwardWithFrom(
+      '"john@wick.example" <john@wick.example>',
+    );
+    // no "john@wick.example - ..." prefix; just the formatted address.
+    expect(from).toBe(`"john at wick.example" <${contact.reply_email}>`);
+  });
+
+  it("RFC 2047-encodes a non-ASCII display name", async () => {
+    const { from, contact } = await forwardWithFrom(
+      "Jöhn Wíck <john@wick.example>",
+    );
+    const m = from.match(/^=\?utf-8\?b\?([A-Za-z0-9+/]+=*)\?= <(.+)>$/);
+    expect(m).not.toBeNull();
+    expect(m?.[2]).toBe(contact.reply_email);
+    const decoded = new TextDecoder().decode(
+      Uint8Array.from(atob(m?.[1] ?? ""), (c) => c.charCodeAt(0)),
+    );
+    expect(decoded).toBe("Jöhn Wíck - john at wick.example");
+  });
+
+  it("rewrites To/Cc recipients to reverse aliases and keeps the alias", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "John Wick <john@wick.example>"],
+        ["To", `${alias.email}, Alice <alice@ext.example>`],
+        ["Cc", "Bob <bob@ext.example>"],
+        ["Subject", "s"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+
+    const alice = await one<ContactRow>(
+      "SELECT * FROM contact WHERE alias_id = ?1 AND website_email = ?2",
+      alias.id,
+      "alice@ext.example",
+    );
+    const bob = await one<ContactRow>(
+      "SELECT * FROM contact WHERE alias_id = ?1 AND website_email = ?2",
+      alias.id,
+      "bob@ext.example",
+    );
+    expect(alice).not.toBeNull();
+    expect(alice?.is_cc).toBe(0);
+    expect(bob?.is_cc).toBe(1);
+
+    const toOut = rawHeader(out, "To") ?? "";
+    expect(toOut).toContain(alias.email); // alias kept verbatim
+    expect(toOut).toContain(alice?.reply_email ?? "x");
+    expect(toOut).not.toContain("alice@ext.example");
+    const ccOut = rawHeader(out, "Cc") ?? "";
+    expect(ccOut).toContain(bob?.reply_email ?? "x");
+    expect(ccOut).not.toContain("bob@ext.example");
+  });
+
+  it("deletes the Cc header when no recipient survives", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["To", alias.email],
+        ["Cc", "invalid@"],
+        ["Subject", "s"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    expect(rawHeader(out, "Cc")).toBeNull();
+  });
+
+  it("adds the alias to To when it was BCC'd (absent from headers)", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["Subject", "bcc"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    expect(rawHeader(out, "To")).toBe(alias.email);
+  });
+
+  it("rewrites Reply-To to the reply-to contacts' reverse aliases (max 5)", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const replyTos = Array.from(
+      { length: 6 },
+      (_, i) => `rt${i}@ext.example`,
+    ).join(", ");
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["To", alias.email],
+        ["Reply-To", replyTos],
+        ["Subject", "s"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    const replyToOut = rawHeader(out, "Reply-To") ?? "";
+
+    // all 6 reply-to contacts are created, but only 5 appear in the header.
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM contact WHERE alias_id = ?1 AND website_email LIKE '%@ext.example'",
+        alias.id,
+      ),
+    ).toBe(6);
+    const reverseAliasCount = (replyToOut.match(/_at_ext_example_/g) ?? [])
+      .length;
+    expect(reverseAliasCount).toBe(5);
+    expect(replyToOut).not.toContain("@ext.example>");
+  });
+
+  it("preserves an http List-Unsubscribe and stashes the sender's originals", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "news@ext.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "news@ext.example"],
+        ["To", alias.email],
+        ["Subject", "newsletter"],
+        ["List-Unsubscribe", "<https://ext.example/unsub?id=1>"],
+        ["List-Id", "News <news.ext.example>"],
+        ["X-Mailer", "Bulk 2.0"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+
+    expect(rawHeader(out, "X-Mailer")).toBeNull();
+    expect(rawHeader(out, "List-Unsubscribe")).toBe(
+      "<https://ext.example/unsub?id=1>",
+    );
+    expect(rawHeader(out, "List-Unsubscribe-Post")).toBe(
+      "List-Unsubscribe=One-Click",
+    );
+    expect(rawHeader(out, "X-SimpleLogin-Original-List-Unsubscribe")).toBe(
+      "<https://ext.example/unsub?id=1>",
+    );
+    expect(rawHeader(out, "X-SimpleLogin-Original-List-Id")).toBe(
+      "News <news.ext.example>",
+    );
+    // the original List-Id itself is dropped from the forwarded message.
+    expect(rawHeader(out, "List-Id")).toBeNull();
+    expect(rawHeader(out, "X-SimpleLogin-Unsub-Behaviour")).toBe(
+      "original-behaviour",
+    );
+  });
+
+  it("drops a mailto-only List-Unsubscribe but stashes the original", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "news@ext.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "news@ext.example"],
+        ["To", alias.email],
+        ["Subject", "newsletter"],
+        ["List-Unsubscribe", "<mailto:unsub@ext.example>"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    expect(rawHeader(out, "List-Unsubscribe")).toBeNull();
+    expect(rawHeader(out, "X-SimpleLogin-Original-List-Unsubscribe")).toBe(
+      "<mailto:unsub@ext.example>",
+    );
+  });
+
+  it("uses an https unsubscribe link for the DisableAlias behaviour", async () => {
+    const { alias } = await forwardSetup({ unsub_behaviour: 0 });
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "news@ext.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "news@ext.example"],
+        ["To", alias.email],
+        ["Subject", "newsletter"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    expect(rawHeader(out, "List-Unsubscribe")).toBe(
+      `<${env.URL}/dashboard/unsubscribe/${alias.id}>`,
+    );
+    expect(rawHeader(out, "X-SimpleLogin-Unsub-Behaviour")).toBe(
+      "alias-disable",
+    );
+  });
+
+  it("omits Envelope-From / Original-From when include_header_email_header is off", async () => {
+    const { alias } = await forwardSetup({ include_header_email_header: 0 });
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "John Wick <john@wick.example>"],
+        ["To", alias.email],
+        ["Subject", "s"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    expect(rawHeader(out, "X-SimpleLogin-Type")).toBe("Forward");
+    expect(rawHeader(out, "X-SimpleLogin-Envelope-To")).toBe(alias.email);
+    expect(rawHeader(out, "X-SimpleLogin-Envelope-From")).toBeNull();
+    expect(rawHeader(out, "X-SimpleLogin-Original-From")).toBeNull();
+  });
+
+  it("adds a Date header when the original lacks one", async () => {
+    const { out } = await forwardWithFrom("john@wick.example");
+    expect(rawHeader(out, "Date")).toMatch(
+      /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} -0000$/,
+    );
+  });
+
+  it("uses a VERP envelope sender and deletes the EmailLog on send failure", async () => {
+    const { alias } = await forwardSetup();
+    const testEnv = envWithFailingSend();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["To", alias.email],
+        ["Subject", "s"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    expect(msg.rejectReason).toBe("421 SL E407 Retry later");
+    expect(outboundEmails[outboundEmails.length - 1].envelopeFrom).toMatch(
+      new RegExp(`^sl\\.[a-z2-7]+\\.[a-z2-7]+@${reDomain(env.EMAIL_DOMAIN)}$`),
+    );
+    const contact = await one<ContactRow>(
+      "SELECT * FROM contact WHERE alias_id = ?1",
+      alias.id,
+    );
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM email_log WHERE contact_id = ?1",
+        contact?.id,
+      ),
+    ).toBe(0);
+  });
+
+  it("falls back to message.forward() when SEND_EMAIL is not bound", async () => {
+    const { mailbox, alias } = await forwardSetup();
+    const testEnv = { ...env, SEND_EMAIL: undefined } as unknown as Env;
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "John Wick <john@wick.example>"],
+        ["To", alias.email],
+        ["Subject", "s"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    expect(msg.rejectReason).toBeNull();
+    expect(msg.forwards).toHaveLength(1);
+    expect(msg.forwards[0].to).toBe(mailbox.email);
+    expect(msg.forwards[0].headers["x-simplelogin-type"]).toBe("Forward");
+    expect(msg.forwards[0].headers["x-simplelogin-envelope-to"]).toBe(
+      alias.email,
+    );
   });
 });
 
@@ -907,12 +1339,13 @@ describe("reply phase", () => {
   });
 
   it("rejects an unknown legacy reverse alias with E502", async () => {
+    const legacy = `ra+doesnotexist@${env.EMAIL_DOMAIN}`;
     const msg = makeMessage({
       from: "someone@ext.example",
-      to: "ra+doesnotexist@sl.example.com",
+      to: legacy,
       raw: buildRaw([
         ["From", "someone@ext.example"],
-        ["To", "ra+doesnotexist@sl.example.com"],
+        ["To", legacy],
       ]),
     });
     await deliver(msg);

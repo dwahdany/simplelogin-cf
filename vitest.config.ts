@@ -17,6 +17,13 @@ export default defineConfig(async () => {
           bindings: {
             TEST_MIGRATIONS: migrations,
             FLASK_SECRET: "test-flask-secret",
+            // Tests are written against these fixture values; wrangler.jsonc
+            // carries the real deployment vars and must not leak into tests.
+            EMAIL_DOMAIN: "sl.example.com",
+            ALIAS_DOMAINS: "sl.example.com",
+            PREMIUM_ALIAS_DOMAINS: "",
+            URL: "https://app.sl.example.com",
+            MAX_NB_EMAIL_FREE_PLAN: "3",
           },
         },
       }),
