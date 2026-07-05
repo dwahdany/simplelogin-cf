@@ -1,146 +1,92 @@
 # Handover: SimpleLogin → Cloudflare Workers rewrite
 
 **Goal:** Rebuild SimpleLogin as a Cloudflare-native serverless app (Workers +
-D1 + KV + Email Routing) with a **byte/field-exact compatible API** so existing
-client apps (mobile apps, browser extensions) keep working unchanged.
+D1 + KV + Email Routing) with a **field/status-code-exact compatible API** so
+existing client apps (mobile apps, browser extensions) keep working unchanged.
 
 **Branch:** `cloudflare-rewrite` (off `master`). Everything lives under
-`cloudflare/`. Commits so far: scaffold → specs → core lib foundations →
-(uncommitted at handover time: crypto + models/serializer layers, Biome).
+`cloudflare/`. As of commit `34f42417` the port is functionally complete:
+API + email worker + server-rendered web dashboard, 672 tests green in real
+workerd, tsc + Biome clean.
 
 ---
 
 ## 1. The compatibility contract: `cloudflare/specs/`
 
-Nine spec files were extracted from the Flask source by parallel readers; they
-are the **source of truth** for the rewrite. Implement from the specs; when
-ambiguous, read the original Flask code (paths cited inside each spec).
+Extracted from the Flask source by parallel readers; the **source of truth**.
+`00`–`08` cover the API/data model/email pipeline/config; `specs/web/00`–`05`
+cover the web dashboard blueprints. When ambiguous, read the original Flask
+code (paths cited inside each spec).
 
-- `00-routes-inventory.md` — all 52 routes, auth semantics, CORS, rate limits.
-- `01-auth.md` … `05-user-settings.md` — per-route request/response/error
-  schemas, exact strings and status codes.
-- `06-data-model.md` — full schema; its §24 SQL block **is**
-  `migrations/0001_init.sql`.
-- `07-email-handling.md` — forwarding/reply pipeline for the email worker.
-- `08-config.md` — config constants and their quirks.
+Key API gotchas (clients depend on these): `Authentication` header (raw key);
+cookie fallback needs `X-Sl-Allowcookies`; HTTP 440 sudo with 5-min TTL;
+per-request api_key.last_used/times writes; arrow 0.16 date format
+`YYYY-MM-DD HH:MM:SS+00:00`; exact error strings (400 "Unknown error",
+404 "No such alias", 405 "Method not allowed"...); 201 for mailbox/alias/
+api_key creation; PAGE_LIMIT 20; presence-based list filters; itsdangerous
+1.1-compatible signing (signed_suffix TimestampSigner max_age 600s, mfa_key
+Signer) — byte-verified against Python vectors in test/crypto.test.ts.
 
-Highest-value gotchas (clients depend on these):
-- Auth header is literally **`Authentication`** (raw API key, no Bearer).
-  Cookie fallback needs session cookie **and** `X-Sl-Allowcookies` header.
-- Sudo failure = **HTTP 440** `{"error": "Need sudo"}`, 5-min TTL
-  (`api_key.sudo_mode_at`). Entered via `PATCH /api/sudo`.
-- Every API-key request **writes** `api_key.last_used/times` before the route.
-- Dates: `YYYY-MM-DD HH:MM:SS+00:00` (arrow 0.16 default, no `T`/`Z`);
-  `*_timestamp` = unix seconds; notifications use arrow `humanize()` strings.
-- Error bodies are exact strings clients may match on (e.g. GET missing alias
-  → **400** `{"error": "Unknown error"}`, not 404; contacts endpoint → 404
-  `{"error": "No such alias"}`).
-- 201 for: mailbox create, alias create (v2/v3/random), api_key create.
-- `GET /api/export/aliases` returns CSV (the only non-JSON success).
-- PAGE_LIMIT = 20 everywhere; `/api/v2/aliases` has **no** `has_more` field,
-  but `/api/notifications` returns `more` (fetches PAGE_LIMIT+1).
-- Alias-list filters `pinned/disabled/enabled` are **presence-based** query
-  params (`?pinned=false` still filters); precedence pinned>disabled>enabled.
-- `signed_suffix` = itsdangerous 1.1 TimestampSigner, secret
-  `FLASK_SECRET + "custom_alias"`, max_age 600s — parse on the RIGHTMOST two
-  dots. `mfa_key` = itsdangerous Signer over the user id, no expiry.
+Deliberate deviations (safe for working clients): Flask 500-bug paths return
+clean 4xx; signed-cookie session → opaque KV session (cookie still "slapp");
+Redis limits/locks → D1 `rate_limit` table with flask-limiter/parallel_limiter
+KEY SEMANTICS preserved (session user else IP; locks not disabled by
+DISABLE_RATE_LIMIT); SMTP → SEND_EMAIL binding via src/lib/mailer.ts;
+ts_vector search → LIKE approximation (documented in serializer.ts).
 
-**Deliberate deviations** (documented, safe for working clients):
-- Flask paths that 500 due to real bugs (session-cookie-without-header,
-  missing body fields hitting `None`) return clean 4xxs here instead.
-- Flask signed-cookie session → opaque KV session (cookie still named `slapp`).
-- Redis rate limiting / locks → D1 `rate_limit` table (atomic single-writer
-  upserts); flask-limiter key semantics preserved (IP-keyed for API-key
-  traffic except `/aliases*` which key by user id).
+## 2. Architecture / state (all committed)
 
-## 2. Current state of `cloudflare/`
+- **API** (`src/routes/`): all 52 Flask routes, field-exact. Adversarially
+  verified: 5 finder agents diffed implementation vs Flask views, findings
+  re-verified by skeptics, 26 confirmed mismatches fixed with regression
+  tests (commit `34f42417`).
+- **Email worker** (`src/email.ts`): alias resolution (exact → catch-all/
+  rules → directory), reverse-alias contact creation, EmailLog +
+  last_email_log_id, forward/reply paths, VERP.
+- **Web dashboard** (`src/web/` + `templates/` + `src/lib/web/`): ~73
+  server-rendered routes ported from the Flask blueprints; nunjucks templates
+  precompiled at build time (`scripts/build-templates.mjs` → `src/generated/`,
+  gitignored — `npm test`'s pretest hook builds them; run it before a bare
+  `npx tsc`/`vitest`). KV sessions with CSRF/flashes; static assets via the
+  ASSETS binding (`scripts/build-assets.mjs` → `public/`).
+  Deferred shells (config-gated, routes present): FIDO assertion verification,
+  PGP key import (needs an OpenPGP port), Paddle checkout/webhooks, Zendesk
+  (needs ZENDESK_HOST), OAuth token exchanges (need provider credentials).
+- **Core lib** (`src/lib/`): auth middleware (440 sudo honors either api_key
+  sudo_mode_at OR browser-session sudo_time), D1 rate limiting, KV sessions,
+  arrow-exact dates/humanize, itsdangerous/bcrypt/TOTP crypto, models
+  (subscription-precedence premium logic), serializers, mailer seam.
+  405-vs-404 Werkzeug parity implemented in `src/index.ts` notFound.
+- **Schema**: `migrations/0001_init.sql` (50 tables) + `0002_rate_limit.sql`.
 
-**Toolchain:** TypeScript + Hono 4 on Workers; vitest 4 +
-`@cloudflare/vitest-pool-workers` 0.18 (tests run in real workerd; note the
-new vite-plugin config API `cloudflareTest()` in `vitest.config.ts`; D1
-migrations auto-applied via `test/apply-migrations.ts`). Biome (Rust) is
-installed with `biome.json` written but **no format/lint pass has been run
-yet** — user wants Rust/Astral-style tooling wherever possible (`uv` for any
-ad-hoc Python, Biome for lint/format).
+## 3. Working on this codebase
 
-**Node is not on PATH** — prefix all npm/npx with
-`nix-shell -p nodejs_22 --run '...'` from `cloudflare/`. Commands:
-`npm test`, `npx tsc --noEmit`, `npx @biomejs/biome check --write .`.
-Git commits must be run non-sandboxed. Test secret `FLASK_SECRET` is provided
-via miniflare bindings in `vitest.config.ts`.
+Node is NOT on PATH: `nix-shell -p nodejs_22 --run '...'` from `cloudflare/`.
+`npm test` (672 tests, workerd via vitest-pool-workers 0.18/vitest 4 —
+config uses the `cloudflareTest()` vite plugin), `npx tsc --noEmit`,
+`npx @biomejs/biome check --write .`. Python one-offs: `uv run --with ...`.
+Git commits non-sandboxed. Rust tooling preferred (Biome, uv/ruff).
 
-**Done and committed (52f0c552):**
-- `migrations/0001_init.sql` (50 tables) + `0002_rate_limit.sql`.
-- `src/lib/`: `auth.ts` (requireApiAuth/requireApiSudo per base.py),
-  `ratelimit.ts` (fixed-window + 5s request mutex), `session.ts` (KV),
-  `dates.ts` (arrow-exact format + humanize — thresholds verified against
-  real arrow 0.16 via `uv run`), `errors.ts`, `rows.ts` (D1 row typings),
-  `env.ts` (bindings contract). `src/index.ts` mounts CORS, error handlers
-  (SyntaxError→400 "Bad Request", other→500 "Internal error"), health route,
-  and five **stub** route modules in `src/routes/`.
-- Smoke tests green at commit time (worker + D1 + KV in workerd).
+File ownership pattern used by agent fan-outs: route/page agents own only
+their module + test file; shared lib/index.ts belong to the lead. Test
+fixtures in `test/fixtures.ts`; web tests seed KV sessions directly.
 
-**Done by subagents, UNCOMMITTED and NOT yet verified by the lead:**
-- `src/lib/crypto.ts` + `src/lib/words.ts` + `test/crypto.test.ts` —
-  bcrypt(NFKC, cost 12), TOTP (±2 steps, last_otp replay), itsdangerous
-  Signer/TimestampSigner reimplementations with hardcoded Python-generated
-  cross-vectors (via `uv run --with itsdangerous==1.1.0 ...`), randomString/
-  tokenUrlsafe/randomWords, canonicalize/sanitizeEmail.
-- `src/lib/models.ts`, `src/lib/serializer.ts`, `test/fixtures.ts`,
-  `test/models.test.ts`, `test/serializer.test.ts` — premium/subscription
-  precedence, alias limits, `getAliasInfosWithPaginationV3`, alias/contact
-  serializers, shared test fixtures (`createUser/createAlias/...`).
-- Both agents reported success, but **the first action for whoever picks this
-  up is: run `npx tsc --noEmit && npm test` and fix anything red, run the
-  Biome pass, then commit.** (A verification run was interrupted at handover.)
+## 4. Remaining / nice-to-have
 
-## 3. Contracts the next agents must honor
-
-- Route modules own ONLY their file in `src/routes/` + their test file;
-  shared lib files are the lead's/lib-agents' — extend, don't fork.
-- Exports available to routes: `requireApiAuth`, `requireApiSudo`, `AppEnv`,
-  vars `user`/`apiKey`/`session`; `rateLimit(name, spec, keyBy)`,
-  `requestLock(name)`; `jsonError/badRequest/...`; `nowStr/toStr/toEpoch/
-  humanize`; row types from `rows.ts`; crypto + models + serializer exports
-  (see file headers). Test fixtures in `test/fixtures.ts`.
-- `wrangler.jsonc`: D1 (`DB`), KV (`KV`), `send_email` (`SEND_EMAIL`), vars;
-  D1/KV ids are `REPLACE_WITH_*` placeholders — real deploy needs
-  `wrangler d1 create` / `kv namespace create` + `wrangler secret put
-  FLASK_SECRET`, plus Email Routing wired to the email worker.
-
-## 4. Remaining work (task list mirrors this)
-
-1. **Route groups** (task #4) — five parallel agents, one per stub module,
-   implementing from specs with field-exact tests:
-   `auth.ts` (spec 01: login/register/activate/reactivate/forgot_password/mfa
-   — MFA needs crypto.itsdangerous mfa_key), `aliases.ts` (spec 02: list
-   v1/v2, get/update/delete/toggle, activities, contacts, contact toggle/
-   delete), `alias-creation.ts` (spec 03: v4/v5 options, v2/v3 custom, random
-   — signed suffixes + `requestLock("alias_creation")` + ALIAS_LIMIT),
-   `mailboxes.ts` (spec 04: mailbox CRUD + v2 list, custom domains + trash),
-   `user.ts` (spec 05: user_info GET/PATCH, api_key POST (sudo), sudo PATCH,
-   settings + domains v1/v2, notifications, exports CSV/JSON, user DELETE
-   (sudo), cookie_token, stats, logout; apple/phone/proton-unlink minimal per
-   spec). Emails (activation etc.): use `SEND_EMAIL` binding when bound, else
-   log — keep an injectable seam for tests.
-2. **Email worker** (task #5) — `src/email.ts` per spec 07: alias resolution
-   (exact → custom-domain catch-all/rules → directory), contact get-or-create
-   with new-format reverse aliases, EmailLog + `alias.last_email_log_id`,
-   forward via `message.forward()` to verified mailboxes, reply path via
-   reverse-alias detection + sender verification, disabled-alias handling,
-   VERP-style bounce address fidelity where CF allows. Export as
-   `export default { fetch: app.fetch, email: handleEmail }` (lead owns
-   `src/index.ts` — coordinate that one-line change).
-3. **Adversarial verification** (task #6) — workflow: per route group, an
-   agent diffs implementation against the ORIGINAL Flask views (not the
-   specs) and reports schema mismatches with CONFIRMED/PLAUSIBLE verdicts;
-   fix confirmed ones; completeness check: every route in
-   `00-routes-inventory.md` §5 exists with matching methods/status codes.
-4. **Finish** (task #7) — full green suite, Biome clean, README (deploy steps
-   incl. D1/KV/Email Routing/DNS), commit per milestone.
+- Completeness audit of all 52 routes re-run (first attempt returned empty) —
+  check result, fix anything it surfaces.
+- Deploy runbook is in README.md: `wrangler d1 create` + migrations,
+  KV namespace, `wrangler secret put FLASK_SECRET`, Email Routing → worker,
+  DNS/MX; wrangler.jsonc has `REPLACE_WITH_*` placeholder ids.
+- Follow-up refactors flagged by agents: extract duplicated helpers
+  (email validation, suffix signing, alias delete) from route modules into
+  src/lib; deterministic-time test seams for humanize/premium boundaries;
+  port openpgp.js for PGP import; WebAuthn ceremony support.
+- Not ported (out of scope, documented): Flask-Admin panel, Paddle webhooks,
+  Proton OAuth partner flows, phone reservations UI, batch import S3 jobs.
 
 ## 5. Original Flask reference points
 
-- API views: `app/api/views/*.py`; auth plumbing `app/api/base.py`;
-  serializers `app/api/serializer.py`; models `app/models.py` (4198 lines);
-  email pipeline `email_handler.py` (2497 lines); config `app/config.py`.
+API views `app/api/views/*.py`; base auth `app/api/base.py`; serializers
+`app/api/serializer.py`; models `app/models.py`; email `email_handler.py`;
+web blueprints `app/dashboard/`, `app/auth/`; templates `templates/`.
