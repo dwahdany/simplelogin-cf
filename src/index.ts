@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { handleEmail } from "./email";
 import type { AppEnv } from "./lib/auth";
 import { aliasCreationRoutes } from "./routes/alias-creation";
 import { aliasRoutes } from "./routes/aliases";
@@ -31,4 +32,7 @@ app.route("/api", aliasCreationRoutes);
 app.route("/api", mailboxDomainRoutes);
 app.route("/api", userRoutes);
 
-export default app;
+export default {
+  fetch: app.fetch,
+  email: handleEmail,
+};

@@ -28,7 +28,6 @@
     "ALIAS_DOMAINS": "sl.example.com",
     "PREMIUM_ALIAS_DOMAINS": "",
     "URL": "https://app.sl.example.com",
-    "MAX_NB_EMAIL_FREE_PLAN": "3",
-    "DISABLE_REGISTRATION": "0"
+    "MAX_NB_EMAIL_FREE_PLAN": "3"
   }
 }
