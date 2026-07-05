@@ -14,7 +14,10 @@ export default defineConfig(async () => {
         singleWorker: true,
         wrangler: { configPath: "./wrangler.jsonc" },
         miniflare: {
-          bindings: { TEST_MIGRATIONS: migrations },
+          bindings: {
+            TEST_MIGRATIONS: migrations,
+            FLASK_SECRET: "test-flask-secret",
+          },
         },
       }),
     ],
