@@ -85,11 +85,7 @@ export function verifyTotp(
   });
 
   const timestamp =
-    now === undefined
-      ? Date.now()
-      : now instanceof Date
-        ? now.getTime()
-        : now;
+    now === undefined ? Date.now() : now instanceof Date ? now.getTime() : now;
 
   // pyotp NFKC-normalizes both sides before the constant-time compare.
   const delta = totp.validate({
@@ -129,7 +125,7 @@ function b64urlDecode(s: string): Uint8Array {
  * derived_key = SHA1(salt + "signer" + secret).
  */
 async function deriveKey(secret: string): Promise<CryptoKey> {
-  const material = enc.encode(ITSDANGEROUS_SALT + "signer" + secret);
+  const material = enc.encode(`${ITSDANGEROUS_SALT}signer${secret}`);
   const digest = await crypto.subtle.digest("SHA-1", material);
   return crypto.subtle.importKey(
     "raw",
@@ -279,12 +275,14 @@ export async function timestampUnsign(
 const LOWERCASE = "abcdefghijklmnopqrstuvwxyz";
 
 /**
- * Unbiased random index in [0, n) using rejection sampling over bytes, so the
- * distribution matches Python's `secrets.choice`.
+ * Unbiased random index in [0, n) using rejection sampling over a 32-bit
+ * draw, so the distribution matches Python's `secrets.choice`. (A single-byte
+ * draw would spin forever for n > 256 — the word list has ~7.6k entries.)
  */
 function randomIndex(n: number): number {
-  const limit = Math.floor(256 / n) * n; // largest multiple of n <= 256
-  const buf = new Uint8Array(1);
+  const RANGE = 2 ** 32;
+  const limit = RANGE - (RANGE % n); // largest multiple of n <= 2^32
+  const buf = new Uint32Array(1);
   for (;;) {
     crypto.getRandomValues(buf);
     if (buf[0] < limit) return buf[0] % n;
@@ -316,7 +314,8 @@ function randomDigit(): string {
  */
 export function randomWords(nbWords: number, numbers = 0): string {
   const parts: string[] = [];
-  for (let i = 0; i < nbWords; i++) parts.push(WORDS[randomIndex(WORDS.length)]);
+  for (let i = 0; i < nbWords; i++)
+    parts.push(WORDS[randomIndex(WORDS.length)]);
   let out = parts.join("_");
   if (numbers > 0) {
     let digits = "";

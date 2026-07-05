@@ -7,9 +7,15 @@
  * integer unix seconds via toEpoch. Booleans are emitted as JSON true/false.
  */
 
-import type { AliasRow, ContactRow, EmailLogRow, MailboxRow, UserRow } from "./rows";
 import { toDate, toEpoch } from "./dates";
 import { getContactById, getMailboxById } from "./models";
+import type {
+  AliasRow,
+  ContactRow,
+  EmailLogRow,
+  MailboxRow,
+  UserRow,
+} from "./rows";
 
 const PAGE_LIMIT = 20; // config.PAGE_LIMIT
 
@@ -39,7 +45,9 @@ export interface AliasInfo {
 }
 
 /** EmailLog.get_action(): reply | bounced | block | forward (models.py L2333). */
-export function emailLogAction(log: EmailLogRow): "reply" | "bounced" | "block" | "forward" {
+export function emailLogAction(
+  log: EmailLogRow,
+): "reply" | "bounced" | "block" | "forward" {
   if (log.is_reply) return "reply";
   if (log.bounced) return "bounced";
   if (log.blocked) return "block";
@@ -67,7 +75,10 @@ function parseDisplayName(raw: string): string {
  * per the owner's sender_format. When senderFormat is null/unknown/AT the "@"
  * becomes " at "; A(2) uses "(a)"; 5/6/7 leave the address untouched.
  */
-export function reverseAliasDisplay(contact: ContactRow, senderFormat: number | null): string {
+export function reverseAliasDisplay(
+  contact: ContactRow,
+  senderFormat: number | null,
+): string {
   let email = contact.website_email;
   const known = senderFormat !== null && SENDER_FORMAT_VALUES.has(senderFormat);
   if (senderFormat === null || !known || senderFormat === 0) {
@@ -77,7 +88,8 @@ export function reverseAliasDisplay(contact: ContactRow, senderFormat: number | 
   }
 
   let name = contact.name;
-  if (!name && contact.website_from) name = parseDisplayName(contact.website_from);
+  if (!name && contact.website_from)
+    name = parseDisplayName(contact.website_from);
   if (name) name = name.replaceAll('"', "");
 
   const display = name ? `${name} | ${email}` : email;
@@ -166,7 +178,10 @@ export function serializeContact(
   return res;
 }
 
-async function fetchMailboxMap(db: D1Database, ids: number[]): Promise<Map<number, MailboxRow>> {
+async function fetchMailboxMap(
+  db: D1Database,
+  ids: number[],
+): Promise<Map<number, MailboxRow>> {
   const map = new Map<number, MailboxRow>();
   if (ids.length === 0) return map;
   const placeholders = ids.map((_, i) => `?${i + 1}`).join(", ");
@@ -185,15 +200,22 @@ async function fetchMailboxMap(db: D1Database, ids: number[]): Promise<Map<numbe
  * mailboxes (unlike the list endpoints); support_pgp is still computed over the
  * verified mailboxes only.
  */
-export async function getAliasInfoV2(db: D1Database, alias: AliasRow, user: UserRow): Promise<AliasInfo> {
+export async function getAliasInfoV2(
+  db: D1Database,
+  alias: AliasRow,
+  user: UserRow,
+): Promise<AliasInfo> {
   const primary = await getMailboxById(db, alias.mailbox_id);
 
   const amRows = await db
-    .prepare("SELECT mailbox_id FROM alias_mailbox WHERE alias_id = ?1 ORDER BY id")
+    .prepare(
+      "SELECT mailbox_id FROM alias_mailbox WHERE alias_id = ?1 ORDER BY id",
+    )
     .bind(alias.id)
     .all<{ mailbox_id: number }>();
   const ids = [alias.mailbox_id];
-  for (const r of amRows.results) if (!ids.includes(r.mailbox_id)) ids.push(r.mailbox_id);
+  for (const r of amRows.results)
+    if (!ids.includes(r.mailbox_id)) ids.push(r.mailbox_id);
 
   const mbMap = await fetchMailboxMap(db, ids);
   const mailboxes: MailboxLite[] = ids
@@ -230,11 +252,15 @@ export async function getAliasInfoV2(db: D1Database, alias: AliasRow, user: User
     }
   }
 
-  const latestContact = latestEmailLog ? await getContactById(db, latestEmailLog.contact_id) : null;
+  const latestContact = latestEmailLog
+    ? await getContactById(db, latestEmailLog.contact_id)
+    : null;
 
   return {
     alias,
-    mailbox: primary ? { id: primary.id, email: primary.email } : { id: alias.mailbox_id, email: "" },
+    mailbox: primary
+      ? { id: primary.id, email: primary.email }
+      : { id: alias.mailbox_id, email: "" },
     mailboxes,
     nb_forward: nbForward,
     nb_blocked: nbBlocked,
@@ -278,7 +304,9 @@ export async function getAliasInfosWithPaginationV3(
   const filterParams: unknown[] = [];
 
   if (opts.query) {
-    conds.push("(a.email LIKE '%' || ? || '%' OR a.note LIKE '%' || ? || '%' OR a.name LIKE '%' || ? || '%')");
+    conds.push(
+      "(a.email LIKE '%' || ? || '%' OR a.note LIKE '%' || ? || '%' OR a.name LIKE '%' || ? || '%')",
+    );
     filterParams.push(opts.query, opts.query, opts.query);
   }
   if (opts.pinned) conds.push("a.pinned = 1");
@@ -313,25 +341,39 @@ export async function getAliasInfosWithPaginationV3(
   const rows = await db
     .prepare(sql)
     .bind(...bind)
-    .all<AliasRow & { _nb_reply: number; _nb_blocked: number; _nb_forward: number }>();
+    .all<
+      AliasRow & { _nb_reply: number; _nb_blocked: number; _nb_forward: number }
+    >();
 
   if (rows.results.length === 0) return [];
 
   // Batch-load the latest email_log + contact for the page.
   const logIds = [
-    ...new Set(rows.results.map((r) => r.last_email_log_id).filter((v): v is number => v !== null)),
+    ...new Set(
+      rows.results
+        .map((r) => r.last_email_log_id)
+        .filter((v): v is number => v !== null),
+    ),
   ];
   const logMap = new Map<number, EmailLogRow>();
   if (logIds.length > 0) {
     const ph = logIds.map((_, i) => `?${i + 1}`).join(", ");
-    const res = await db.prepare(`SELECT * FROM email_log WHERE id IN (${ph})`).bind(...logIds).all<EmailLogRow>();
+    const res = await db
+      .prepare(`SELECT * FROM email_log WHERE id IN (${ph})`)
+      .bind(...logIds)
+      .all<EmailLogRow>();
     for (const l of res.results) logMap.set(l.id, l);
   }
-  const contactIds = [...new Set([...logMap.values()].map((l) => l.contact_id))];
+  const contactIds = [
+    ...new Set([...logMap.values()].map((l) => l.contact_id)),
+  ];
   const contactMap = new Map<number, ContactRow>();
   if (contactIds.length > 0) {
     const ph = contactIds.map((_, i) => `?${i + 1}`).join(", ");
-    const res = await db.prepare(`SELECT * FROM contact WHERE id IN (${ph})`).bind(...contactIds).all<ContactRow>();
+    const res = await db
+      .prepare(`SELECT * FROM contact WHERE id IN (${ph})`)
+      .bind(...contactIds)
+      .all<ContactRow>();
     for (const c of res.results) contactMap.set(c.id, c);
   }
 
@@ -339,7 +381,9 @@ export async function getAliasInfosWithPaginationV3(
   const aliasIds = rows.results.map((r) => r.id);
   const amPh = aliasIds.map((_, i) => `?${i + 1}`).join(", ");
   const amRes = await db
-    .prepare(`SELECT alias_id, mailbox_id FROM alias_mailbox WHERE alias_id IN (${amPh}) ORDER BY id`)
+    .prepare(
+      `SELECT alias_id, mailbox_id FROM alias_mailbox WHERE alias_id IN (${amPh}) ORDER BY id`,
+    )
     .bind(...aliasIds)
     .all<{ alias_id: number; mailbox_id: number }>();
   const additionalByAlias = new Map<number, number[]>();
@@ -350,7 +394,8 @@ export async function getAliasInfosWithPaginationV3(
   }
   const allMailboxIds = new Set<number>();
   for (const r of rows.results) allMailboxIds.add(r.mailbox_id);
-  for (const list of additionalByAlias.values()) for (const id of list) allMailboxIds.add(id);
+  for (const list of additionalByAlias.values())
+    for (const id of list) allMailboxIds.add(id);
   const mbMap = await fetchMailboxMap(db, [...allMailboxIds]);
 
   return rows.results.map((row) => {
@@ -359,21 +404,33 @@ export async function getAliasInfosWithPaginationV3(
 
     // Alias.mailboxes property: [primary] + additional, deduped, verified-only, email-sorted.
     const ids = [alias.mailbox_id];
-    for (const id of additionalByAlias.get(alias.id) ?? []) if (!ids.includes(id)) ids.push(id);
+    for (const id of additionalByAlias.get(alias.id) ?? [])
+      if (!ids.includes(id)) ids.push(id);
     const verified = ids
       .map((id) => mbMap.get(id))
       .filter((m): m is MailboxRow => !!m && !!m.verified)
       .sort((a, b) => (a.email < b.email ? -1 : a.email > b.email ? 1 : 0));
-    const mailboxes: MailboxLite[] = verified.map((m) => ({ id: m.id, email: m.email }));
-    const supportPgp = verified.some((m) => !!m.pgp_finger_print && !m.disable_pgp);
+    const mailboxes: MailboxLite[] = verified.map((m) => ({
+      id: m.id,
+      email: m.email,
+    }));
+    const supportPgp = verified.some(
+      (m) => !!m.pgp_finger_print && !m.disable_pgp,
+    );
 
     const primary = mbMap.get(alias.mailbox_id);
-    const latestEmailLog = alias.last_email_log_id ? logMap.get(alias.last_email_log_id) ?? null : null;
-    const latestContact = latestEmailLog ? contactMap.get(latestEmailLog.contact_id) ?? null : null;
+    const latestEmailLog = alias.last_email_log_id
+      ? (logMap.get(alias.last_email_log_id) ?? null)
+      : null;
+    const latestContact = latestEmailLog
+      ? (contactMap.get(latestEmailLog.contact_id) ?? null)
+      : null;
 
     return {
       alias,
-      mailbox: primary ? { id: primary.id, email: primary.email } : { id: alias.mailbox_id, email: "" },
+      mailbox: primary
+        ? { id: primary.id, email: primary.email }
+        : { id: alias.mailbox_id, email: "" },
       mailboxes,
       nb_forward: _nb_forward,
       nb_blocked: _nb_blocked,

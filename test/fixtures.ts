@@ -5,6 +5,7 @@
  * latest-activity behaviour can be made deterministic.
  */
 
+import { addDays, addHours, nowStr, toStr } from "../src/lib/dates";
 import type {
   AliasRow,
   ApiKeyRow,
@@ -13,14 +14,17 @@ import type {
   MailboxRow,
   UserRow,
 } from "../src/lib/rows";
-import { addDays, addHours, nowStr, toStr } from "../src/lib/dates";
 
 let seq = 0;
 const uniq = () => ++seq;
 
 type Overrides = Record<string, unknown>;
 
-async function insertRow<T>(db: D1Database, table: string, values: Overrides): Promise<T> {
+async function insertRow<T>(
+  db: D1Database,
+  table: string,
+  values: Overrides,
+): Promise<T> {
   const cols = Object.keys(values);
   const placeholders = cols.map((_, i) => `?${i + 1}`).join(", ");
   const columnList = cols.map((c) => `"${c}"`).join(", ");
@@ -47,7 +51,10 @@ function randomCode(len = 60): string {
  * Insert an activated user (trial_end 7d1h in the future, flags=1, uuid
  * alternative_id) plus a verified default mailbox, and wire up default_mailbox_id.
  */
-export async function createUser(db: D1Database, overrides: Overrides = {}): Promise<UserRow> {
+export async function createUser(
+  db: D1Database,
+  overrides: Overrides = {},
+): Promise<UserRow> {
   const n = uniq();
   const values: Overrides = {
     email: `user${n}@example.com`,
@@ -60,14 +67,23 @@ export async function createUser(db: D1Database, overrides: Overrides = {}): Pro
   const user = await insertRow<UserRow>(db, "users", values);
   const mailbox = await createMailbox(db, user.id, user.email, { verified: 1 });
   await db
-    .prepare("UPDATE users SET default_mailbox_id = ?1, updated_at = ?2 WHERE id = ?3")
+    .prepare(
+      "UPDATE users SET default_mailbox_id = ?1, updated_at = ?2 WHERE id = ?3",
+    )
     .bind(mailbox.id, nowStr(), user.id)
     .run();
   return { ...user, default_mailbox_id: mailbox.id };
 }
 
-export function createApiKey(db: D1Database, userId: number, code?: string): Promise<ApiKeyRow> {
-  return insertRow<ApiKeyRow>(db, "api_key", { user_id: userId, code: code ?? randomCode() });
+export function createApiKey(
+  db: D1Database,
+  userId: number,
+  code?: string,
+): Promise<ApiKeyRow> {
+  return insertRow<ApiKeyRow>(db, "api_key", {
+    user_id: userId,
+    code: code ?? randomCode(),
+  });
 }
 
 export function createMailbox(
@@ -76,7 +92,12 @@ export function createMailbox(
   email: string,
   overrides: Overrides = {},
 ): Promise<MailboxRow> {
-  return insertRow<MailboxRow>(db, "mailbox", { user_id: userId, email, verified: 1, ...overrides });
+  return insertRow<MailboxRow>(db, "mailbox", {
+    user_id: userId,
+    email,
+    verified: 1,
+    ...overrides,
+  });
 }
 
 export function createAlias(
@@ -122,7 +143,7 @@ export async function createEmailLog(
   overrides: Overrides = {},
 ): Promise<EmailLogRow> {
   let aliasId: number | null;
-  if (Object.prototype.hasOwnProperty.call(overrides, "alias_id")) {
+  if (Object.hasOwn(overrides, "alias_id")) {
     aliasId = overrides.alias_id as number | null;
   } else {
     const c = await db
@@ -132,13 +153,21 @@ export async function createEmailLog(
     aliasId = c?.alias_id ?? null;
   }
 
-  const values: Overrides = { user_id: userId, contact_id: contactId, alias_id: aliasId, ...overrides };
-  if (typeof values.message_id === "string") values.message_id = values.message_id.slice(0, 250);
+  const values: Overrides = {
+    user_id: userId,
+    contact_id: contactId,
+    alias_id: aliasId,
+    ...overrides,
+  };
+  if (typeof values.message_id === "string")
+    values.message_id = values.message_id.slice(0, 250);
 
   const log = await insertRow<EmailLogRow>(db, "email_log", values);
   if (aliasId != null) {
     await db
-      .prepare("UPDATE alias SET last_email_log_id = ?1, updated_at = ?2 WHERE id = ?3")
+      .prepare(
+        "UPDATE alias SET last_email_log_id = ?1, updated_at = ?2 WHERE id = ?3",
+      )
       .bind(log.id, nowStr(), aliasId)
       .run();
   }

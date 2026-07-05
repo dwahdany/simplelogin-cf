@@ -1,8 +1,8 @@
 import type { Context, MiddlewareHandler } from "hono";
+import { addMinutes, nowStr, toDate } from "./dates";
 import type { Env } from "./env";
-import type { ApiKeyRow, UserRow } from "./rows";
 import { jsonError } from "./errors";
-import { nowStr, addMinutes, toDate } from "./dates";
+import type { ApiKeyRow, UserRow } from "./rows";
 import { getSession, type SessionData } from "./session";
 
 /**
@@ -98,7 +98,9 @@ export const requireApiSudo: MiddlewareHandler<AppEnv> = async (c, next) => {
   const err = await authorizeRequest(c);
   if (err) return err;
   const apiKey = c.get("apiKey");
-  if (apiKey ? !sudoModeIsActive(apiKey) : !sessionSudoIsActive(c.get("session"))) {
+  if (
+    apiKey ? !sudoModeIsActive(apiKey) : !sessionSudoIsActive(c.get("session"))
+  ) {
     return jsonError(c, 440, "Need sudo");
   }
   await next();

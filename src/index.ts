@@ -1,9 +1,9 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { AppEnv } from "./lib/auth";
-import { authRoutes } from "./routes/auth";
-import { aliasRoutes } from "./routes/aliases";
 import { aliasCreationRoutes } from "./routes/alias-creation";
+import { aliasRoutes } from "./routes/aliases";
+import { authRoutes } from "./routes/auth";
 import { mailboxDomainRoutes } from "./routes/mailboxes";
 import { userRoutes } from "./routes/user";
 

@@ -79,7 +79,12 @@ export function rateLimit(
     }
     const now = Date.now() / 1000;
     for (const win of windows) {
-      const count = await hitWindow(c.env.DB, `rl:${name}:${subject}`, win, now);
+      const count = await hitWindow(
+        c.env.DB,
+        `rl:${name}:${subject}`,
+        win,
+        now,
+      );
       if (count > win.limit) return rateLimited(c);
     }
     return next();
@@ -95,7 +100,9 @@ export function requestLock(name: string): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
     if (c.env.DISABLE_RATE_LIMIT) return next();
     const user = c.get("user");
-    const subject = user ? `user:${user.id}` : `ip:${clientIp(c.req.raw.headers)}`;
+    const subject = user
+      ? `user:${user.id}`
+      : `ip:${clientIp(c.req.raw.headers)}`;
     const key = `lock:${subject}:${name}`;
     const now = Math.floor(Date.now() / 1000);
     const acquired = await c.env.DB.prepare(

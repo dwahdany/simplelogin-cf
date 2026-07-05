@@ -12,6 +12,7 @@
  * - free alias limit excludes trashed aliases and applies even during trial
  */
 
+import { nowStr, toDate } from "./dates";
 import type { Env } from "./env";
 import type {
   AliasRow,
@@ -19,14 +20,13 @@ import type {
   CoinbaseSubscriptionRow,
   ContactRow,
   CustomDomainRow,
-  ManualSubscriptionRow,
   MailboxRow,
+  ManualSubscriptionRow,
   PartnerSubscriptionRow,
   PublicDomainRow,
   SubscriptionRow,
   UserRow,
 } from "./rows";
-import { toDate, nowStr } from "./dates";
 
 // ---- constants (specs/06 §2.2, §2.3; specs/08 §2) ----
 export const PADDLE_SUBSCRIPTION_GRACE_DAYS = 14;
@@ -68,35 +68,55 @@ export interface PremiumInputs {
 /** Paddle: active until next_bill_date + 14d (DATE granularity, cancelled included). */
 export function paddleActive(sub: SubscriptionRow | null, now: Date): boolean {
   if (!sub) return false;
-  const graceDate = dateOnlyUTC(new Date(now.getTime() - PADDLE_SUBSCRIPTION_GRACE_DAYS * DAY_MS));
+  const graceDate = dateOnlyUTC(
+    new Date(now.getTime() - PADDLE_SUBSCRIPTION_GRACE_DAYS * DAY_MS),
+  );
   // next_bill_date is stored 'YYYY-MM-DD'; lexicographic compare == date compare.
   return sub.next_bill_date >= graceDate;
 }
 
 /** Apple: expires_date > now - 16 days. */
-export function appleValid(sub: AppleSubscriptionRow | null, now: Date): boolean {
+export function appleValid(
+  sub: AppleSubscriptionRow | null,
+  now: Date,
+): boolean {
   if (!sub) return false;
-  return toDate(sub.expires_date).getTime() > now.getTime() - APPLE_GRACE_PERIOD_DAYS * DAY_MS;
+  return (
+    toDate(sub.expires_date).getTime() >
+    now.getTime() - APPLE_GRACE_PERIOD_DAYS * DAY_MS
+  );
 }
 
 /** Manual: end_at > now. */
-export function manualActive(sub: ManualSubscriptionRow | null, now: Date): boolean {
+export function manualActive(
+  sub: ManualSubscriptionRow | null,
+  now: Date,
+): boolean {
   if (!sub) return false;
   return toDate(sub.end_at).getTime() > now.getTime();
 }
 
 /** Coinbase: end_at > now. */
-export function coinbaseActive(sub: CoinbaseSubscriptionRow | null, now: Date): boolean {
+export function coinbaseActive(
+  sub: CoinbaseSubscriptionRow | null,
+  now: Date,
+): boolean {
   if (!sub) return false;
   return toDate(sub.end_at).getTime() > now.getTime();
 }
 
 /** Partner: lifetime OR end_at > now - 14 days (end_at nullable for lifetime subs). */
-export function partnerActive(sub: PartnerSubscriptionRow | null, now: Date): boolean {
+export function partnerActive(
+  sub: PartnerSubscriptionRow | null,
+  now: Date,
+): boolean {
   if (!sub) return false;
   if (sub.lifetime) return true;
   if (!sub.end_at) return false;
-  return toDate(sub.end_at).getTime() > now.getTime() - PARTNER_SUBSCRIPTION_GRACE_DAYS * DAY_MS;
+  return (
+    toDate(sub.end_at).getTime() >
+    now.getTime() - PARTNER_SUBSCRIPTION_GRACE_DAYS * DAY_MS
+  );
 }
 
 /**
@@ -133,7 +153,11 @@ export function lifetimeOrActiveSubscription(
  * window. Note the trial branch is the *simple* check (trial_end && now <
  * trial_end), independent of subscriptions — same as Flask.
  */
-export function isPremium(subs: PremiumInputs, now: Date = new Date(), includePartner = true): boolean {
+export function isPremium(
+  subs: PremiumInputs,
+  now: Date = new Date(),
+  includePartner = true,
+): boolean {
   if (lifetimeOrActiveSubscription(subs, now, includePartner)) return true;
   return !!subs.trialEnd && now.getTime() < toDate(subs.trialEnd).getTime();
 }
@@ -172,10 +196,22 @@ async function fetchSubs(
   userId: number,
 ): Promise<Omit<PremiumInputs, "lifetime" | "trialEnd">> {
   const [paddle, apple, manual, coinbase, partner] = await Promise.all([
-    db.prepare("SELECT * FROM subscription WHERE user_id = ?1").bind(userId).first<SubscriptionRow>(),
-    db.prepare("SELECT * FROM apple_subscription WHERE user_id = ?1").bind(userId).first<AppleSubscriptionRow>(),
-    db.prepare("SELECT * FROM manual_subscription WHERE user_id = ?1").bind(userId).first<ManualSubscriptionRow>(),
-    db.prepare("SELECT * FROM coinbase_subscription WHERE user_id = ?1").bind(userId).first<CoinbaseSubscriptionRow>(),
+    db
+      .prepare("SELECT * FROM subscription WHERE user_id = ?1")
+      .bind(userId)
+      .first<SubscriptionRow>(),
+    db
+      .prepare("SELECT * FROM apple_subscription WHERE user_id = ?1")
+      .bind(userId)
+      .first<AppleSubscriptionRow>(),
+    db
+      .prepare("SELECT * FROM manual_subscription WHERE user_id = ?1")
+      .bind(userId)
+      .first<ManualSubscriptionRow>(),
+    db
+      .prepare("SELECT * FROM coinbase_subscription WHERE user_id = ?1")
+      .bind(userId)
+      .first<CoinbaseSubscriptionRow>(),
     db
       .prepare(
         `SELECT ps.* FROM partner_subscription ps
@@ -189,25 +225,43 @@ async function fetchSubs(
 }
 
 /** Build PremiumInputs from an already-loaded user row + its subscription rows. */
-export async function premiumInputsForUser(db: D1Database, user: UserRow): Promise<PremiumInputs> {
+export async function premiumInputsForUser(
+  db: D1Database,
+  user: UserRow,
+): Promise<PremiumInputs> {
   const subs = await fetchSubs(db, user.id);
   return { lifetime: !!user.lifetime, trialEnd: user.trial_end, ...subs };
 }
 
 /** Load everything needed to evaluate `isPremium` for a user id. */
-export async function getPremiumInputs(db: D1Database, userId: number): Promise<PremiumInputs> {
+export async function getPremiumInputs(
+  db: D1Database,
+  userId: number,
+): Promise<PremiumInputs> {
   const user = await getUserById(db, userId);
   const subs = await fetchSubs(db, userId);
-  return { lifetime: !!user?.lifetime, trialEnd: user?.trial_end ?? null, ...subs };
+  return {
+    lifetime: !!user?.lifetime,
+    trialEnd: user?.trial_end ?? null,
+    ...subs,
+  };
 }
 
 /** Convenience: fetch + evaluate premium status for a loaded user. */
-export async function userIsPremium(db: D1Database, user: UserRow, now: Date = new Date()): Promise<boolean> {
+export async function userIsPremium(
+  db: D1Database,
+  user: UserRow,
+  now: Date = new Date(),
+): Promise<boolean> {
   return isPremium(await premiumInputsForUser(db, user), now);
 }
 
 /** Faithful User.in_trial(): NOT lifetime/active subscription AND simple trial. */
-export async function userInTrial(db: D1Database, user: UserRow, now: Date = new Date()): Promise<boolean> {
+export async function userInTrial(
+  db: D1Database,
+  user: UserRow,
+  now: Date = new Date(),
+): Promise<boolean> {
   const subs = await premiumInputsForUser(db, user);
   if (lifetimeOrActiveSubscription(subs, now)) return false;
   return inTrial(user, now);
@@ -228,7 +282,9 @@ export async function canCreateNewAlias(
   const subs = await premiumInputsForUser(db, user);
   if (lifetimeOrActiveSubscription(subs, now)) return true;
   const row = await db
-    .prepare("SELECT COUNT(*) AS n FROM alias WHERE user_id = ?1 AND delete_on IS NULL")
+    .prepare(
+      "SELECT COUNT(*) AS n FROM alias WHERE user_id = ?1 AND delete_on IS NULL",
+    )
     .bind(user.id)
     .first<{ n: number }>();
   const count = row?.n ?? 0;
@@ -260,7 +316,11 @@ export async function getSLDomains(
     params.push(user.default_alias_public_domain_id);
   }
   // show_sl_domains defaults to true.
-  orConds.push(premium ? "(partner_id IS NULL)" : "(partner_id IS NULL AND premium_only = 0)");
+  orConds.push(
+    premium
+      ? "(partner_id IS NULL)"
+      : "(partner_id IS NULL AND premium_only = 0)",
+  );
 
   const sql = `SELECT * FROM public_domain WHERE hidden = 0 AND (${orConds.join(" OR ")}) ORDER BY "order"`;
   const res = await db
@@ -274,12 +334,24 @@ export async function getSLDomains(
  * available_sl_email() (models.py L1557): an address is free iff it is not an
  * alias email, not a contact reply_email, and not a deleted_alias email.
  */
-export async function availableSlEmail(db: D1Database, email: string): Promise<boolean> {
-  const alias = await db.prepare("SELECT 1 FROM alias WHERE email = ?1 LIMIT 1").bind(email).first();
+export async function availableSlEmail(
+  db: D1Database,
+  email: string,
+): Promise<boolean> {
+  const alias = await db
+    .prepare("SELECT 1 FROM alias WHERE email = ?1 LIMIT 1")
+    .bind(email)
+    .first();
   if (alias) return false;
-  const contact = await db.prepare("SELECT 1 FROM contact WHERE reply_email = ?1 LIMIT 1").bind(email).first();
+  const contact = await db
+    .prepare("SELECT 1 FROM contact WHERE reply_email = ?1 LIMIT 1")
+    .bind(email)
+    .first();
   if (contact) return false;
-  const deleted = await db.prepare("SELECT 1 FROM deleted_alias WHERE email = ?1 LIMIT 1").bind(email).first();
+  const deleted = await db
+    .prepare("SELECT 1 FROM deleted_alias WHERE email = ?1 LIMIT 1")
+    .bind(email)
+    .first();
   if (deleted) return false;
   return true;
 }
@@ -298,13 +370,19 @@ export async function defaultRandomAliasDomain(
   const firstAliasDomain = env.FIRST_ALIAS_DOMAIN || env.EMAIL_DOMAIN;
 
   if (user.default_alias_custom_domain_id) {
-    const cd = await getCustomDomainById(db, user.default_alias_custom_domain_id);
-    if (!cd || !cd.verified || cd.user_id !== user.id) return firstAliasDomain;
+    const cd = await getCustomDomainById(
+      db,
+      user.default_alias_custom_domain_id,
+    );
+    if (!cd?.verified || cd.user_id !== user.id) return firstAliasDomain;
     return cd.domain;
   }
 
   if (user.default_alias_public_domain_id) {
-    const sl = await getPublicDomainById(db, user.default_alias_public_domain_id);
+    const sl = await getPublicDomainById(
+      db,
+      user.default_alias_public_domain_id,
+    );
     if (!sl) return firstAliasDomain;
     if (sl.premium_only && !(await userIsPremium(db, user, now))) {
       await db
@@ -324,50 +402,97 @@ export async function defaultRandomAliasDomain(
 
 // ---- small typed query helpers used across routes ----
 
-export function getUserById(db: D1Database, id: number): Promise<UserRow | null> {
-  return db.prepare("SELECT * FROM users WHERE id = ?1").bind(id).first<UserRow>();
+export function getUserById(
+  db: D1Database,
+  id: number,
+): Promise<UserRow | null> {
+  return db
+    .prepare("SELECT * FROM users WHERE id = ?1")
+    .bind(id)
+    .first<UserRow>();
 }
 
-export function getAliasById(db: D1Database, id: number): Promise<AliasRow | null> {
-  return db.prepare("SELECT * FROM alias WHERE id = ?1").bind(id).first<AliasRow>();
+export function getAliasById(
+  db: D1Database,
+  id: number,
+): Promise<AliasRow | null> {
+  return db
+    .prepare("SELECT * FROM alias WHERE id = ?1")
+    .bind(id)
+    .first<AliasRow>();
 }
 
-export function getMailboxById(db: D1Database, id: number): Promise<MailboxRow | null> {
-  return db.prepare("SELECT * FROM mailbox WHERE id = ?1").bind(id).first<MailboxRow>();
+export function getMailboxById(
+  db: D1Database,
+  id: number,
+): Promise<MailboxRow | null> {
+  return db
+    .prepare("SELECT * FROM mailbox WHERE id = ?1")
+    .bind(id)
+    .first<MailboxRow>();
 }
 
-export function getContactById(db: D1Database, id: number): Promise<ContactRow | null> {
-  return db.prepare("SELECT * FROM contact WHERE id = ?1").bind(id).first<ContactRow>();
+export function getContactById(
+  db: D1Database,
+  id: number,
+): Promise<ContactRow | null> {
+  return db
+    .prepare("SELECT * FROM contact WHERE id = ?1")
+    .bind(id)
+    .first<ContactRow>();
 }
 
-export function getCustomDomainById(db: D1Database, id: number): Promise<CustomDomainRow | null> {
-  return db.prepare("SELECT * FROM custom_domain WHERE id = ?1").bind(id).first<CustomDomainRow>();
+export function getCustomDomainById(
+  db: D1Database,
+  id: number,
+): Promise<CustomDomainRow | null> {
+  return db
+    .prepare("SELECT * FROM custom_domain WHERE id = ?1")
+    .bind(id)
+    .first<CustomDomainRow>();
 }
 
-export function getPublicDomainById(db: D1Database, id: number): Promise<PublicDomainRow | null> {
-  return db.prepare("SELECT * FROM public_domain WHERE id = ?1").bind(id).first<PublicDomainRow>();
+export function getPublicDomainById(
+  db: D1Database,
+  id: number,
+): Promise<PublicDomainRow | null> {
+  return db
+    .prepare("SELECT * FROM public_domain WHERE id = ?1")
+    .bind(id)
+    .first<PublicDomainRow>();
 }
 
 /**
  * Mailbox ids for an alias, primary (alias.mailbox_id) first, then the
  * additional alias_mailbox rows (id-ordered), deduped.
  */
-export async function aliasMailboxIds(db: D1Database, aliasId: number): Promise<number[]> {
+export async function aliasMailboxIds(
+  db: D1Database,
+  aliasId: number,
+): Promise<number[]> {
   const alias = await getAliasById(db, aliasId);
   if (!alias) return [];
   const rows = await db
-    .prepare("SELECT mailbox_id FROM alias_mailbox WHERE alias_id = ?1 ORDER BY id")
+    .prepare(
+      "SELECT mailbox_id FROM alias_mailbox WHERE alias_id = ?1 ORDER BY id",
+    )
     .bind(aliasId)
     .all<{ mailbox_id: number }>();
   const ids = [alias.mailbox_id];
-  for (const r of rows.results) if (!ids.includes(r.mailbox_id)) ids.push(r.mailbox_id);
+  for (const r of rows.results)
+    if (!ids.includes(r.mailbox_id)) ids.push(r.mailbox_id);
   return ids;
 }
 
 /** All verified mailboxes for a user, email-sorted. */
-export async function userVerifiedMailboxes(db: D1Database, userId: number): Promise<MailboxRow[]> {
+export async function userVerifiedMailboxes(
+  db: D1Database,
+  userId: number,
+): Promise<MailboxRow[]> {
   const res = await db
-    .prepare("SELECT * FROM mailbox WHERE user_id = ?1 AND verified = 1 ORDER BY email")
+    .prepare(
+      "SELECT * FROM mailbox WHERE user_id = ?1 AND verified = 1 ORDER BY email",
+    )
     .bind(userId)
     .all<MailboxRow>();
   return res.results;

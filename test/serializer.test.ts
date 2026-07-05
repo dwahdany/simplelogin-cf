@@ -1,16 +1,16 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { toEpoch } from "../src/lib/dates";
+import type { ContactRow } from "../src/lib/rows";
 import type { AliasInfo } from "../src/lib/serializer";
 import {
-  getAliasInfoV2,
   getAliasInfosWithPaginationV3,
+  getAliasInfoV2,
   reverseAliasDisplay,
   serializeAliasInfo,
   serializeAliasInfoV2,
   serializeContact,
 } from "../src/lib/serializer";
-import type { ContactRow } from "../src/lib/rows";
 import {
   createAlias,
   createContact,
@@ -140,11 +140,25 @@ describe("serializeAliasInfoV2", () => {
     const out = serializeAliasInfoV2(
       baseInfo({
         latestEmailLog: {
-          id: 5, created_at: "2024-06-01 00:00:00+00:00", updated_at: null, user_id: 1,
-          contact_id: 9, alias_id: 7, is_reply: 1, blocked: 0, bounced: 0, auto_replied: 0,
-          is_spam: 0, spam_score: null, spam_status: null, spam_report: null,
-          refused_email_id: null, mailbox_id: null, bounced_mailbox_id: null,
-          message_id: null, sl_message_id: null,
+          id: 5,
+          created_at: "2024-06-01 00:00:00+00:00",
+          updated_at: null,
+          user_id: 1,
+          contact_id: 9,
+          alias_id: 7,
+          is_reply: 1,
+          blocked: 0,
+          bounced: 0,
+          auto_replied: 0,
+          is_spam: 0,
+          spam_score: null,
+          spam_status: null,
+          spam_report: null,
+          refused_email_id: null,
+          mailbox_id: null,
+          bounced_mailbox_id: null,
+          message_id: null,
+          sl_message_id: null,
         },
         latestContact: contact,
         senderFormat: 0,
@@ -164,37 +178,64 @@ describe("serializeAliasInfoV2", () => {
 
 describe("reverseAliasDisplay / serializeContact", () => {
   const contact = (over: Partial<ContactRow> = {}): ContactRow => ({
-    id: 1, created_at: CREATED, updated_at: null, user_id: 1, alias_id: 1,
-    name: "John Wick", website_email: "john@wick.com", website_from: null,
-    reply_email: "ra@sl.test", is_cc: 0, pgp_public_key: null, pgp_finger_print: null,
-    mail_from: null, invalid_email: 0, block_forward: 0, automatic_created: 0, flags: 0,
+    id: 1,
+    created_at: CREATED,
+    updated_at: null,
+    user_id: 1,
+    alias_id: 1,
+    name: "John Wick",
+    website_email: "john@wick.com",
+    website_from: null,
+    reply_email: "ra@sl.test",
+    is_cc: 0,
+    pgp_public_key: null,
+    pgp_finger_print: null,
+    mail_from: null,
+    invalid_email: 0,
+    block_forward: 0,
+    automatic_created: 0,
+    flags: 0,
     ...over,
   });
 
   it("AT format (0/default/unknown): @ becomes ' at '", () => {
-    expect(reverseAliasDisplay(contact(), 0)).toBe('"John Wick | john at wick.com" <ra@sl.test>');
-    expect(reverseAliasDisplay(contact(), null)).toBe('"John Wick | john at wick.com" <ra@sl.test>');
+    expect(reverseAliasDisplay(contact(), 0)).toBe(
+      '"John Wick | john at wick.com" <ra@sl.test>',
+    );
+    expect(reverseAliasDisplay(contact(), null)).toBe(
+      '"John Wick | john at wick.com" <ra@sl.test>',
+    );
   });
 
   it("A format (2): @ becomes '(a)'", () => {
-    expect(reverseAliasDisplay(contact(), 2)).toBe('"John Wick | john(a)wick.com" <ra@sl.test>');
+    expect(reverseAliasDisplay(contact(), 2)).toBe(
+      '"John Wick | john(a)wick.com" <ra@sl.test>',
+    );
   });
 
   it("NO_NAME/AT_ONLY/NAME_ONLY (5/6/7) keep the address unchanged", () => {
-    expect(reverseAliasDisplay(contact(), 7)).toBe('"John Wick | john@wick.com" <ra@sl.test>');
+    expect(reverseAliasDisplay(contact(), 7)).toBe(
+      '"John Wick | john@wick.com" <ra@sl.test>',
+    );
   });
 
   it("no name -> just the (formatted) email", () => {
-    expect(reverseAliasDisplay(contact({ name: null }), 0)).toBe('"john at wick.com" <ra@sl.test>');
+    expect(reverseAliasDisplay(contact({ name: null }), 0)).toBe(
+      '"john at wick.com" <ra@sl.test>',
+    );
   });
 
   it("parses the name from website_from when name is empty, stripping quotes", () => {
     const c = contact({ name: null, website_from: '"AB CD" <john@wick.com>' });
-    expect(reverseAliasDisplay(c, 0)).toBe('"AB CD | john at wick.com" <ra@sl.test>');
+    expect(reverseAliasDisplay(c, 0)).toBe(
+      '"AB CD | john at wick.com" <ra@sl.test>',
+    );
   });
 
   it("strips double quotes out of the display name", () => {
-    expect(reverseAliasDisplay(contact({ name: 'Jo"hn' }), 0)).toBe('"John | john at wick.com" <ra@sl.test>');
+    expect(reverseAliasDisplay(contact({ name: 'Jo"hn' }), 0)).toBe(
+      '"John | john at wick.com" <ra@sl.test>',
+    );
   });
 
   it("serializeContact has the exact key set and fills last_email_sent_* from lastReply", () => {
@@ -215,14 +256,23 @@ describe("reverseAliasDisplay / serializeContact", () => {
     );
     expect(out.last_email_sent_date).toBeNull();
     expect(out.reverse_alias_address).toBe("ra@sl.test");
-    expect(out.reverse_alias).toBe('"John Wick | john at wick.com" <ra@sl.test>');
+    expect(out.reverse_alias).toBe(
+      '"John Wick | john at wick.com" <ra@sl.test>',
+    );
 
-    const withReply = serializeContact(contact(), true, { sender_format: 0 } as any, {
-      created_at: "2024-06-01 00:00:00+00:00",
-    } as any);
+    const withReply = serializeContact(
+      contact(),
+      true,
+      { sender_format: 0 } as any,
+      {
+        created_at: "2024-06-01 00:00:00+00:00",
+      } as any,
+    );
     expect(withReply.existed).toBe(true);
     expect(withReply.last_email_sent_date).toBe("2024-06-01 00:00:00+00:00");
-    expect(withReply.last_email_sent_timestamp).toBe(toEpoch("2024-06-01 00:00:00+00:00"));
+    expect(withReply.last_email_sent_timestamp).toBe(
+      toEpoch("2024-06-01 00:00:00+00:00"),
+    );
   });
 });
 
@@ -232,16 +282,30 @@ describe("getAliasInfoV2", () => {
     const primary = await createMailbox(env.DB, user.id, "primary@mb.test", {
       pgp_finger_print: "FPR",
     });
-    const secondary = await createMailbox(env.DB, user.id, "sec@mb.test", { verified: 0 });
+    const secondary = await createMailbox(env.DB, user.id, "sec@mb.test", {
+      verified: 0,
+    });
     const alias = await createAlias(env.DB, user.id, primary.id, {
       created_at: "2024-01-01 00:00:00+00:00",
     });
-    await env.DB.prepare("INSERT INTO alias_mailbox (alias_id, mailbox_id) VALUES (?1,?2)")
-      .bind(alias.id, secondary.id).run();
+    await env.DB.prepare(
+      "INSERT INTO alias_mailbox (alias_id, mailbox_id) VALUES (?1,?2)",
+    )
+      .bind(alias.id, secondary.id)
+      .run();
 
-    const contact = await createContact(env.DB, user.id, alias.id, { name: "C", website_email: "c@ex.test" });
-    await createEmailLog(env.DB, user.id, contact.id, { created_at: "2024-01-02 00:00:00+00:00", blocked: 1 });
-    await createEmailLog(env.DB, user.id, contact.id, { created_at: "2024-01-03 00:00:00+00:00", is_reply: 1 });
+    const contact = await createContact(env.DB, user.id, alias.id, {
+      name: "C",
+      website_email: "c@ex.test",
+    });
+    await createEmailLog(env.DB, user.id, contact.id, {
+      created_at: "2024-01-02 00:00:00+00:00",
+      blocked: 1,
+    });
+    await createEmailLog(env.DB, user.id, contact.id, {
+      created_at: "2024-01-03 00:00:00+00:00",
+      is_reply: 1,
+    });
 
     const info = await getAliasInfoV2(env.DB, alias, user);
     expect(info.nb_blocked).toBe(1);
@@ -250,14 +314,19 @@ describe("getAliasInfoV2", () => {
     expect(info.latestEmailLog?.created_at).toBe("2024-01-03 00:00:00+00:00");
     expect(info.latestContact?.website_email).toBe("c@ex.test");
     // includes the unverified secondary mailbox (single-alias quirk)
-    expect(info.mailboxes.map((m) => m.email).sort()).toEqual(["primary@mb.test", "sec@mb.test"]);
+    expect(info.mailboxes.map((m) => m.email).sort()).toEqual([
+      "primary@mb.test",
+      "sec@mb.test",
+    ]);
     // support_pgp is computed only over verified mailboxes (primary has a fingerprint)
     expect(info.supportPgp).toBe(true);
 
     const out = serializeAliasInfoV2(info);
     expect((out.latest_activity as any).action).toBe("reply");
     // sender_format A(2) applied to the reverse alias
-    expect((out.latest_activity as any).contact.reverse_alias).toBe('"C | c(a)ex.test" <' + contact.reply_email + ">");
+    expect((out.latest_activity as any).contact.reverse_alias).toBe(
+      `"C | c(a)ex.test" <${contact.reply_email}>`,
+    );
   });
 
   it("a log exactly at created_at is counted but is not the latest activity", async () => {
@@ -266,7 +335,10 @@ describe("getAliasInfoV2", () => {
       created_at: "2024-01-01 00:00:00+00:00",
     });
     const contact = await createContact(env.DB, user.id, alias.id);
-    await createEmailLog(env.DB, user.id, contact.id, { created_at: "2024-01-01 00:00:00+00:00", blocked: 1 });
+    await createEmailLog(env.DB, user.id, contact.id, {
+      created_at: "2024-01-01 00:00:00+00:00",
+      blocked: 1,
+    });
 
     const info = await getAliasInfoV2(env.DB, alias, user);
     expect(info.nb_blocked).toBe(1);
@@ -282,21 +354,34 @@ describe("getAliasInfosWithPaginationV3", () => {
 
     // A: created early, but a recent email_log -> recent activity
     const aliasA = await createAlias(env.DB, user.id, mb, {
-      email: "a@sl.test", created_at: "2024-01-01 00:00:00+00:00",
+      email: "a@sl.test",
+      created_at: "2024-01-01 00:00:00+00:00",
     });
     const cA = await createContact(env.DB, user.id, aliasA.id);
-    await createEmailLog(env.DB, user.id, cA.id, { created_at: "2024-06-01 00:00:00+00:00", is_reply: 1 });
+    await createEmailLog(env.DB, user.id, cA.id, {
+      created_at: "2024-06-01 00:00:00+00:00",
+      is_reply: 1,
+    });
 
     // B: created later, no activity
-    await createAlias(env.DB, user.id, mb, { email: "b@sl.test", created_at: "2024-03-01 00:00:00+00:00" });
+    await createAlias(env.DB, user.id, mb, {
+      email: "b@sl.test",
+      created_at: "2024-03-01 00:00:00+00:00",
+    });
 
     // P: pinned, oldest -> must still sort first
     await createAlias(env.DB, user.id, mb, {
-      email: "p@sl.test", created_at: "2020-01-01 00:00:00+00:00", pinned: 1,
+      email: "p@sl.test",
+      created_at: "2020-01-01 00:00:00+00:00",
+      pinned: 1,
     });
 
     const page = await getAliasInfosWithPaginationV3(env.DB, user, 0);
-    expect(page.map((i) => i.alias.email)).toEqual(["p@sl.test", "a@sl.test", "b@sl.test"]);
+    expect(page.map((i) => i.alias.email)).toEqual([
+      "p@sl.test",
+      "a@sl.test",
+      "b@sl.test",
+    ]);
 
     // latest_activity correctness on A
     const infoA = page.find((i) => i.alias.email === "a@sl.test")!;
@@ -310,22 +395,45 @@ describe("getAliasInfosWithPaginationV3", () => {
   it("presence filters follow precedence pinned > disabled > enabled", async () => {
     const user = await createUser(env.DB);
     const mb = user.default_mailbox_id!;
-    await createAlias(env.DB, user.id, mb, { email: "en@sl.test", enabled: 1, pinned: 0 });
-    await createAlias(env.DB, user.id, mb, { email: "dis@sl.test", enabled: 0, pinned: 0 });
-    await createAlias(env.DB, user.id, mb, { email: "pin@sl.test", enabled: 1, pinned: 1 });
+    await createAlias(env.DB, user.id, mb, {
+      email: "en@sl.test",
+      enabled: 1,
+      pinned: 0,
+    });
+    await createAlias(env.DB, user.id, mb, {
+      email: "dis@sl.test",
+      enabled: 0,
+      pinned: 0,
+    });
+    await createAlias(env.DB, user.id, mb, {
+      email: "pin@sl.test",
+      enabled: 1,
+      pinned: 1,
+    });
 
-    const enabled = await getAliasInfosWithPaginationV3(env.DB, user, 0, { enabled: true });
-    expect(enabled.map((i) => i.alias.email).sort()).toEqual(["en@sl.test", "pin@sl.test"]);
+    const enabled = await getAliasInfosWithPaginationV3(env.DB, user, 0, {
+      enabled: true,
+    });
+    expect(enabled.map((i) => i.alias.email).sort()).toEqual([
+      "en@sl.test",
+      "pin@sl.test",
+    ]);
 
-    const disabled = await getAliasInfosWithPaginationV3(env.DB, user, 0, { disabled: true });
+    const disabled = await getAliasInfosWithPaginationV3(env.DB, user, 0, {
+      disabled: true,
+    });
     expect(disabled.map((i) => i.alias.email)).toEqual(["dis@sl.test"]);
 
-    const pinned = await getAliasInfosWithPaginationV3(env.DB, user, 0, { pinned: true });
+    const pinned = await getAliasInfosWithPaginationV3(env.DB, user, 0, {
+      pinned: true,
+    });
     expect(pinned.map((i) => i.alias.email)).toEqual(["pin@sl.test"]);
 
     // all three flags -> pinned wins
     const both = await getAliasInfosWithPaginationV3(env.DB, user, 0, {
-      pinned: true, disabled: true, enabled: true,
+      pinned: true,
+      disabled: true,
+      enabled: true,
     });
     expect(both.map((i) => i.alias.email)).toEqual(["pin@sl.test"]);
   });
@@ -333,34 +441,76 @@ describe("getAliasInfosWithPaginationV3", () => {
   it("query filter matches email, note, and name; trashed aliases are excluded", async () => {
     const user = await createUser(env.DB);
     const mb = user.default_mailbox_id!;
-    await createAlias(env.DB, user.id, mb, { email: "shopping@sl.test", note: "for stores" });
-    await createAlias(env.DB, user.id, mb, { email: "x@sl.test", note: "banking stuff" });
-    await createAlias(env.DB, user.id, mb, { email: "y@sl.test", name: "Newsletter" });
     await createAlias(env.DB, user.id, mb, {
-      email: "trashed@sl.test", note: "banking", delete_on: "2030-01-01 00:00:00+00:00",
+      email: "shopping@sl.test",
+      note: "for stores",
+    });
+    await createAlias(env.DB, user.id, mb, {
+      email: "x@sl.test",
+      note: "banking stuff",
+    });
+    await createAlias(env.DB, user.id, mb, {
+      email: "y@sl.test",
+      name: "Newsletter",
+    });
+    await createAlias(env.DB, user.id, mb, {
+      email: "trashed@sl.test",
+      note: "banking",
+      delete_on: "2030-01-01 00:00:00+00:00",
     });
 
-    expect((await getAliasInfosWithPaginationV3(env.DB, user, 0, { query: "shop" })).map((i) => i.alias.email))
-      .toEqual(["shopping@sl.test"]);
-    expect((await getAliasInfosWithPaginationV3(env.DB, user, 0, { query: "banking" })).map((i) => i.alias.email))
-      .toEqual(["x@sl.test"]); // trashed one excluded
-    expect((await getAliasInfosWithPaginationV3(env.DB, user, 0, { query: "Newsletter" })).map((i) => i.alias.email))
-      .toEqual(["y@sl.test"]);
+    expect(
+      (
+        await getAliasInfosWithPaginationV3(env.DB, user, 0, { query: "shop" })
+      ).map((i) => i.alias.email),
+    ).toEqual(["shopping@sl.test"]);
+    expect(
+      (
+        await getAliasInfosWithPaginationV3(env.DB, user, 0, {
+          query: "banking",
+        })
+      ).map((i) => i.alias.email),
+    ).toEqual(["x@sl.test"]); // trashed one excluded
+    expect(
+      (
+        await getAliasInfosWithPaginationV3(env.DB, user, 0, {
+          query: "Newsletter",
+        })
+      ).map((i) => i.alias.email),
+    ).toEqual(["y@sl.test"]);
   });
 
   it("list mailboxes are verified-only and email-sorted", async () => {
     const user = await createUser(env.DB);
     const primary = await createMailbox(env.DB, user.id, "zzz@mb.test");
-    const secondaryVerified = await createMailbox(env.DB, user.id, "aaa@mb.test");
-    const secondaryUnverified = await createMailbox(env.DB, user.id, "unv@mb.test", { verified: 0 });
-    const alias = await createAlias(env.DB, user.id, primary.id, { email: "list@sl.test" });
+    const secondaryVerified = await createMailbox(
+      env.DB,
+      user.id,
+      "aaa@mb.test",
+    );
+    const secondaryUnverified = await createMailbox(
+      env.DB,
+      user.id,
+      "unv@mb.test",
+      { verified: 0 },
+    );
+    const alias = await createAlias(env.DB, user.id, primary.id, {
+      email: "list@sl.test",
+    });
     await env.DB.batch([
-      env.DB.prepare("INSERT INTO alias_mailbox (alias_id, mailbox_id) VALUES (?1,?2)").bind(alias.id, secondaryVerified.id),
-      env.DB.prepare("INSERT INTO alias_mailbox (alias_id, mailbox_id) VALUES (?1,?2)").bind(alias.id, secondaryUnverified.id),
+      env.DB.prepare(
+        "INSERT INTO alias_mailbox (alias_id, mailbox_id) VALUES (?1,?2)",
+      ).bind(alias.id, secondaryVerified.id),
+      env.DB.prepare(
+        "INSERT INTO alias_mailbox (alias_id, mailbox_id) VALUES (?1,?2)",
+      ).bind(alias.id, secondaryUnverified.id),
     ]);
 
     const [info] = await getAliasInfosWithPaginationV3(env.DB, user, 0);
-    expect(info.mailboxes.map((m) => m.email)).toEqual(["aaa@mb.test", "zzz@mb.test"]);
+    expect(info.mailboxes.map((m) => m.email)).toEqual([
+      "aaa@mb.test",
+      "zzz@mb.test",
+    ]);
     expect(info.mailbox.email).toBe("zzz@mb.test"); // primary regardless of order
   });
 

@@ -54,13 +54,17 @@ export function humanize(dateStr: string, now: Date = new Date()): string {
   if (diff < 10) return "just now";
   if (diff < 45) return phrase(`${diff} seconds`);
   if (diff < 90) return phrase("a minute");
-  if (diff < 2700) return phrase(`${Math.trunc(Math.max(diff / 60, 2))} minutes`);
+  if (diff < 2700)
+    return phrase(`${Math.trunc(Math.max(diff / 60, 2))} minutes`);
   if (diff < 5400) return phrase("an hour");
-  if (diff < 79200) return phrase(`${Math.trunc(Math.max(diff / 3600, 2))} hours`);
+  if (diff < 79200)
+    return phrase(`${Math.trunc(Math.max(diff / 3600, 2))} hours`);
   if (diff < 172800) return phrase("a day");
-  if (diff < 554400) return phrase(`${Math.trunc(Math.max(diff / 86400, 2))} days`);
+  if (diff < 554400)
+    return phrase(`${Math.trunc(Math.max(diff / 86400, 2))} days`);
   if (diff < 907200) return phrase("a week");
-  if (diff < 2419200) return phrase(`${Math.trunc(Math.max(diff / 604800, 2))} weeks`);
+  if (diff < 2419200)
+    return phrase(`${Math.trunc(Math.max(diff / 604800, 2))} weeks`);
   if (diff < 3888000) return phrase("a month");
   if (diff < 29808000) {
     const selfMonths = then.getUTCFullYear() * 12 + then.getUTCMonth();

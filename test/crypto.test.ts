@@ -28,7 +28,7 @@ import {
  */
 
 const FLASK_SECRET = "test-flask-secret";
-const CUSTOM_ALIAS_SECRET = FLASK_SECRET + "custom_alias"; // app/config.py
+const CUSTOM_ALIAS_SECRET = `${FLASK_SECRET}custom_alias`; // app/config.py
 
 // --- itsdangerous Signer (mfa_key) ---
 const V_SIGNER = {
@@ -91,12 +91,14 @@ describe("itsdangerous Signer", () => {
   });
 
   it("rejects a tampered signature", async () => {
-    const tampered = V_SIGNER.signed.slice(0, -1) + "X";
+    const tampered = `${V_SIGNER.signed.slice(0, -1)}X`;
     expect(await itsdangerousUnsign(FLASK_SECRET, tampered)).toBeNull();
   });
 
   it("rejects the wrong secret", async () => {
-    expect(await itsdangerousUnsign("other-secret", V_SIGNER.signed)).toBeNull();
+    expect(
+      await itsdangerousUnsign("other-secret", V_SIGNER.signed),
+    ).toBeNull();
   });
 
   it("returns null when there is no separator", async () => {
@@ -153,7 +155,7 @@ describe("itsdangerous TimestampSigner", () => {
   });
 
   it("returns null for a tampered signature", async () => {
-    const tampered = V_TS.signedFixed.slice(0, -1) + "A";
+    const tampered = `${V_TS.signedFixed.slice(0, -1)}A`;
     expect(
       await timestampUnsign(CUSTOM_ALIAS_SECRET, tampered, 600, FIXED_EPOCH),
     ).toBeNull();
@@ -163,12 +165,7 @@ describe("itsdangerous TimestampSigner", () => {
     const value = ".sunny_falcon123@my.custom.domain.com";
     const signed = await timestampSign(CUSTOM_ALIAS_SECRET, value, FIXED_EPOCH);
     expect(
-      await timestampUnsign(
-        CUSTOM_ALIAS_SECRET,
-        signed,
-        600,
-        FIXED_EPOCH + 10,
-      ),
+      await timestampUnsign(CUSTOM_ALIAS_SECRET, signed, 600, FIXED_EPOCH + 10),
     ).toBe(value);
   });
 });
@@ -247,9 +244,9 @@ describe("TOTP verification (pyotp-compatible)", () => {
   });
 
   it("rejects a replayed code (equal to lastOtp)", () => {
-    expect(verifyTotp(TOTP_SECRET, V_TOTP.step0, V_TOTP.step0, TOTP_NOW_MS)).toBe(
-      false,
-    );
+    expect(
+      verifyTotp(TOTP_SECRET, V_TOTP.step0, V_TOTP.step0, TOTP_NOW_MS),
+    ).toBe(false);
   });
 
   it("accepts a valid code when lastOtp is a different code", () => {
