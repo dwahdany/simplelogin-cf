@@ -73,8 +73,9 @@ fixtures in `test/fixtures.ts`; web tests seed KV sessions directly.
 
 ## 4. Remaining / nice-to-have
 
-- Completeness audit of all 52 routes re-run (first attempt returned empty) —
-  check result, fix anything it surfaces.
+- ~~Completeness audit~~ done: all 52 routes positively verified 1:1
+  (paths, methods, auth middleware, success status codes; /api/health is the
+  only extra route).
 - Deploy runbook is in README.md: `wrangler d1 create` + migrations,
   KV namespace, `wrangler secret put FLASK_SECRET`, Email Routing → worker,
   DNS/MX; wrangler.jsonc has `REPLACE_WITH_*` placeholder ids.
