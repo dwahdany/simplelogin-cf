@@ -1,0 +1,27 @@
+{
+  "name": "simplelogin-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SimpleLogin rebuilt as a Cloudflare-native serverless application (Workers + D1 + KV + Email Routing)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "hono": "^4.12.27",
+    "otpauth": "^9.5.1",
+    "postal-mime": "^2.7.5"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.0",
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9",
+    "wrangler": "^4.107.0"
+  }
+}
