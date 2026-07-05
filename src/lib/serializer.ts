@@ -272,6 +272,370 @@ export async function getAliasInfoV2(
   };
 }
 
+// ---------------------------------------------------------------------------
+// v3 list search filter — Postgres semantics reproduced in JS
+// (app/api/serializer.py L153-163). D1/SQLite has neither ILIKE (its LIKE is
+// ASCII-only case-insensitive) nor ts_vector/plainto_tsquery, so the filter
+// runs in JS over the SQL-ordered rows before pagination.
+// ---------------------------------------------------------------------------
+
+/**
+ * Postgres `col ILIKE '%' || query || '%'` as a RegExp: full-Unicode
+ * case-insensitive containment where % and _ inside the query stay wildcards
+ * and backslash escapes the following character (LIKE's default escape).
+ */
+export function ilikeToRegExp(query: string): RegExp {
+  const escapeChar = (ch: string) => ch.replace(/[.*+?^${}()|[\]\\]/, "\\$&");
+  let pattern = "";
+  for (let i = 0; i < query.length; i++) {
+    const ch = query[i];
+    if (ch === "\\" && i + 1 < query.length) {
+      i += 1;
+      pattern += escapeChar(query[i]);
+    } else if (ch === "%") pattern += "[\\s\\S]*";
+    else if (ch === "_") pattern += "[\\s\\S]";
+    else pattern += escapeChar(ch);
+  }
+  return new RegExp(pattern, "iu");
+}
+
+/** Postgres english.stop — tokens dropped by the 'english' text-search config. */
+const FT_STOPWORDS = new Set(
+  (
+    "i me my myself we our ours ourselves you your yours yourself yourselves " +
+    "he him his himself she her hers herself it its itself they them their " +
+    "theirs themselves what which who whom this that these those am is are " +
+    "was were be been being have has had having do does did doing a an the " +
+    "and but if or because as until while of at by for with about against " +
+    "between into through during before after above below to from up down " +
+    "in out on off over under again further then once here there when where " +
+    "why how all any both each few more most other some such no nor not " +
+    "only own same so than too very s t can will just don should now"
+  ).split(" "),
+);
+
+const FT_VOWELS = "aeiouy";
+const FT_DOUBLES = new Set([
+  "bb",
+  "dd",
+  "ff",
+  "gg",
+  "mm",
+  "nn",
+  "pp",
+  "rr",
+  "tt",
+]);
+const FT_LI_ENDING = "cdeghkmnrt";
+
+// snowball english exceptional forms
+const FT_EXCEPTIONS1 = new Map<string, string>([
+  ["skis", "ski"],
+  ["skies", "sky"],
+  ["dying", "die"],
+  ["lying", "lie"],
+  ["tying", "tie"],
+  ["idly", "idl"],
+  ["gently", "gentl"],
+  ["ugly", "ugli"],
+  ["early", "earli"],
+  ["only", "onli"],
+  ["singly", "singl"],
+  ["sky", "sky"],
+  ["news", "news"],
+  ["howe", "howe"],
+  ["atlas", "atlas"],
+  ["cosmos", "cosmos"],
+  ["bias", "bias"],
+  ["andes", "andes"],
+]);
+const FT_EXCEPTIONS2 = new Set([
+  "inning",
+  "outing",
+  "canning",
+  "herring",
+  "earring",
+  "proceed",
+  "exceed",
+  "succeed",
+]);
+
+const ftIsVowel = (ch: string | undefined): boolean =>
+  ch !== undefined && FT_VOWELS.includes(ch);
+
+function ftHasVowel(s: string): boolean {
+  for (const ch of s) if (ftIsVowel(ch)) return true;
+  return false;
+}
+
+/** Snowball "short syllable": non-vowel + vowel + non-vowel(≠ w/x/Y), or a
+ * vowel at the start of the word followed by a non-vowel. */
+function endsInShortSyllable(w: string): boolean {
+  const n = w.length;
+  if (n === 2) return ftIsVowel(w[0]) && !ftIsVowel(w[1]);
+  if (n < 3) return false;
+  const c = w[n - 1];
+  return (
+    !ftIsVowel(w[n - 3]) &&
+    ftIsVowel(w[n - 2]) &&
+    !ftIsVowel(c) &&
+    c !== "w" &&
+    c !== "x" &&
+    c !== "Y"
+  );
+}
+
+/**
+ * The Snowball English ("Porter2") stemmer — what Postgres' 'english'
+ * text-search dictionary applies to every non-stopword token. Input must be
+ * lowercase.
+ */
+export function englishStem(word: string): string {
+  if (word.length <= 2) return word;
+  let w = word;
+  if (w.startsWith("'")) w = w.slice(1);
+
+  const exception = FT_EXCEPTIONS1.get(w);
+  if (exception !== undefined) return exception;
+
+  // mark consonant y's as "Y" (initial y, or y after a vowel)
+  const chars = [...w];
+  if (chars[0] === "y") chars[0] = "Y";
+  for (let i = 1; i < chars.length; i++) {
+    if (chars[i] === "y" && FT_VOWELS.includes(chars[i - 1])) chars[i] = "Y";
+  }
+  w = chars.join("");
+
+  // R1/R2 as absolute offsets — suffix operations never move them
+  let r1 = w.length;
+  const exceptionalPrefix = ["gener", "commun", "arsen"].find((p) =>
+    w.startsWith(p),
+  );
+  if (exceptionalPrefix) {
+    r1 = exceptionalPrefix.length;
+  } else {
+    for (let i = 1; i < w.length; i++) {
+      if (!ftIsVowel(w[i]) && ftIsVowel(w[i - 1])) {
+        r1 = i + 1;
+        break;
+      }
+    }
+  }
+  let r2 = w.length;
+  for (let i = r1 + 1; i < w.length; i++) {
+    if (!ftIsVowel(w[i]) && ftIsVowel(w[i - 1])) {
+      r2 = i + 1;
+      break;
+    }
+  }
+  const inR1 = (suffix: string) => w.length - suffix.length >= r1;
+  const inR2 = (suffix: string) => w.length - suffix.length >= r2;
+
+  // step 0: apostrophe suffixes
+  for (const suf of ["'s'", "'s", "'"]) {
+    if (w.endsWith(suf)) {
+      w = w.slice(0, -suf.length);
+      break;
+    }
+  }
+
+  // step 1a
+  if (w.endsWith("sses")) {
+    w = w.slice(0, -2);
+  } else if (w.endsWith("ied") || w.endsWith("ies")) {
+    w = w.length - 3 > 1 ? w.slice(0, -2) : w.slice(0, -1);
+  } else if (w.endsWith("us") || w.endsWith("ss")) {
+    // no-op
+  } else if (w.endsWith("s")) {
+    if (ftHasVowel(w.slice(0, -2))) w = w.slice(0, -1);
+  }
+
+  if (FT_EXCEPTIONS2.has(w)) return w;
+
+  // step 1b
+  {
+    const suf = ["eedly", "ingly", "edly", "eed", "ing", "ed"].find((sfx) =>
+      w.endsWith(sfx),
+    );
+    if (suf === "eed" || suf === "eedly") {
+      if (inR1(suf)) w = `${w.slice(0, -suf.length)}ee`;
+    } else if (suf) {
+      const stem = w.slice(0, -suf.length);
+      if (ftHasVowel(stem)) {
+        w = stem;
+        if (w.endsWith("at") || w.endsWith("bl") || w.endsWith("iz")) w += "e";
+        else if (FT_DOUBLES.has(w.slice(-2))) w = w.slice(0, -1);
+        else if (r1 >= w.length && endsInShortSyllable(w)) w += "e";
+      }
+    }
+  }
+
+  // step 1c: y -> i after a non-vowel that is not the first letter
+  if (w.length > 2) {
+    const last = w[w.length - 1];
+    if ((last === "y" || last === "Y") && !ftIsVowel(w[w.length - 2])) {
+      w = `${w.slice(0, -1)}i`;
+    }
+  }
+
+  // step 2 (longest suffix, applied only when it lies in R1)
+  {
+    const map: [string, string][] = [
+      ["ational", "ate"],
+      ["fulness", "ful"],
+      ["iveness", "ive"],
+      ["ization", "ize"],
+      ["ousness", "ous"],
+      ["biliti", "ble"],
+      ["lessli", "less"],
+      ["tional", "tion"],
+      ["alism", "al"],
+      ["aliti", "al"],
+      ["ation", "ate"],
+      ["entli", "ent"],
+      ["fulli", "ful"],
+      ["iviti", "ive"],
+      ["ousli", "ous"],
+      ["anci", "ance"],
+      ["abli", "able"],
+      ["alli", "al"],
+      ["ator", "ate"],
+      ["enci", "ence"],
+      ["izer", "ize"],
+      ["bli", "ble"],
+      ["ogi", "og"],
+      ["li", ""],
+    ];
+    for (const [suf, rep] of map) {
+      if (!w.endsWith(suf)) continue;
+      if (inR1(suf)) {
+        if (suf === "ogi") {
+          if (w[w.length - 4] === "l") w = w.slice(0, -1);
+        } else if (suf === "li") {
+          if (FT_LI_ENDING.includes(w[w.length - 3] ?? "")) w = w.slice(0, -2);
+        } else {
+          w = w.slice(0, -suf.length) + rep;
+        }
+      }
+      break;
+    }
+  }
+
+  // step 3 (in R1; "ative" additionally requires R2)
+  {
+    const map: [string, string][] = [
+      ["ational", "ate"],
+      ["tional", "tion"],
+      ["alize", "al"],
+      ["icate", "ic"],
+      ["iciti", "ic"],
+      ["ative", ""],
+      ["ical", "ic"],
+      ["ness", ""],
+      ["ful", ""],
+    ];
+    for (const [suf, rep] of map) {
+      if (!w.endsWith(suf)) continue;
+      if (inR1(suf)) {
+        if (suf === "ative") {
+          if (inR2(suf)) w = w.slice(0, -5);
+        } else {
+          w = w.slice(0, -suf.length) + rep;
+        }
+      }
+      break;
+    }
+  }
+
+  // step 4 (in R2; "ion" only after s/t)
+  {
+    const sufs = [
+      "ement",
+      "ance",
+      "ence",
+      "able",
+      "ible",
+      "ment",
+      "ant",
+      "ent",
+      "ism",
+      "ate",
+      "iti",
+      "ous",
+      "ive",
+      "ize",
+      "ion",
+      "al",
+      "er",
+      "ic",
+    ];
+    for (const suf of sufs) {
+      if (!w.endsWith(suf)) continue;
+      if (inR2(suf)) {
+        if (suf === "ion") {
+          const prev = w[w.length - 4];
+          if (prev === "s" || prev === "t") w = w.slice(0, -3);
+        } else {
+          w = w.slice(0, -suf.length);
+        }
+      }
+      break;
+    }
+  }
+
+  // step 5
+  if (w.endsWith("e")) {
+    if (inR2("e") || (inR1("e") && !endsInShortSyllable(w.slice(0, -1)))) {
+      w = w.slice(0, -1);
+    }
+  } else if (w.endsWith("l")) {
+    if (inR2("l") && w[w.length - 2] === "l") w = w.slice(0, -1);
+  }
+
+  return w.replaceAll("Y", "y");
+}
+
+/** Approximate the Postgres default parser: word tokens are letter/digit
+ * runs; hyphenated compounds also emit the whole compound (hword). */
+function ftTokenize(text: string): string[] {
+  const tokens: string[] = [];
+  for (const m of text.matchAll(/[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)*/gu)) {
+    const whole = m[0];
+    if (whole.includes("-")) {
+      tokens.push(whole);
+      for (const part of whole.split("-")) tokens.push(part);
+    } else {
+      tokens.push(whole);
+    }
+  }
+  return tokens;
+}
+
+/** to_tsvector('english', text) lexemes: lowercase, drop stopwords, stem. */
+function ftLexemes(text: string): string[] {
+  const out: string[] = [];
+  for (const token of ftTokenize(text)) {
+    const lower = token.toLowerCase();
+    if (FT_STOPWORDS.has(lower)) continue;
+    out.push(englishStem(lower));
+  }
+  return out;
+}
+
+/**
+ * `Alias.ts_vector @@ plainto_tsquery('english', query)` where ts_vector is
+ * the generated column to_tsvector('english', note): every query lexeme must
+ * appear among the note's lexemes (plainto AND-joins them). An empty tsquery
+ * (all stopwords) matches nothing, and a NULL note never matches.
+ */
+export function tsVectorMatches(note: string | null, query: string): boolean {
+  if (note === null) return false;
+  const queryLexemes = ftLexemes(query);
+  if (queryLexemes.length === 0) return false;
+  const noteLexemes = new Set(ftLexemes(note));
+  return queryLexemes.every((lex) => noteLexemes.has(lex));
+}
+
 export interface AliasListOptions {
   query?: string | null;
   /** presence-based filters, precedence pinned > disabled > enabled */
@@ -290,9 +654,9 @@ export interface AliasListOptions {
  * Postgres GREATEST's NULL-skipping), with id DESC as a deterministic tiebreak
  * (spec 06 recommends an id tiebreak given second-precision timestamps).
  *
- * The `query` filter approximates the Postgres note ts_vector full-text branch
- * with a LIKE over note, plus LIKE over email and name (wildcards in the raw
- * query are preserved by concatenating into the LIKE pattern, like ILIKE did).
+ * The `query` filter (email/note/name ILIKE + ts_vector full-text over note)
+ * has no SQLite equivalent, so when a query is present ALL rows are fetched
+ * in SQL order and the filter + LIMIT/OFFSET are applied in JS.
  */
 export async function getAliasInfosWithPaginationV3(
   db: D1Database,
@@ -300,15 +664,9 @@ export async function getAliasInfosWithPaginationV3(
   pageId: number,
   opts: AliasListOptions = {},
 ): Promise<AliasInfo[]> {
+  const query = opts.query || null; // Flask `if query:` — falsy = no filter
   const conds: string[] = [];
-  const filterParams: unknown[] = [];
 
-  if (opts.query) {
-    conds.push(
-      "(a.email LIKE '%' || ? || '%' OR a.note LIKE '%' || ? || '%' OR a.name LIKE '%' || ? || '%')",
-    );
-    filterParams.push(opts.query, opts.query, opts.query);
-  }
   if (opts.pinned) conds.push("a.pinned = 1");
   else if (opts.disabled) conds.push("a.enabled = 0");
   else if (opts.enabled) conds.push("a.enabled = 1");
@@ -334,10 +692,9 @@ export async function getAliasInfosWithPaginationV3(
     WHERE 1 = 1${whereExtra}
     ORDER BY a.pinned DESC,
              MAX(a.created_at, IFNULL(el.created_at, a.created_at)) DESC,
-             a.id DESC
-    LIMIT ? OFFSET ?`;
+             a.id DESC${query ? "" : "\n    LIMIT ? OFFSET ?"}`;
 
-  const bind = [user.id, ...filterParams, PAGE_LIMIT, pageId * PAGE_LIMIT];
+  const bind = query ? [user.id] : [user.id, PAGE_LIMIT, pageId * PAGE_LIMIT];
   const rows = await db
     .prepare(sql)
     .bind(...bind)
@@ -345,12 +702,28 @@ export async function getAliasInfosWithPaginationV3(
       AliasRow & { _nb_reply: number; _nb_blocked: number; _nb_forward: number }
     >();
 
-  if (rows.results.length === 0) return [];
+  let pageRows = rows.results;
+  if (query) {
+    // app/api/serializer.py L154-162: email ILIKE OR note ILIKE OR
+    // ts_vector @@ plainto_tsquery('english', query) OR name ILIKE
+    const re = ilikeToRegExp(query);
+    pageRows = pageRows.filter(
+      (r) =>
+        re.test(r.email) ||
+        (r.note !== null && re.test(r.note)) ||
+        tsVectorMatches(r.note, query) ||
+        (r.name !== null && re.test(r.name)),
+    );
+    const start = pageId * PAGE_LIMIT;
+    pageRows = pageRows.slice(start, start + PAGE_LIMIT);
+  }
+
+  if (pageRows.length === 0) return [];
 
   // Batch-load the latest email_log + contact for the page.
   const logIds = [
     ...new Set(
-      rows.results
+      pageRows
         .map((r) => r.last_email_log_id)
         .filter((v): v is number => v !== null),
     ),
@@ -378,7 +751,7 @@ export async function getAliasInfosWithPaginationV3(
   }
 
   // Batch-load mailboxes (primary + additional) for the page.
-  const aliasIds = rows.results.map((r) => r.id);
+  const aliasIds = pageRows.map((r) => r.id);
   const amPh = aliasIds.map((_, i) => `?${i + 1}`).join(", ");
   const amRes = await db
     .prepare(
@@ -393,12 +766,12 @@ export async function getAliasInfosWithPaginationV3(
     additionalByAlias.set(r.alias_id, list);
   }
   const allMailboxIds = new Set<number>();
-  for (const r of rows.results) allMailboxIds.add(r.mailbox_id);
+  for (const r of pageRows) allMailboxIds.add(r.mailbox_id);
   for (const list of additionalByAlias.values())
     for (const id of list) allMailboxIds.add(id);
   const mbMap = await fetchMailboxMap(db, [...allMailboxIds]);
 
-  return rows.results.map((row) => {
+  return pageRows.map((row) => {
     const { _nb_reply, _nb_blocked, _nb_forward, ...aliasCols } = row;
     const alias = aliasCols as AliasRow;
 

@@ -18,9 +18,9 @@
  *   cookie name).
  */
 
-import type { Context } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
-import type { AppEnv } from "../lib/auth";
+import { type AppEnv, userIsActive } from "../lib/auth";
 import {
   canonicalizeEmail,
   checkPassword,
@@ -40,9 +40,42 @@ import { sendTransactionalEmail } from "../lib/mailer";
 import { availableSlEmail, getUserById } from "../lib/models";
 import { rateLimit, requestLock } from "../lib/ratelimit";
 import type { AccountActivationRow, ApiKeyRow, UserRow } from "../lib/rows";
-import { createSession } from "../lib/session";
+import { createSession, getSession } from "../lib/session";
 
 export const authRoutes = new Hono<AppEnv>();
+
+/**
+ * flask-limiter key_func parity (app/extensions.py:14-19): every
+ * @limiter.limit on the auth routes keys by `userid:{id}` whenever the
+ * request carries a valid authenticated "slapp" session cookie (no
+ * X-Sl-Allowcookies needed — flask-login's user loader runs on every
+ * request), and by client IP otherwise. Likewise app/parallel_limiter.py:55-58
+ * keys the /auth/mfa lock `cl:{user.id}:mfa_auth` for cookie-authenticated
+ * callers. Mirror the flask-login user loader here (simplelogin_app.py
+ * load_user): anonymous when the user is missing, disabled, inactive, or the
+ * session's alternative_id was rotated away — then set the session/user vars
+ * that rateLimit("default") and requestLock read.
+ */
+const loadSessionUserForLimiter: MiddlewareHandler<AppEnv> = async (
+  c,
+  next,
+) => {
+  const session = await getSession(c);
+  if (session?.user_id != null) {
+    const user = await getUserById(c.env.DB, session.user_id);
+    const rotatedAway =
+      session.alternative_id != null &&
+      user?.alternative_id != null &&
+      session.alternative_id !== user.alternative_id;
+    if (user && !user.disabled && userIsActive(user) && !rotatedAway) {
+      c.set("session", session);
+      c.set("user", user);
+    }
+  }
+  return next();
+};
+
+authRoutes.use("/auth/*", loadSessionUserForLimiter);
 
 // --------------------------------------------------------------------------
 // Local helpers (candidates for the shared lib — see libGaps in the report)
@@ -190,11 +223,13 @@ function randomDigits(n: number): string {
 
 /**
  * email_validator `validate_email(check_deliverability=False,
- * allow_smtputf8=False)` approximation: ASCII-only local part, FQDN-looking
- * domain with at least one dot.
+ * allow_smtputf8=False)` approximation: ASCII-only local part; the domain may
+ * be internationalized (IDN) — it is IDNA-encoded like email_validator's
+ * `idna.encode(uts46=True)` — and the resulting ascii_email is capped at
+ * EMAIL_MAX_LENGTH = 254 (email_validator 2.x).
  */
 function isValidEmail(email: string): boolean {
-  if (!email || email.length > 320) return false;
+  if (!email) return false;
   const parts = email.split("@");
   if (parts.length !== 2) return false;
   const [local, domain] = parts;
@@ -202,14 +237,35 @@ function isValidEmail(email: string): boolean {
   if (!/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+$/.test(local)) return false;
   if (local.startsWith(".") || local.endsWith(".") || local.includes(".."))
     return false;
-  if (!domain || domain.length > 255 || !domain.includes(".")) return false;
-  const labels = domain.split(".");
+  if (!domain) return false;
+  // Any ASCII char outside [A-Za-z0-9.-] can never be a valid domain char,
+  // before or after IDNA (and must not reach the URL parser, which would
+  // silently truncate on "/", "?", "#", ":", "@").
+  let hasNonAscii = false;
+  for (const ch of domain) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp > 0x7f) hasNonAscii = true;
+    else if (!/[A-Za-z0-9.-]/.test(ch)) return false;
+  }
+  let asciiDomain = domain;
+  if (hasNonAscii) {
+    // IDN: domain-to-ASCII via the URL parser (UTS-46, like idna.encode)
+    try {
+      asciiDomain = new URL(`http://${domain}/`).hostname;
+    } catch {
+      return false;
+    }
+  }
+  if (!asciiDomain.includes(".")) return false;
+  const labels = asciiDomain.split(".");
   for (const label of labels) {
     if (!label || label.length > 63) return false;
     if (!/^[A-Za-z0-9-]+$/.test(label)) return false;
     if (label.startsWith("-") || label.endsWith("-")) return false;
   }
-  return !/^\d+$/.test(labels[labels.length - 1]);
+  if (/^\d+$/.test(labels[labels.length - 1])) return false;
+  // len(ascii_email) > 254 → EmailNotValidError("The email address is too long")
+  return local.length + 1 + asciiDomain.length <= 254;
 }
 
 /**

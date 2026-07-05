@@ -58,9 +58,46 @@ app.onError(async (err, c) => {
   return renderErrorPage(c, 500);
 });
 
+// Werkzeug routing returns 405 when the path exists under another method;
+// Flask's /api error handler renders it as JSON. Hono has no automatic 405,
+// so match the request path against the registered route table.
+const ROUTE_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+const routeRegexCache = new Map<string, RegExp>();
+function routePathToRegex(path: string): RegExp {
+  let re = routeRegexCache.get(path);
+  if (!re) {
+    const pattern = path
+      .split("/")
+      .map((seg) => {
+        const m = seg.match(/^:[^{]+(?:\{(.+)\})?$/);
+        if (m) return m[1] ? `(?:${m[1]})` : "[^/]+";
+        return seg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      })
+      .join("/");
+    re = new RegExp(`^${pattern}$`);
+    routeRegexCache.set(path, re);
+  }
+  return re;
+}
+function pathExistsWithOtherMethod(path: string, method: string): boolean {
+  if (!ROUTE_METHODS.has(method)) return false;
+  return app.routes.some(
+    (r) =>
+      ROUTE_METHODS.has(r.method) &&
+      r.method !== method &&
+      routePathToRegex(r.path).test(path),
+  );
+}
+
 app.notFound(async (c) => {
-  const isApi = new URL(c.req.url).pathname.startsWith("/api/");
-  if (isApi) return c.json({ error: "No such endpoint" }, 404);
+  const path = new URL(c.req.url).pathname;
+  const isApi = path.startsWith("/api/");
+  if (isApi) {
+    if (pathExistsWithOtherMethod(path, c.req.method)) {
+      return c.json({ error: "Method not allowed" }, 405);
+    }
+    return c.json({ error: "No such endpoint" }, 404);
+  }
   return renderErrorPage(c, 404);
 });
 

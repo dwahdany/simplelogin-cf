@@ -98,10 +98,13 @@ export const requireApiSudo: MiddlewareHandler<AppEnv> = async (c, next) => {
   const err = await authorizeRequest(c);
   if (err) return err;
   const apiKey = c.get("apiKey");
-  if (
-    apiKey ? !sudoModeIsActive(apiKey) : !sessionSudoIsActive(c.get("session"))
-  ) {
-    return jsonError(c, 440, "Need sudo");
+  // Flask grants sudo when EITHER the api_key sudo OR the browser-session
+  // sudo is active — the session cookie is loaded even on API-key requests.
+  let ok = apiKey != null && sudoModeIsActive(apiKey);
+  if (!ok) {
+    const session = c.get("session") ?? (await getSession(c));
+    ok = sessionSudoIsActive(session);
   }
+  if (!ok) return jsonError(c, 440, "Need sudo");
   await next();
 };

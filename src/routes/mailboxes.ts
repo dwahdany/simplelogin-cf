@@ -25,11 +25,16 @@ import type {
  *
  * Deliberate deviations from Flask (documented in the port contract):
  * - No user audit log table in the D1 schema -> audit-log emission skipped.
- * - Mailbox-domain MX/DNS checks (NoMxRecordFound, ForbiddenMxRecordFound) and
- *   the invalid_mailbox_domain suffix check are skipped: no DNS in Workers
- *   without DoH and those tables are absent from the D1 schema.
+ * - DNS resolution goes through DNS-over-HTTPS (cloudflare-dns.com JSON API)
+ *   instead of dnspython + NAMESERVERS; tests install an in-memory client via
+ *   `setDnsClient`, mirroring Flask's `set_global_dns_client`.
+ * - The invalid_mailbox_domain / forbidden_mx_ip blocklists are enforced when
+ *   those tables exist in the D1 database; a missing table is treated as an
+ *   empty blocklist.
  * - Flask paths that 500 (non-numeric transfer_aliases_to / mailbox_ids,
- *   non-object JSON bodies) return clean 4xxs instead.
+ *   non-object JSON bodies, non-JSON Content-Type on POST /mailboxes, PATCH
+ *   values Postgres rejects at commit) return clean 4xxs instead — and, like
+ *   Flask's failed commit, persist nothing.
  */
 
 export const mailboxDomainRoutes = new Hono<AppEnv>();
@@ -58,18 +63,106 @@ function isValidMailboxDomainSyntax(domain: string): boolean {
   return true;
 }
 
-/** app/email_validation.py is_valid_email — RFC dot-atom, ASCII only. */
+/**
+ * IDNA/UTS-46 encode a (possibly internationalized) domain via the WHATWG URL
+ * parser, which lowercases and punycode-encodes the hostname. Returns null
+ * when the domain cannot be encoded.
+ */
+function idnaEncodeDomain(domain: string): string | null {
+  if (!domain) return null;
+  // ASCII characters other than letters/digits/hyphen/dot can never appear in
+  // a hostname and could change how the URL below parses -> reject upfront.
+  // Codepoints >= U+0080 are left to the URL parser's IDNA mapping.
+  if (!/^[A-Za-z0-9.\-\u0080-\u{10FFFF}]+$/u.test(domain)) return null;
+  try {
+    return new URL(`http://${domain}/`).hostname;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * app/email_validation.py is_valid_email — email_validator ~=2.2 with
+ * allow_smtputf8=False: only the LOCAL part is restricted to ASCII dot-atom;
+ * an internationalized domain is IDNA-encoded before the syntax checks.
+ */
 function isValidEmail(email: string): boolean {
-  if (!email || email.length > 254) return false;
-  // printable ASCII only (rejects spaces, control chars, unicode)
-  if (!/^[\x21-\x7e]+$/.test(email)) return false;
+  if (!email) return false;
   const at = email.lastIndexOf("@");
   if (at <= 0 || at === email.length - 1) return false;
   const local = email.slice(0, at);
   const domain = email.slice(at + 1);
   if (local.length > 64) return false;
+  // ASCII-only dot-atom (allow_smtputf8=False rejects unicode local parts)
   if (!LOCAL_RE.test(local)) return false;
-  return isValidMailboxDomainSyntax(domain);
+  const asciiDomain = idnaEncodeDomain(domain);
+  if (asciiDomain === null) return false;
+  if (!isValidMailboxDomainSyntax(asciiDomain)) return false;
+  // email_validator checks the total length on the ASCII form (max 254)
+  if (local.length + 1 + asciiDomain.length > 254) return false;
+  return true;
+}
+
+// ---- DNS (app/dns_utils.py, resolved over DoH in the Workers port) ----
+
+export interface DnsClient {
+  /** get_mx_domain_list(): MX hosts without the trailing dot; [] on failure. */
+  getMxDomainList(hostname: string): Promise<string[]>;
+  /** get_a_record(): first A-record IP for the hostname, or null. */
+  getARecord(hostname: string): Promise<string | null>;
+}
+
+const DNS_TYPE_A = 1;
+const DNS_TYPE_MX = 15;
+
+interface DohAnswer {
+  type: number;
+  data: string;
+}
+
+/** cloudflare-dns.com JSON API query; any failure resolves to no answers. */
+async function dohQuery(name: string, type: "MX" | "A"): Promise<DohAnswer[]> {
+  try {
+    const res = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`,
+      { headers: { accept: "application/dns-json" } },
+    );
+    if (!res.ok) return [];
+    const body = (await res.json()) as { Answer?: DohAnswer[] };
+    return body.Answer ?? [];
+  } catch {
+    return [];
+  }
+}
+
+const dohDnsClient: DnsClient = {
+  async getMxDomainList(hostname) {
+    const mxDomains: string[] = [];
+    for (const answer of await dohQuery(hostname, "MX")) {
+      if (answer.type !== DNS_TYPE_MX) continue;
+      // record data looks like "20 alt2.aspmx.l.google.com."
+      const host = answer.data.split(" ")[1];
+      if (host) mxDomains.push(host.endsWith(".") ? host.slice(0, -1) : host);
+    }
+    return mxDomains;
+  },
+  async getARecord(hostname) {
+    for (const answer of await dohQuery(hostname, "A")) {
+      if (answer.type === DNS_TYPE_A) return answer.data;
+    }
+    return null;
+  },
+};
+
+let dnsClient: DnsClient = dohDnsClient;
+
+/**
+ * Test seam mirroring app/dns_utils.py `set_global_dns_client`: tests run in
+ * the same isolate as SELF, so an in-memory client installed here is used by
+ * the routes. `null` restores the DoH client.
+ */
+export function setDnsClient(client: DnsClient | null): void {
+  dnsClient = client ?? dohDnsClient;
 }
 
 // ---- mailbox email validation (app/mailbox_utils.py + app/email_utils.py) --
@@ -79,11 +172,72 @@ const REASON_INVALID_DOMAIN = "This email domain is not valid";
 const REASON_SL_DOMAIN = "This email is a SimpleLogin domain";
 const REASON_CUSTOM_DOMAIN =
   "This email address belongs to a custom domain that has already been registered";
+const REASON_INVALID_MAILBOX_DOMAIN =
+  "We don't allow mailboxes using this domain";
+const REASON_NO_MX_RECORD =
+  "We couldn't get any MX records configured for this domain";
+const REASON_FORBIDDEN_MX =
+  "We don't allow mailbox domains that point to these MX records";
 const REASON_NOT_ALLOWED = "This email address is not allowed";
 
+/** True when `e` is D1 telling us the (optional) blocklist table is absent. */
+function isMissingTableError(e: unknown): boolean {
+  return String(e).includes("no such table");
+}
+
 /**
- * email_can_be_used_as_mailbox_with_reason(): returns the reason value string
- * or null. MX/invalid-mailbox-domain checks are skipped (see file header).
+ * is_invalid_mailbox_domain (email_utils.py L793): the domain or ANY parent
+ * suffix (excluding the bare TLD) is listed in invalid_mailbox_domain. A
+ * missing table counts as an empty blocklist (see file header).
+ */
+async function isInvalidMailboxDomain(
+  db: D1Database,
+  domain: string,
+): Promise<boolean> {
+  const parts = domain.split(".");
+  const suffixes: string[] = [];
+  for (let i = 0; i < parts.length - 1; i++) {
+    suffixes.push(parts.slice(i).join("."));
+  }
+  if (suffixes.length === 0) return false;
+  const placeholders = suffixes.map((_, i) => `?${i + 1}`).join(", ");
+  try {
+    const row = await db
+      .prepare(
+        `SELECT 1 FROM invalid_mailbox_domain WHERE domain IN (${placeholders}) LIMIT 1`,
+      )
+      .bind(...suffixes)
+      .first();
+    return !!row;
+  } catch (e) {
+    if (isMissingTableError(e)) return false;
+    throw e;
+  }
+}
+
+/** ForbiddenMxIp.filter(ip.in_(mx_ips)) — missing table = empty blocklist. */
+async function hasForbiddenMxIp(
+  db: D1Database,
+  ips: string[],
+): Promise<boolean> {
+  const placeholders = ips.map((_, i) => `?${i + 1}`).join(", ");
+  try {
+    const row = await db
+      .prepare(
+        `SELECT 1 FROM forbidden_mx_ip WHERE ip IN (${placeholders}) LIMIT 1`,
+      )
+      .bind(...ips)
+      .first();
+    return !!row;
+  } catch (e) {
+    if (isMissingTableError(e)) return false;
+    throw e;
+  }
+}
+
+/**
+ * email_can_be_used_as_mailbox_with_reason() + check_domain_for_mailbox()
+ * (email_utils.py L660-L779): returns the reason value string or null.
  */
 async function emailCannotBeUsedReason(
   db: D1Database,
@@ -103,6 +257,28 @@ async function emailCannotBeUsedReason(
     .bind(domain)
     .first();
   if (customDomain) return REASON_CUSTOM_DOMAIN;
+
+  if (await isInvalidMailboxDomain(db, domain)) {
+    return REASON_INVALID_MAILBOX_DOMAIN;
+  }
+
+  // DNS goes through the IDNA/ASCII form, like dnspython does in Flask.
+  // SKIP_MX_LOOKUP_ON_CHECK is hardcoded False (config.py L634, tests only).
+  const asciiDomain = idnaEncodeDomain(domain) ?? domain;
+  const mxDomains = await dnsClient.getMxDomainList(asciiDomain);
+  if (mxDomains.length === 0) return REASON_NO_MX_RECORD;
+
+  const mxIps = new Set<string>();
+  for (const mxDomain of mxDomains) {
+    if (await isInvalidMailboxDomain(db, mxDomain)) {
+      return REASON_INVALID_MAILBOX_DOMAIN;
+    }
+    const aRecord = await dnsClient.getARecord(mxDomain);
+    if (aRecord !== null) mxIps.add(aRecord);
+  }
+  if (mxIps.size > 0 && (await hasForbiddenMxIp(db, [...mxIps]))) {
+    return REASON_FORBIDDEN_MX;
+  }
 
   const disabledUser = await db
     .prepare("SELECT 1 FROM users WHERE email = ?1 AND disabled = 1")
@@ -225,13 +401,29 @@ async function customDomainToDict(
 // ---- small helpers ----
 
 /**
- * `request.get_json() or {}` equivalent: empty body -> {}; malformed JSON
- * throws SyntaxError (index.ts onError -> 400 "Bad Request"); non-object JSON
- * -> {} (Flask would 500 on `.get`; clean-4xx deviation).
+ * Werkzeug `Request.is_json` (Flask 1.1.2): the body only counts as JSON when
+ * the Content-Type mimetype is application/json or application/*+json —
+ * otherwise `request.get_json()` returns None and the body is ignored.
+ */
+function requestIsJson(c: Context<AppEnv>): boolean {
+  const contentType = c.req.header("content-type") ?? "";
+  const mimetype = contentType.split(";")[0].trim().toLowerCase();
+  return (
+    mimetype === "application/json" ||
+    (mimetype.startsWith("application/") && mimetype.endsWith("+json"))
+  );
+}
+
+/**
+ * `request.get_json() or {}` equivalent: non-JSON Content-Type or empty body
+ * -> {}; malformed JSON throws SyntaxError (index.ts onError -> 400 "Bad
+ * Request"); non-object JSON -> {} (Flask would 500 on `.get`; clean-4xx
+ * deviation).
  */
 async function parseOptionalJson(
   c: Context<AppEnv>,
 ): Promise<Record<string, unknown>> {
+  if (!requestIsJson(c)) return {};
   const text = await c.req.text();
   if (!text.trim()) return {};
   const parsed = JSON.parse(text);
@@ -283,6 +475,15 @@ function toDbValue(v: unknown): unknown {
   return v;
 }
 
+/**
+ * Values SQLAlchemy 1.3's Boolean type accepts for a NOT NULL Postgres column
+ * (`value in (True, False, 1, 0)`; None would hit the NOT NULL constraint).
+ * Anything else makes Flask's commit raise -> 500, nothing persisted.
+ */
+function isPgBooleanValue(v: unknown): boolean {
+  return v === true || v === false || v === 0 || v === 1;
+}
+
 // ---- POST /mailboxes (limiter outside auth, like the Flask decorators) ----
 
 mailboxDomainRoutes.post(
@@ -291,6 +492,11 @@ mailboxDomainRoutes.post(
   requireApiAuth,
   async (c) => {
     const user = c.get("user");
+    if (!requestIsJson(c)) {
+      // Flask: request.get_json() is None -> .get() AttributeError -> 500;
+      // clean 4xx here (see file header).
+      return badRequest(c, "Bad Request");
+    }
     const body: unknown = await c.req.json();
     const email =
       body && typeof body === "object" && !Array.isArray(body)
@@ -598,8 +804,12 @@ mailboxDomainRoutes.patch(
     const user = c.get("user");
     const db = c.env.DB;
 
-    const text = await c.req.text();
-    const parsed: unknown = text.trim() ? JSON.parse(text) : null;
+    // request.get_json(): None unless the Content-Type is JSON (Flask 1.1.2)
+    let parsed: unknown = null;
+    if (requestIsJson(c)) {
+      const text = await c.req.text();
+      parsed = text.trim() ? JSON.parse(text) : null;
+    }
     const isEmpty =
       !parsed ||
       (typeof parsed === "object" &&
@@ -669,6 +879,29 @@ mailboxDomainRoutes.patch(
         return badRequest(c, "Forbidden");
       }
       newMailboxIds = found.results.map((m) => m.id);
+    }
+
+    // Values Postgres would reject when Flask commits (500 "Internal error",
+    // NOTHING persisted): non-boolean catch_all / random_prefix_generation
+    // (models.py L2611: Boolean NOT NULL) and a non-string or >128-char name
+    // (models.py L2594: varchar(128)). Clean 4xx deviation — checked after
+    // mailbox_ids like Flask, where those 400s fire before the commit.
+    if ("catch_all" in data && !isPgBooleanValue(data.catch_all)) {
+      return badRequest(c, "Bad Request");
+    }
+    if (
+      "random_prefix_generation" in data &&
+      !isPgBooleanValue(data.random_prefix_generation)
+    ) {
+      return badRequest(c, "Bad Request");
+    }
+    if ("name" in data) {
+      const name = data.name;
+      if (
+        !(name === null || (typeof name === "string" && name.length <= 128))
+      ) {
+        return badRequest(c, "Bad Request");
+      }
     }
 
     if (sets.length > 0) {

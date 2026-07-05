@@ -20,6 +20,7 @@ import type {
   PublicDomainRow,
   UserRow,
 } from "../src/lib/rows";
+import { aliasCreationRoutes } from "../src/routes/alias-creation";
 import {
   authHeaders,
   createAlias,
@@ -265,6 +266,41 @@ describe("GET /api/v4/alias/options", () => {
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.prefix_suggestion).toBe(`groupon${seq}`);
     expect(body.recommendation).toEqual({ alias: newer.email, hostname });
+  });
+
+  it("derives prefix_suggestion with the full PSL + unidecode like Flask", async () => {
+    const { code } = await setupUser();
+    await createSlDomain();
+    // expectations computed with the pinned tldextract 3.1.2 (bundled PSL
+    // snapshot) + unidecode 1.1.1 through app/utils.py convert_to_id
+    const cases: [string, string][] = [
+      ["shop.example.co.at", "example"], // co.at is a PSL suffix
+      ["foo.example", "example"], // unknown suffix: last label is the domain
+      ["192.168.0.1", "192.168.0.1"], // IPv4 hostname stays whole
+      ["0x7f.1", "0x7f.1"], // inet_aton also accepts hex/short forms
+      ["1.2.3.4.5", "5"], // not an IP: 5 parts
+      ["foo.bar.ck", "foo"], // *.ck wildcard suffix
+      ["www.ck", "www"], // !www.ck exception
+      ["foo.bar.xn--fiqs8s", "bar"], // punycode label matches PSL suffix 中国
+      ["xn--bcher-kva.com", "xn--bcher-kva"], // domain label is NOT decoded
+      ["https://user:pass@www.shop.co.uk:8080/path?q=1#frag", "shop"],
+      ["a..com", ""], // empty label before the suffix
+      ["ß.com", "ss"], // unidecode: ß -> ss
+      ["北京.com", "BeiJing"], // 北京: lower() runs before unidecode
+      ["москва.рф", "moskva"], // москва.рф
+      ["æther.com", "aether"], // æ -> ae
+      ["café.fr", "cafe"],
+    ];
+    for (const [hostname, expected] of cases) {
+      const res = await getOptions(
+        4,
+        code,
+        `?hostname=${encodeURIComponent(hostname)}`,
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { prefix_suggestion: string };
+      expect(body.prefix_suggestion, hostname).toBe(expected);
+    }
   });
 
   it("puts the default custom domain first", async () => {
@@ -585,6 +621,20 @@ describe("POST /api/v2/alias/custom/new", () => {
     expect(await res.json()).toEqual({ error: "Email is not valid" });
   });
 
+  it("transliterates the alias_prefix with unidecode like Flask", async () => {
+    const { user, code } = await setupUser();
+    const sl = await createSlDomain();
+    // convert_to_id("Æther ß") == "aetherss" (lower -> unidecode -> no spaces)
+    const res = await post("/api/v2/alias/custom/new", code, {
+      alias_prefix: "Æther ß",
+      signed_suffix: await sign(`.x123@${sl.domain}`),
+    });
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual(
+      newAliasBody(`aetherss.x123@${sl.domain}`, defaultMailbox(user)),
+    );
+  });
+
   it("creates an alias on a verified custom domain and links it", async () => {
     const { user, code } = await setupUser();
     const cd = await createCustomDomain(user.id);
@@ -757,6 +807,33 @@ describe("POST /api/v3/alias/custom/new", () => {
     });
   });
 
+  it("accepts numeric-string mailbox_ids like Flask", async () => {
+    const { user, code } = await setupUser();
+    const sl = await createSlDomain();
+
+    // Flask's Mailbox.get("5") reaches Postgres, which casts the quoted
+    // literal to int and finds the row -> 201
+    const res = await post("/api/v3/alias/custom/new", code, {
+      alias_prefix: "strid",
+      signed_suffix: await sign(`.x123@${sl.domain}`),
+      mailbox_ids: [String(user.default_mailbox_id)],
+    });
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual(
+      newAliasBody(`strid.x123@${sl.domain}`, defaultMailbox(user)),
+    );
+
+    // non-numeric strings crash Flask with a 500 -> clean 400 here
+    // (documented deviation)
+    const bad = await post("/api/v3/alias/custom/new", code, {
+      alias_prefix: "strid2",
+      signed_suffix: await sign(`.x123@${sl.domain}`),
+      mailbox_ids: ["abc"],
+    });
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toEqual({ error: "Errors with Mailbox" });
+  });
+
   it("412s on an expired signature", async () => {
     const { user, code } = await setupUser();
     const sl = await createSlDomain();
@@ -879,6 +956,19 @@ describe("POST /api/alias/random/new", () => {
     expect(usedOn).toBeTruthy();
   });
 
+  it("derives the one-click prefix with the full PSL (multi-level suffix)", async () => {
+    const { user, code } = await setupUser();
+    const cd = await createCustomDomain(user.id);
+    await setDefaultCustomDomain(user.id, cd.id);
+    // co.at is a public suffix: the registrable label is "myshop<seq>", not "co"
+    const hostname = `foo.myshop${++seq}.co.at`;
+
+    const res = await post(`/api/alias/random/new?hostname=${hostname}`, code);
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { alias: string };
+    expect(body.alias).toBe(`myshop${seq}@${cd.domain}`);
+  });
+
   it("reuses an existing alias only when it was created for the hostname", async () => {
     const { user, code } = await setupUser();
     const cd = await createCustomDomain(user.id);
@@ -963,17 +1053,20 @@ describe("alias creation rate limits", () => {
     }
   });
 
-  it("429s while the alias_creation lock is held for the user", async () => {
-    const { user, code } = await setupUser({ lifetime: 1, trial_end: null });
+  it("429s while the alias_creation lock is held for the client IP", async () => {
+    // parallel_limiter keys by flask-login's current_user, which API-key
+    // requests never have -> the lock is per client IP for API traffic.
+    const { code } = await setupUser({ lifetime: 1, trial_end: null });
+    const fixedIp = { "CF-Connecting-IP": "203.0.113.77" };
     await env.DB.prepare(
       "INSERT INTO rate_limit (key, window_start, count) VALUES (?1, ?2, 1)",
     )
       .bind(
-        `lock:user:${user.id}:alias_creation`,
+        `lock:ip:${fixedIp["CF-Connecting-IP"]}:alias_creation`,
         Math.floor(Date.now() / 1000),
       )
       .run();
-    const res = await post("/api/alias/random/new", code);
+    const res = await post("/api/alias/random/new", code, undefined, fixedIp);
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
   });
@@ -991,6 +1084,45 @@ describe("alias creation rate limits", () => {
         .run();
     }
     const res = await post("/api/alias/random/new", code);
+    expect(res.status).toBe(429);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+  });
+
+  it("keeps the creation bucket limits active when DISABLE_RATE_LIMIT is set", async () => {
+    // Flask's DISABLE_RATE_LIMIT only disables the flask-limiter decorator;
+    // rate_limiter.check_bucket_limit inside Alias.create stays active.
+    const { user, code } = await setupUser();
+    const flaggedEnv = { ...env, DISABLE_RATE_LIMIT: "1" };
+    const headers = {
+      ...authHeaders(code),
+      "CF-Connecting-IP": "203.0.113.88",
+    };
+
+    // sanity: creation itself works through the flagged env
+    const ok = await aliasCreationRoutes.request(
+      "/alias/random/new",
+      { method: "POST", headers },
+      flaggedEnv,
+    );
+    expect(ok.status).toBe(201);
+
+    // exhaust the 10/900s free bucket (current + next bucket, no boundary flake)
+    const nowSec = Math.floor(Date.now() / 1000);
+    for (const base of [0, 900]) {
+      const bucketId = nowSec - (nowSec % 900) + base;
+      await env.DB.prepare(
+        `INSERT INTO rate_limit (key, window_start, count) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET count = ?3`,
+      )
+        .bind(`bl:alias_create_900:${user.id}:${bucketId}`, bucketId, 10)
+        .run();
+    }
+
+    const res = await aliasCreationRoutes.request(
+      "/alias/random/new",
+      { method: "POST", headers },
+      flaggedEnv,
+    );
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
   });

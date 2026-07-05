@@ -31,12 +31,34 @@ const OTP_SECRET = "JBSWY3DPEHPK3PXP";
 
 const API_KEY_RE = /^[a-z]{60}$/;
 
-function postJson(path: string, body: unknown, ip: string): Promise<Response> {
+function postJson(
+  path: string,
+  body: unknown,
+  ip: string,
+  extraHeaders: Record<string, string> = {},
+): Promise<Response> {
   return SELF.fetch(`https://sl.test${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
+    headers: {
+      "Content-Type": "application/json",
+      "CF-Connecting-IP": ip,
+      ...extraHeaders,
+    },
     body: JSON.stringify(body),
   });
+}
+
+/**
+ * Authenticated "slapp" web-session cookie for a user — the flask-login
+ * session that makes the limiter key by user id instead of IP.
+ */
+async function webSessionCookie(user: UserRow): Promise<string> {
+  const token = crypto.randomUUID();
+  await env.KV.put(
+    `session:${token}`,
+    JSON.stringify({ user_id: user.id, alternative_id: user.alternative_id }),
+  );
+  return `slapp=${token}`;
 }
 
 function totpNow(secret: string): string {
@@ -492,6 +514,55 @@ describe("POST /api/auth/register", () => {
     expect(await res.json()).toEqual({ error: "password too long" });
   });
 
+  it("accepts an internationalized (IDN) domain like email_validator", async () => {
+    // validate_email("user@bücher.example", allow_smtputf8=False) passes:
+    // the domain is IDNA-encoded, only the local part must be ASCII
+    const res = await postJson(
+      "/api/auth/register",
+      { email: "user@bücher.example", password: "longenough" },
+      "10.0.2.11",
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      msg: "User needs to confirm their account",
+    });
+    const user = await env.DB.prepare("SELECT * FROM users WHERE email = ?1")
+      .bind("user@bücher.example")
+      .first<UserRow>();
+    expect(user).not.toBeNull();
+    expect(sentEmails[0].to).toBe("user@bücher.example");
+  });
+
+  it("caps the address length at 254 chars like email_validator (not 320)", async () => {
+    const local = "a".repeat(64);
+    const ok = `${local}@${"b".repeat(63)}.${"c".repeat(63)}.${"e".repeat(57)}.com`;
+    const tooLong = `${local}@${"b".repeat(63)}.${"c".repeat(63)}.${"e".repeat(58)}.com`;
+    expect(ok).toHaveLength(254);
+    expect(tooLong).toHaveLength(255);
+
+    // 255 chars → EmailNotValidError("The email address is too long") → 400
+    const longRes = await postJson(
+      "/api/auth/register",
+      { email: tooLong, password: "longenough" },
+      "10.0.2.12",
+    );
+    expect(longRes.status).toBe(400);
+    expect(await longRes.json()).toEqual({
+      error: `cannot use ${tooLong} as personal inbox`,
+    });
+
+    // exactly 254 chars is still valid
+    const okRes = await postJson(
+      "/api/auth/register",
+      { email: ok, password: "longenough" },
+      "10.0.2.12",
+    );
+    expect(okRes.status).toBe(200);
+    expect(await okRes.json()).toEqual({
+      msg: "User needs to confirm their account",
+    });
+  });
+
   it("400s when registration is disabled (presence flag, even '0')", async () => {
     const testEnv = env as unknown as Record<string, unknown>;
     testEnv.DISABLE_REGISTRATION = "0";
@@ -868,6 +939,69 @@ describe("POST /api/auth/forgot_password", () => {
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
   });
+
+  it("keys the rate limit by user id when an authenticated session cookie is sent", async () => {
+    // flask-limiter __key_func (app/extensions.py:14-19): userid:{id} when
+    // current_user.is_authenticated, else the client IP — cookie-logged-in
+    // users behind a shared IP get their own bucket.
+    await avoidMinuteBoundary(10);
+    const ip = "10.0.6.101";
+    const body = { email: "ghost@example.com" };
+
+    // exhaust the anonymous IP bucket (2/minute)
+    for (let i = 0; i < 2; i++) {
+      expect(
+        (await postJson("/api/auth/forgot_password", body, ip)).status,
+      ).toBe(200);
+    }
+    expect((await postJson("/api/auth/forgot_password", body, ip)).status).toBe(
+      429,
+    );
+
+    // a cookie-authenticated user on the SAME IP has its own bucket
+    const userA = await createUser(env.DB);
+    const cookieA = await webSessionCookie(userA);
+    for (let i = 0; i < 2; i++) {
+      const res = await postJson("/api/auth/forgot_password", body, ip, {
+        Cookie: cookieA,
+      });
+      expect(res.status).toBe(200);
+    }
+    const exhaustedA = await postJson("/api/auth/forgot_password", body, ip, {
+      Cookie: cookieA,
+    });
+    expect(exhaustedA.status).toBe(429);
+    expect(await exhaustedA.json()).toEqual({ error: "Rate limit exceeded" });
+
+    // ...and another user on that IP is isolated from both buckets
+    const userB = await createUser(env.DB);
+    const cookieB = await webSessionCookie(userB);
+    const resB = await postJson("/api/auth/forgot_password", body, ip, {
+      Cookie: cookieB,
+    });
+    expect(resB.status).toBe(200);
+  });
+
+  it("still keys by IP when the session cookie belongs to a disabled user", async () => {
+    // flask-login's user loader returns None for disabled users, so the
+    // limiter falls back to the IP key
+    await avoidMinuteBoundary(6);
+    const ip = "10.0.6.102";
+    const disabled = await createUser(env.DB, { disabled: 1 });
+    const cookie = await webSessionCookie(disabled);
+    const body = { email: "ghost@example.com" };
+    for (let i = 0; i < 2; i++) {
+      const res = await postJson("/api/auth/forgot_password", body, ip, {
+        Cookie: cookie,
+      });
+      expect(res.status).toBe(200);
+    }
+    const res = await postJson("/api/auth/forgot_password", body, ip, {
+      Cookie: cookie,
+    });
+    expect(res.status).toBe(429);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1163,38 @@ describe("POST /api/auth/mfa", () => {
     );
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+  });
+
+  it("keys the mfa_auth lock by user id for cookie-authenticated callers", async () => {
+    // parallel_limiter (app/parallel_limiter.py:55-58): the lock name is
+    // cl:{current_user.id}:mfa_auth when a session cookie authenticates the
+    // caller, cl:{remote_addr}:mfa_auth otherwise
+    const user = await mfaUser();
+    const cookie = await webSessionCookie(user);
+    await env.DB.prepare(
+      "INSERT INTO rate_limit (key, window_start, count) VALUES (?1, ?2, 1)",
+    )
+      .bind(`lock:user:${user.id}:mfa_auth`, Math.floor(Date.now() / 1000))
+      .run();
+
+    // the held user lock blocks the cookie-authenticated request...
+    const locked = await postJson(
+      "/api/auth/mfa",
+      { mfa_key: "x", mfa_token: "123456" },
+      "10.0.7.10",
+      { Cookie: cookie },
+    );
+    expect(locked.status).toBe(429);
+    expect(await locked.json()).toEqual({ error: "Rate limit exceeded" });
+
+    // ...but not an anonymous one from the same IP (keyed by IP instead)
+    const anon = await postJson(
+      "/api/auth/mfa",
+      { mfa_key: "x", mfa_token: "123456" },
+      "10.0.7.10",
+    );
+    expect(anon.status).toBe(400);
+    expect(await anon.json()).toEqual({ error: "Invalid mfa_key" });
   });
 
   it("429s after 10 requests per minute from one IP", async () => {

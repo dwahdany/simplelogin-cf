@@ -73,6 +73,15 @@ function parsePageId(raw: string | undefined): number | null {
   return Number.parseInt(t, 10);
 }
 
+/**
+ * Flask feeds page_id * PAGE_LIMIT straight into OFFSET; Postgres rejects a
+ * negative OFFSET ("OFFSET must not be negative") and the generic /api error
+ * handler (simplelogin_app.py error_handler) turns that into a 500
+ * {"error": "Internal error"}. SQLite quietly treats a negative OFFSET as 0,
+ * so the Flask response is reproduced explicitly.
+ */
+const negativePageError = (c: Ctx) => jsonError(c, 500, "Internal error");
+
 /** Python `int(x)` over JSON values: numbers truncate, bools are 0/1,
  * numeric strings parse; everything else is a failure (null). */
 function pyInt(v: unknown): number | null {
@@ -88,8 +97,26 @@ function pyInt(v: unknown): number | null {
   return null;
 }
 
-/** request.get_json(silent=True) + `data.get("query")` for the list routes. */
+/**
+ * Flask 1.1 `Request.is_json`: the request mimetype (Content-Type without
+ * parameters, lowercased) must be application/json or application/*+json.
+ * `request.get_json()` returns None for anything else, whatever the body is.
+ */
+function requestIsJson(c: Ctx): boolean {
+  const contentType = c.req.header("content-type");
+  if (!contentType) return false;
+  const mimetype = contentType.split(";")[0].trim().toLowerCase();
+  return (
+    mimetype === "application/json" ||
+    (mimetype.startsWith("application/") && mimetype.endsWith("+json"))
+  );
+}
+
+/** request.get_json(silent=True) + `data.get("query")` for the list routes.
+ * A non-JSON Content-Type means get_json returns None: the query filter is
+ * silently ignored even when the body is valid JSON. */
 async function readQueryBody(c: Ctx): Promise<string | null> {
+  if (!requestIsJson(c)) return null;
   let data: unknown;
   try {
     data = await c.req.json();
@@ -103,12 +130,15 @@ async function readQueryBody(c: Ctx): Promise<string | null> {
 }
 
 /**
- * request.get_json() for mutation routes. Malformed JSON propagates as a
+ * request.get_json() for mutation routes. A non-JSON Content-Type makes Flask
+ * 1.1's get_json return None (=> 400 "request body cannot be empty") even for
+ * a valid JSON body. With a JSON Content-Type, malformed JSON propagates as a
  * SyntaxError -> global 400 {"error": "Bad Request"} handler (like Flask's
  * BadRequest). Falsy or non-object JSON -> null (=> "request body cannot be
  * empty"; Flask 500s on non-dict truthy JSON — clean 4xx here).
  */
 async function readBody(c: Ctx): Promise<Record<string, unknown> | null> {
+  if (!requestIsJson(c)) return null;
   const data: unknown = await c.req.json();
   if (!data || typeof data !== "object" || Array.isArray(data)) return null;
   if (Object.keys(data as object).length === 0) return null; // {} is falsy in Python
@@ -448,6 +478,7 @@ aliasRoutes.on(
     if (pageId === null) {
       return badRequest(c, "page_id must be provided in request query");
     }
+    if (pageId < 0) return negativePageError(c);
     const query = await readQueryBody(c);
     const infos = await getAliasInfosV1(c.env.DB, user, pageId, query);
     return c.json({ aliases: infos.map(serializeAliasInfo) });
@@ -469,6 +500,7 @@ aliasRoutes.on(
     if (pageId === null) {
       return badRequest(c, "page_id must be provided in request query");
     }
+    if (pageId < 0) return negativePageError(c);
     // Presence-based flags: `"pinned" in request.args` (?pinned=false counts).
     // Precedence pinned > disabled > enabled is applied by the lib helper.
     const pinned = c.req.query("pinned") !== undefined;
@@ -561,6 +593,9 @@ aliasRoutes.get(
     }
     const alias = await getAliasById(c.env.DB, Number(c.req.param("alias_id")));
     if (!alias || alias.user_id !== user.id) return forbidden(c);
+    // the Postgres OFFSET error only fires once the query runs, i.e. after
+    // the ownership checks above
+    if (pageId < 0) return negativePageError(c);
 
     // get_alias_log: page by email_log.id DESC, then re-sort by created_at
     // DESC (stable, so id-desc order is kept for equal timestamps).
@@ -655,10 +690,19 @@ aliasRoutes.on(
     }
 
     if (Object.hasOwn(data, "mailbox_ids")) {
+      // Python `[int(m_id) for m_id in data.get("mailbox_ids")]` iterates any
+      // iterable: a list yields its elements, a string yields its CHARACTERS
+      // (so "12" means mailboxes [1, 2]) and a dict yields its keys. Numbers,
+      // bools and null raise TypeError -> 400 "Invalid mailbox_id".
       const rawIds = data.mailbox_ids;
-      if (!Array.isArray(rawIds)) return badRequest(c, "Invalid mailbox_id");
+      let iterated: unknown[];
+      if (Array.isArray(rawIds)) iterated = rawIds;
+      else if (typeof rawIds === "string") iterated = [...rawIds];
+      else if (rawIds !== null && typeof rawIds === "object")
+        iterated = Object.keys(rawIds);
+      else return badRequest(c, "Invalid mailbox_id");
       const mailboxIds: number[] = [];
-      for (const rawId of rawIds) {
+      for (const rawId of iterated) {
         const parsed = pyInt(rawId);
         if (parsed === null) return badRequest(c, "Invalid mailbox_id");
         mailboxIds.push(parsed);
@@ -756,6 +800,9 @@ aliasRoutes.get(
     const alias = await getAliasById(c.env.DB, Number(c.req.param("alias_id")));
     if (!alias) return notFound(c, "No such alias");
     if (alias.user_id !== user.id) return forbidden(c);
+    // the Postgres OFFSET error only fires once the query runs, i.e. after
+    // the ownership checks above
+    if (pageId < 0) return negativePageError(c);
 
     const contacts = await c.env.DB.prepare(
       `SELECT * FROM contact WHERE alias_id = ?1 ORDER BY id DESC LIMIT ${PAGE_LIMIT} OFFSET ?2`,

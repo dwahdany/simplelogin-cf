@@ -9,6 +9,7 @@ import type {
   MailboxRow,
   UserRow,
 } from "../src/lib/rows";
+import { setDnsClient } from "../src/routes/mailboxes";
 import {
   createAlias,
   createApiKey,
@@ -97,6 +98,8 @@ interface ReqOpts {
   code?: string;
   body?: unknown;
   ip?: string;
+  /** Content-Type when a body is sent; defaults to application/json. */
+  contentType?: string;
 }
 
 function req(method: string, path: string, opts: ReqOpts = {}) {
@@ -106,10 +109,44 @@ function req(method: string, path: string, opts: ReqOpts = {}) {
   if (opts.code) headers.Authentication = opts.code;
   const init: RequestInit = { method, headers };
   if (opts.body !== undefined) {
-    headers["Content-Type"] = "application/json";
+    headers["Content-Type"] = opts.contentType ?? "application/json";
     init.body = JSON.stringify(opts.body);
   }
   return SELF.fetch(`https://sl.test/api${path}`, init);
+}
+
+// ---- in-memory DNS client (like Flask tests' InMemoryDNSClient) ----
+
+/** MX hosts per hostname; unknown hostnames get a generic MX so mailbox
+ * creation succeeds by default. Set an empty array for an MX-less domain. */
+const mxRecords = new Map<string, string[]>();
+/** A records per MX hostname; unknown hostnames resolve to null. */
+const aRecords = new Map<string, string>();
+/** Hostnames MX records were requested for (asserts IDNA encoding). */
+const mxQueries: string[] = [];
+
+// Tests and SELF share this isolate, so the routes see this client.
+setDnsClient({
+  async getMxDomainList(hostname) {
+    mxQueries.push(hostname);
+    return mxRecords.get(hostname) ?? ["mx.mock.test"];
+  },
+  async getARecord(hostname) {
+    return aRecords.get(hostname) ?? null;
+  },
+});
+
+/** The optional blocklist tables (absent from the D1 migrations). */
+async function createBlocklistTables() {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS invalid_mailbox_domain (
+       id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE)`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS forbidden_mx_ip (
+       id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL UNIQUE,
+       comment TEXT)`,
+  ).run();
 }
 
 /** Pre-fill a fixed-window counter so a single request trips the limit. */
@@ -166,6 +203,9 @@ function getActivations(mailboxId: number) {
 
 beforeEach(() => {
   sentEmails.length = 0;
+  mxRecords.clear();
+  aRecords.clear();
+  mxQueries.length = 0;
 });
 
 // ---- POST /api/mailboxes ----
@@ -324,6 +364,113 @@ describe("POST /api/mailboxes", () => {
         error: "Invalid email: This email address is not allowed",
       });
     }
+  });
+
+  it("400 when the domain has no MX records", async () => {
+    const { code } = await setup();
+    mxRecords.set("no-mx.example.com", []);
+    const res = await req("POST", "/mailboxes", {
+      code,
+      body: { email: "a@no-mx.example.com" },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error:
+        "Invalid email: We couldn't get any MX records configured for this domain",
+    });
+    const row = await env.DB.prepare("SELECT 1 FROM mailbox WHERE email = ?1")
+      .bind("a@no-mx.example.com")
+      .first();
+    expect(row).toBeNull();
+    expect(sentEmails).toHaveLength(0);
+  });
+
+  it("400 for a blocklisted mailbox domain, incl. parent-suffix matches", async () => {
+    await createBlocklistTables();
+    await insertRow("invalid_mailbox_domain", {
+      domain: "blocked.example.com",
+    });
+    const { code } = await setup();
+    for (const email of [
+      "a@blocked.example.com",
+      "a@sub.blocked.example.com",
+    ]) {
+      const res = await req("POST", "/mailboxes", { code, body: { email } });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "Invalid email: We don't allow mailboxes using this domain",
+      });
+    }
+  });
+
+  it("400 when an MX host is itself a blocklisted mailbox domain", async () => {
+    await createBlocklistTables();
+    await insertRow("invalid_mailbox_domain", { domain: "blocked-mx.test" });
+    mxRecords.set("edgy.example.com", ["mx1.blocked-mx.test"]);
+    const { code } = await setup();
+    const res = await req("POST", "/mailboxes", {
+      code,
+      body: { email: "a@edgy.example.com" },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: "Invalid email: We don't allow mailboxes using this domain",
+    });
+  });
+
+  it("400 when an MX host resolves to a forbidden IP", async () => {
+    await createBlocklistTables();
+    await insertRow("forbidden_mx_ip", { ip: "10.0.0.66" });
+    mxRecords.set("bad-ip.example.com", ["mx.bad-ip.test"]);
+    aRecords.set("mx.bad-ip.test", "10.0.0.66");
+    const { code } = await setup();
+    const res = await req("POST", "/mailboxes", {
+      code,
+      body: { email: "a@bad-ip.example.com" },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error:
+        "Invalid email: We don't allow mailbox domains that point to these MX records",
+    });
+  });
+
+  it("accepts an internationalized domain, querying MX on the IDNA form", async () => {
+    const { code } = await setup();
+    const res = await req("POST", "/mailboxes", {
+      code,
+      body: { email: "user@bücher.example" },
+    });
+    expect(res.status).toBe(201);
+    expect(((await res.json()) as { email: string }).email).toBe(
+      "user@bücher.example",
+    );
+    expect(mxQueries).toContain("xn--bcher-kva.example");
+  });
+
+  it("still rejects a unicode LOCAL part (allow_smtputf8=False)", async () => {
+    const { code } = await setup();
+    const res = await req("POST", "/mailboxes", {
+      code,
+      body: { email: "üser@example.com" },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "Invalid email" });
+  });
+
+  it("400 Bad Request for a non-JSON Content-Type (Flask 500)", async () => {
+    const { code } = await setup();
+    const res = await req("POST", "/mailboxes", {
+      code,
+      body: { email: "ct@example.com" },
+      contentType: "text/plain",
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "Bad Request" });
+    const row = await env.DB.prepare("SELECT 1 FROM mailbox WHERE email = ?1")
+      .bind("ct@example.com")
+      .first();
+    expect(row).toBeNull();
   });
 
   it("rate limits at 20/hour per IP, counted before auth like Flask", async () => {
@@ -485,6 +632,24 @@ describe("DELETE /api/mailboxes/:id", () => {
     expect(await res.json()).toEqual({ error: "Bad Request" });
   });
 
+  it("ignores transfer_aliases_to sent with a non-JSON Content-Type (Flask get_json -> None)", async () => {
+    const { user, code } = await setup();
+    const mb = await createMailbox(env.DB, user.id, "plainct@example.com");
+    const target = await createMailbox(env.DB, user.id, "tgt-ct@example.com");
+    const res = await req("DELETE", `/mailboxes/${mb.id}`, {
+      code,
+      body: { transfer_aliases_to: target.id },
+      contentType: "text/plain",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ deleted: true });
+    const job = await env.DB.prepare(
+      "SELECT * FROM job WHERE name = 'delete-mailbox' ORDER BY id DESC",
+    ).first<JobRow>();
+    // the body was ignored: aliases are deleted, not transferred
+    expect(JSON.parse(job?.payload as string).transfer_mailbox_id).toBeNull();
+  });
+
   it("429 once the 100/hour window is exhausted", async () => {
     const { user, code } = await setup();
     const mb = await createMailbox(env.DB, user.id, "rl@example.com");
@@ -609,6 +774,39 @@ describe("PUT /api/mailboxes/:id", () => {
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ error });
     }
+  });
+
+  it("400 when changing the email to a domain without MX records", async () => {
+    const { user, code } = await setup();
+    mxRecords.set("no-mx.example.net", []);
+    const res = await req("PUT", `/mailboxes/${user.default_mailbox_id}`, {
+      code,
+      body: { email: "a@no-mx.example.net" },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error:
+        "Invalid email: We couldn't get any MX records configured for this domain",
+    });
+    const row = await getMailboxRow(user.default_mailbox_id as number);
+    expect(row.new_email).toBeNull();
+  });
+
+  it("ignores the body when the Content-Type is not JSON (Flask get_json -> None)", async () => {
+    const { user, code } = await setup();
+    const mb = await createMailbox(env.DB, user.id, "put-ct@example.com");
+    const res = await req("PUT", `/mailboxes/${mb.id}`, {
+      code,
+      body: { default: true, email: "changed-ct@example.net" },
+      contentType: "text/plain",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ updated: true });
+    expect((await getUserRow(user.id)).default_mailbox_id).toBe(
+      user.default_mailbox_id,
+    );
+    expect((await getMailboxRow(mb.id)).new_email).toBeNull();
+    expect(sentEmails).toHaveLength(0);
   });
 
   it("400 Email already in use when new_email is pending elsewhere (global unique)", async () => {
@@ -967,6 +1165,84 @@ describe("PATCH /api/custom_domains/:id", () => {
       .bind(d.id)
       .first<{ n: number }>();
     expect(links?.n).toBe(0);
+  });
+
+  it("400 request body cannot be empty for a non-JSON Content-Type (Flask get_json -> None)", async () => {
+    const { user, code } = await setup();
+    const d = await createCustomDomain(user.id);
+    const res = await req("PATCH", `/custom_domains/${d.id}`, {
+      code,
+      body: { catch_all: true },
+      contentType: "text/plain",
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "request body cannot be empty" });
+    const row = await env.DB.prepare(
+      "SELECT catch_all FROM custom_domain WHERE id = ?1",
+    )
+      .bind(d.id)
+      .first<{ catch_all: number }>();
+    expect(row?.catch_all).toBe(0); // nothing was applied
+  });
+
+  it("400 Bad Request for values Postgres rejects, persisting nothing (Flask 500)", async () => {
+    const { user, code } = await setup();
+    const d = await createCustomDomain(user.id, { name: "Keep" });
+
+    const badBodies: Array<Record<string, unknown>> = [
+      { catch_all: "no" }, // string for a Boolean column
+      { catch_all: null }, // NOT NULL column
+      { catch_all: 2 }, // not in (True, False, 1, 0)
+      { random_prefix_generation: "yes" },
+      { name: "x".repeat(129) }, // varchar(128)
+      { name: 123 }, // int into varchar
+    ];
+    for (const body of badBodies) {
+      const res = await req("PATCH", `/custom_domains/${d.id}`, { code, body });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "Bad Request" });
+    }
+
+    // a later GET reflects the unchanged state
+    const list = await req("GET", "/custom_domains", { code });
+    const listBody = (await list.json()) as {
+      custom_domains: Array<{
+        id: number;
+        catch_all: boolean;
+        random_prefix_generation: boolean;
+        name: string | null;
+      }>;
+    };
+    const cd = listBody.custom_domains.find((x) => x.id === d.id);
+    expect(cd?.catch_all).toBe(false);
+    expect(cd?.random_prefix_generation).toBe(false);
+    expect(cd?.name).toBe("Keep");
+  });
+
+  it("accepts 0/1 for the boolean fields, like SQLAlchemy's Boolean", async () => {
+    const { user, code } = await setup();
+    const d = await createCustomDomain(user.id);
+    const res = await req("PATCH", `/custom_domains/${d.id}`, {
+      code,
+      body: { catch_all: 1, random_prefix_generation: 0 },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      custom_domain: { catch_all: boolean; random_prefix_generation: boolean };
+    };
+    expect(body.custom_domain.catch_all).toBe(true);
+    expect(body.custom_domain.random_prefix_generation).toBe(false);
+  });
+
+  it("mailbox_ids failures take precedence over bad column values (Flask order)", async () => {
+    const { user, code } = await setup();
+    const d = await createCustomDomain(user.id);
+    const res = await req("PATCH", `/custom_domains/${d.id}`, {
+      code,
+      body: { catch_all: "no", mailbox_ids: [] },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "Forbidden" });
   });
 
   it("no-op PATCH with unrecognized fields returns the current state", async () => {

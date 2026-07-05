@@ -249,6 +249,34 @@ describe("GET/POST /api/aliases (v1)", () => {
     expect(oneBody.aliases.map((a) => a.id)).toEqual([byEmail.id]);
   });
 
+  it("ignores the query body without a JSON Content-Type (get_json silent=True)", async () => {
+    const s = await setup();
+    const a1 = await createAlias(env.DB, s.user.id, s.mailbox.id, {
+      note: "ctfilter haystack",
+    });
+    const a2 = await createAlias(env.DB, s.user.id, s.mailbox.id);
+
+    const res = await SELF.fetch(`${BASE}/api/aliases?page_id=0`, {
+      method: "POST",
+      headers: { ...s.headers, "Content-Type": "text/plain" },
+      body: JSON.stringify({ query: "ctfilter" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { aliases: { id: number }[] };
+    // unfiltered — Flask's get_json returns None for text/plain
+    expect(body.aliases.map((a) => a.id).sort()).toEqual([a1.id, a2.id].sort());
+  });
+
+  it("returns Flask's 500 Internal error for a negative page_id", async () => {
+    const s = await setup();
+    await createAlias(env.DB, s.user.id, s.mailbox.id);
+    const res = await SELF.fetch(`${BASE}/api/aliases?page_id=-1`, {
+      headers: s.headers,
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "Internal error" });
+  });
+
   it("rate limits at 10/minute per user", async () => {
     const s = await setup();
     for (let i = 0; i < 10; i++) {
@@ -382,6 +410,67 @@ describe("GET/POST /api/v2/aliases", () => {
     });
     const body = (await res.json()) as { aliases: { id: number }[] };
     expect(body.aliases.map((a) => a.id)).toEqual([hit.id]);
+  });
+
+  it("query matches English-stemmed note words (Postgres full-text)", async () => {
+    const s = await setup();
+    const hit = await createAlias(env.DB, s.user.id, s.mailbox.id, {
+      note: "run daily",
+    });
+    await createAlias(env.DB, s.user.id, s.mailbox.id, {
+      note: "cycling weekly",
+    });
+
+    // 'running' stems to 'run' — LIKE '%running%' would never match
+    const res = await SELF.fetch(`${BASE}/api/v2/aliases?page_id=0`, {
+      method: "POST",
+      headers: { ...s.headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "running" }),
+    });
+    const body = (await res.json()) as { aliases: { id: number }[] };
+    expect(body.aliases.map((a) => a.id)).toEqual([hit.id]);
+  });
+
+  it("query matches non-ASCII case-insensitively (ILIKE)", async () => {
+    const s = await setup();
+    const hit = await createAlias(env.DB, s.user.id, s.mailbox.id, {
+      note: "Über alles",
+    });
+    await createAlias(env.DB, s.user.id, s.mailbox.id);
+
+    const res = await SELF.fetch(`${BASE}/api/v2/aliases?page_id=0`, {
+      method: "POST",
+      headers: { ...s.headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "über" }),
+    });
+    const body = (await res.json()) as { aliases: { id: number }[] };
+    expect(body.aliases.map((a) => a.id)).toEqual([hit.id]);
+  });
+
+  it("ignores the query body without a JSON Content-Type (get_json silent=True)", async () => {
+    const s = await setup();
+    const a1 = await createAlias(env.DB, s.user.id, s.mailbox.id, {
+      note: "needle in a haystack",
+    });
+    const a2 = await createAlias(env.DB, s.user.id, s.mailbox.id);
+
+    const res = await SELF.fetch(`${BASE}/api/v2/aliases?page_id=0`, {
+      method: "POST",
+      headers: { ...s.headers, "Content-Type": "text/plain" },
+      body: JSON.stringify({ query: "needle" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { aliases: { id: number }[] };
+    expect(body.aliases.map((a) => a.id).sort()).toEqual([a1.id, a2.id].sort());
+  });
+
+  it("returns Flask's 500 Internal error for a negative page_id", async () => {
+    const s = await setup();
+    const res = await SELF.fetch(`${BASE}/api/v2/aliases?page_id=-2`, {
+      headers: s.headers,
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "Internal error" });
   });
 
   it("rate limits at 50/minute per user", async () => {
@@ -530,12 +619,49 @@ describe("PUT/PATCH /api/aliases/:id", () => {
     expect(await res.json()).toEqual({ error: "request body cannot be empty" });
   });
 
-  it("maps a missing/unparseable body to the global 400", async () => {
+  it("treats a body without a JSON Content-Type as empty (Flask get_json -> None)", async () => {
+    const s = await setup();
+    const alias = await createAlias(env.DB, s.user.id, s.mailbox.id);
+
+    // no body, no Content-Type
+    const noBody = await SELF.fetch(`${BASE}/api/aliases/${alias.id}`, {
+      method: "PUT",
+      headers: s.headers,
+    });
+    expect(noBody.status).toBe(400);
+    expect(await noBody.json()).toEqual({
+      error: "request body cannot be empty",
+    });
+
+    // a VALID JSON body sent as text/plain is ignored: 400, note unchanged
+    const textPlain = await SELF.fetch(`${BASE}/api/aliases/${alias.id}`, {
+      method: "PUT",
+      headers: { ...s.headers, "Content-Type": "text/plain" },
+      body: JSON.stringify({ note: "smuggled" }),
+    });
+    expect(textPlain.status).toBe(400);
+    expect(await textPlain.json()).toEqual({
+      error: "request body cannot be empty",
+    });
+    expect((await getAliasRow(alias.id))?.note).toBeNull();
+
+    // application/*+json counts as JSON (Flask Request.is_json)
+    const suffixJson = await SELF.fetch(`${BASE}/api/aliases/${alias.id}`, {
+      method: "PUT",
+      headers: { ...s.headers, "Content-Type": "application/vnd.api+json" },
+      body: JSON.stringify({ note: "via +json" }),
+    });
+    expect(suffixJson.status).toBe(200);
+    expect((await getAliasRow(alias.id))?.note).toBe("via +json");
+  });
+
+  it("maps a malformed application/json body to the global 400", async () => {
     const s = await setup();
     const alias = await createAlias(env.DB, s.user.id, s.mailbox.id);
     const res = await SELF.fetch(`${BASE}/api/aliases/${alias.id}`, {
       method: "PUT",
-      headers: s.headers,
+      headers: { ...s.headers, "Content-Type": "application/json" },
+      body: "{not json",
     });
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "Bad Request" });
@@ -635,6 +761,63 @@ describe("PUT/PATCH /api/aliases/:id", () => {
     res = await update(s, alias.id, { mailbox_ids: [disabledMb.id] });
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "Forbidden" });
+  });
+
+  it("iterates a string mailbox_ids per character, like Python int() over str", async () => {
+    const s = await setup();
+    const alias = await createAlias(env.DB, s.user.id, s.mailbox.id);
+
+    // Python iterates "12" into mailbox ids [1, 2], so the user must OWN
+    // verified mailboxes with those single-digit ids: claim (or create) them.
+    for (const id of [1, 2]) {
+      await env.DB.prepare(
+        "INSERT OR IGNORE INTO mailbox (id, user_id, email, verified) VALUES (?1, ?2, ?3, 1)",
+      )
+        .bind(id, s.user.id, `digit${id}-${s.user.id}@x.com`)
+        .run();
+      await env.DB.prepare(
+        "UPDATE mailbox SET user_id = ?1, verified = 1, flags = 0 WHERE id = ?2",
+      )
+        .bind(s.user.id, id)
+        .run();
+    }
+
+    // Flask: [int(m_id) for m_id in "12"] == [1, 2] -> update succeeds
+    const ok = await update(s, alias.id, { mailbox_ids: "12" });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ ok: true });
+    expect((await getAliasRow(alias.id))?.mailbox_id).toBe(1);
+    const links = await env.DB.prepare(
+      "SELECT mailbox_id FROM alias_mailbox WHERE alias_id = ?1",
+    )
+      .bind(alias.id)
+      .all<{ mailbox_id: number }>();
+    expect(links.results.map((r) => r.mailbox_id)).toEqual([2]);
+
+    // digits that are not the user's mailboxes -> 400 "Forbidden" (NOT
+    // "Invalid mailbox_id": the string itself parses fine)
+    const notOwned = await update(s, alias.id, { mailbox_ids: "9" });
+    expect(notOwned.status).toBe(400);
+    expect(await notOwned.json()).toEqual({ error: "Forbidden" });
+
+    // non-digit characters raise ValueError -> 400 Invalid mailbox_id
+    const nonDigit = await update(s, alias.id, { mailbox_ids: "1a" });
+    expect(nonDigit.status).toBe(400);
+    expect(await nonDigit.json()).toEqual({ error: "Invalid mailbox_id" });
+
+    // empty string iterates to [] -> EmptyMailboxes error
+    const emptyStr = await update(s, alias.id, { mailbox_ids: "" });
+    expect(emptyStr.status).toBe(400);
+    expect(await emptyStr.json()).toEqual({
+      error: "Must choose at least one mailbox",
+    });
+
+    // non-iterables (numbers, bools, null) raise TypeError -> Invalid mailbox_id
+    for (const bad of [12, true, null]) {
+      const res = await update(s, alias.id, { mailbox_ids: bad });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "Invalid mailbox_id" });
+    }
   });
 
   it("rewrites mailboxes: lowest id becomes primary, rest go to alias_mailbox", async () => {
@@ -906,6 +1089,28 @@ describe("GET /api/aliases/:id/activities", () => {
     expect(await res.json()).toEqual({ error: "Forbidden" });
   });
 
+  it("returns Flask's 500 Internal error for a negative page_id (after ownership)", async () => {
+    const s = await setup();
+    const alias = await createAlias(env.DB, s.user.id, s.mailbox.id);
+
+    // ownership is checked before the query runs: foreign alias still 403s
+    const other = await setup();
+    const foreign = await createAlias(env.DB, other.user.id, other.mailbox.id);
+    const foreignRes = await SELF.fetch(
+      `${BASE}/api/aliases/${foreign.id}/activities?page_id=-1`,
+      { headers: { ...s.headers, "CF-Connecting-IP": nextIp() } },
+    );
+    expect(foreignRes.status).toBe(403);
+    expect(await foreignRes.json()).toEqual({ error: "Forbidden" });
+
+    const res = await SELF.fetch(
+      `${BASE}/api/aliases/${alias.id}/activities?page_id=-1`,
+      { headers: { ...s.headers, "CF-Connecting-IP": nextIp() } },
+    );
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "Internal error" });
+  });
+
   it("serializes activities newest-first with exact fields", async () => {
     const s = await setup();
     const alias = await createAlias(env.DB, s.user.id, s.mailbox.id);
@@ -1034,6 +1239,26 @@ describe("GET /api/aliases/:id/contacts", () => {
     expect(await res.json()).toEqual({ error: "Forbidden" });
   });
 
+  it("returns Flask's 500 Internal error for a negative page_id (after 404/403)", async () => {
+    const s = await setup();
+    const alias = await createAlias(env.DB, s.user.id, s.mailbox.id);
+
+    // the 404 for a missing alias still wins over the offset crash
+    const missing = await SELF.fetch(
+      `${BASE}/api/aliases/999999/contacts?page_id=-1`,
+      { headers: s.headers },
+    );
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual({ error: "No such alias" });
+
+    const res = await SELF.fetch(
+      `${BASE}/api/aliases/${alias.id}/contacts?page_id=-1`,
+      { headers: s.headers },
+    );
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "Internal error" });
+  });
+
   it("lists contacts id-desc with last_email_sent from replies only", async () => {
     const s = await setup();
     const alias = await createAlias(env.DB, s.user.id, s.mailbox.id);
@@ -1121,6 +1346,27 @@ describe("POST /api/aliases/:id/contacts", () => {
     expect(await empty.json()).toEqual({
       error: "request body cannot be empty",
     });
+
+    // valid JSON body without a JSON Content-Type: Flask's get_json returns
+    // None -> same "empty body" 400, no contact created
+    const textPlain = await SELF.fetch(
+      `${BASE}/api/aliases/${alias.id}/contacts`,
+      {
+        method: "POST",
+        headers: { ...s.headers, "Content-Type": "text/plain" },
+        body: JSON.stringify({ contact: "a@b.com" }),
+      },
+    );
+    expect(textPlain.status).toBe(400);
+    expect(await textPlain.json()).toEqual({
+      error: "request body cannot be empty",
+    });
+    const created = await env.DB.prepare(
+      "SELECT 1 FROM contact WHERE alias_id = ?1 LIMIT 1",
+    )
+      .bind(alias.id)
+      .first();
+    expect(created).toBeNull();
 
     const other = await setup();
     const foreign = await createAlias(env.DB, other.user.id, other.mailbox.id);

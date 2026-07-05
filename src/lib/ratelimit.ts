@@ -1,6 +1,7 @@
-import type { MiddlewareHandler } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import type { AppEnv } from "./auth";
 import { rateLimited } from "./errors";
+import { getSession } from "./session";
 
 /**
  * Fixed-window rate limiting on D1 (single-writer => atomic upserts),
@@ -10,7 +11,8 @@ import { rateLimited } from "./errors";
  * - default key: user id for cookie-session requests, client IP otherwise;
  *   routes that passed key_func=g.user.id use keyByUser.
  * - 429 responses use the /api error handler body {"error": "Rate limit exceeded"}.
- * - DISABLE_RATE_LIMIT env var (presence-based) disables everything.
+ * - DISABLE_RATE_LIMIT env var (presence-based) disables the flask-limiter
+ *   windows only — parallel_limiter locks stay active, like in Flask.
  */
 
 export interface Window {
@@ -57,6 +59,20 @@ export function clientIp(headers: Headers): string {
 }
 
 /**
+ * flask-limiter/parallel_limiter key semantics: keyed by the flask-login
+ * SESSION user whenever the request carries a valid slapp cookie — even when
+ * an Authentication header is also present (flask-login loads the session on
+ * every request, independent of the API-key auth path) — else client IP.
+ */
+async function flaskLoginSubject(c: Context<AppEnv>): Promise<string> {
+  const authSession = c.get("session");
+  if (authSession?.user_id != null) return `user:${authSession.user_id}`;
+  const cookieSession = await getSession(c);
+  if (cookieSession?.user_id != null) return `user:${cookieSession.user_id}`;
+  return `ip:${clientIp(c.req.raw.headers)}`;
+}
+
+/**
  * Rate-limit middleware. Must run AFTER requireApiAuth when keyBy="user".
  * keyBy="default" mirrors flask-limiter's key func: session user id when
  * cookie-authenticated, client IP otherwise (API-key traffic!).
@@ -72,8 +88,8 @@ export function rateLimit(
     let subject: string;
     if (keyBy === "user") {
       subject = `user:${c.get("user").id}`;
-    } else if (keyBy === "default" && c.get("session")?.user_id != null) {
-      subject = `user:${c.get("session")!.user_id}`;
+    } else if (keyBy === "default") {
+      subject = await flaskLoginSubject(c);
     } else {
       subject = `ip:${clientIp(c.req.raw.headers)}`;
     }
@@ -94,15 +110,14 @@ export function rateLimit(
 /**
  * parallel_limiter.lock() port: 5s NX mutex held for the request duration.
  * Contention => 429 {"error": "Rate limit exceeded"}.
+ * Keyed like flask-limiter (session user else IP — parallel_limiter uses
+ * flask-login's current_user, NOT g.user, so API-key traffic locks per IP).
+ * NOT disabled by DISABLE_RATE_LIMIT (parallel_limiter has no such filter).
  */
 export function requestLock(name: string): MiddlewareHandler<AppEnv> {
   const TTL = 5;
   return async (c, next) => {
-    if (c.env.DISABLE_RATE_LIMIT) return next();
-    const user = c.get("user");
-    const subject = user
-      ? `user:${user.id}`
-      : `ip:${clientIp(c.req.raw.headers)}`;
+    const subject = await flaskLoginSubject(c);
     const key = `lock:${subject}:${name}`;
     const now = Math.floor(Date.now() / 1000);
     const acquired = await c.env.DB.prepare(

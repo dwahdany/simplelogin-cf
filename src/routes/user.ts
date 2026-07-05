@@ -46,7 +46,7 @@ import type {
   PublicDomainRow,
   UserRow,
 } from "../lib/rows";
-import { destroySession } from "../lib/session";
+import { destroySession, getSession } from "../lib/session";
 
 export const userRoutes = new Hono<AppEnv>();
 
@@ -270,12 +270,31 @@ userRoutes.patch("/user_info", requireApiAuth, async (c) => {
   const data = ((await jsonBody(c)) ?? {}) as Record<string, unknown>;
 
   if ("profile_picture" in data) {
-    // Flask removes the current picture first, before validating the new one.
+    // Flask removes the current picture first, before validating the new one,
+    // but only with Session.flush(): the blob delete (s3.delete, KV here) is
+    // immediate, while the DB changes roll back when the 400 below returns
+    // before Session.commit(). D1 statements auto-commit, so defer them until
+    // validation has passed.
+    const oldFile = user.profile_picture_id
+      ? await db
+          .prepare("SELECT * FROM file WHERE id = ?1")
+          .bind(user.profile_picture_id)
+          .first<FileRow>()
+      : null;
+    if (oldFile) await c.env.KV.delete(`file:${oldFile.path}`);
+
+    let raw: Uint8Array | null = null;
+    if (data.profile_picture !== null) {
+      raw =
+        typeof data.profile_picture === "string"
+          ? decodeBase64Lenient(data.profile_picture)
+          : null;
+      if (!raw || !imageFormatIsSupported(raw)) {
+        return badRequest(c, "Unsupported image format");
+      }
+    }
+
     if (user.profile_picture_id) {
-      const file = await db
-        .prepare("SELECT * FROM file WHERE id = ?1")
-        .bind(user.profile_picture_id)
-        .first<FileRow>();
       await db
         .prepare(
           "UPDATE users SET profile_picture_id = NULL, updated_at = ?1 WHERE id = ?2",
@@ -283,19 +302,14 @@ userRoutes.patch("/user_info", requireApiAuth, async (c) => {
         .bind(nowStr(), user.id)
         .run();
       user = { ...user, profile_picture_id: null };
-      if (file) {
-        await db.prepare("DELETE FROM file WHERE id = ?1").bind(file.id).run();
-        await c.env.KV.delete(`file:${file.path}`);
+      if (oldFile) {
+        await db
+          .prepare("DELETE FROM file WHERE id = ?1")
+          .bind(oldFile.id)
+          .run();
       }
     }
-    if (data.profile_picture !== null) {
-      const raw =
-        typeof data.profile_picture === "string"
-          ? decodeBase64Lenient(data.profile_picture)
-          : null;
-      if (!raw || !imageFormatIsSupported(raw)) {
-        return badRequest(c, "Unsupported image format");
-      }
+    if (raw) {
       const path = randomString(30);
       const file = await db
         .prepare("INSERT INTO file (path, user_id) VALUES (?1, ?2) RETURNING *")
@@ -377,6 +391,12 @@ userRoutes.post("/api_key", requireApiSudo, async (c) => {
   const empty =
     !data || (typeof data === "object" && Object.keys(data).length === 0);
   if (empty) return badRequest(c, "request body cannot be empty");
+
+  // Truthy non-dict bodies ("x", 123, [1], true): Flask's data.get("device")
+  // raises AttributeError → 500 {"error": "Internal error"}, no key created.
+  if (typeof data !== "object" || Array.isArray(data)) {
+    return jsonError(c, 500, "Internal error");
+  }
 
   const device = (data as Record<string, unknown>).device ?? null;
   const user = c.get("user");
@@ -478,6 +498,13 @@ userRoutes.get(
 
 userRoutes.patch(
   "/sudo",
+  // flask-limiter's key func runs before API auth but sees flask-login's
+  // lazily-loaded current_user: cookie-session requests are keyed per-user,
+  // only anonymous/API-key traffic per-IP. Load the session for the limiter.
+  async (c, next) => {
+    c.set("session", await getSession(c));
+    await next();
+  },
   rateLimit("sudo", "5/minute"),
   requireApiAuth,
   async (c) => {
@@ -720,6 +747,11 @@ userRoutes.get("/notifications", requireApiAuth, async (c) => {
   if (page === null) {
     return badRequest(c, "page must be provided in request query");
   }
+  if (page < 0) {
+    // Postgres rejects the negative OFFSET ("OFFSET must not be negative")
+    // → Flask 500s; SQLite would silently treat it as 0.
+    return jsonError(c, 500, "Internal error");
+  }
   const res = await c.env.DB.prepare(
     `SELECT * FROM notification WHERE user_id = ?1
      ORDER BY read ASC, created_at DESC LIMIT ?2 OFFSET ?3`,
@@ -934,11 +966,12 @@ userRoutes.post("/apple/update_notification", async (c) => {
     | { latest_receipt?: string; latest_receipt_info?: unknown }
     | undefined;
   const transactions = unified?.latest_receipt_info;
+  // Python truthiness: empty dicts {} are falsy too, not just empty arrays.
   if (
     !data ||
     !unified ||
     !transactions ||
-    (Array.isArray(transactions) && transactions.length === 0)
+    (typeof transactions === "object" && Object.keys(transactions).length === 0)
   ) {
     return badRequest(c, "Empty Response");
   }
@@ -973,13 +1006,20 @@ userRoutes.post("/apple/update_notification", async (c) => {
       .bind(otid)
       .first<AppleSubscriptionRow>();
     if (appleSub) {
+      if (!("latest_receipt" in unified)) {
+        // Flask: data["unified_receipt"]["latest_receipt"] raises KeyError
+        // → 500 {"error": "Internal error"}, nothing committed.
+        return jsonError(c, 500, "Internal error");
+      }
       await db
         .prepare(
           `UPDATE apple_subscription SET receipt_data = ?1, expires_date = ?2,
              plan = ?3, product_id = ?4, updated_at = ?5 WHERE id = ?6`,
         )
         .bind(
-          unified.latest_receipt ?? "",
+          // null propagates: receipt_data is NOT NULL, so a JSON null fails
+          // the UPDATE → 500, matching Flask's IntegrityError on commit.
+          unified.latest_receipt ?? null,
           expiresDate,
           plan,
           (t.product_id as string | null) ?? null,

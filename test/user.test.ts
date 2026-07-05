@@ -313,13 +313,17 @@ describe("PATCH /user_info", () => {
     expect(await env.KV.get(`file:${file?.path}`)).toBeNull();
   });
 
-  it("rejects unsupported image formats after removing the old picture", async () => {
+  it("rejects unsupported image formats, keeping the old picture row but not its blob", async () => {
     const { user, apiKey } = await newUserWithKey();
     await SELF.fetch(`${B}/user_info`, {
       method: "PATCH",
       headers: jsonHeaders(apiKey.code),
       body: JSON.stringify({ profile_picture: b64(PNG_BYTES) }),
     });
+    const oldPictureId = (await getUser(user.id)).profile_picture_id;
+    const oldFile = await env.DB.prepare("SELECT * FROM file WHERE id = ?1")
+      .bind(oldPictureId)
+      .first<FileRow>();
 
     const res = await SELF.fetch(`${B}/user_info`, {
       method: "PATCH",
@@ -330,8 +334,21 @@ describe("PATCH /user_info", () => {
     });
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "Unsupported image format" });
-    // Flask deletes the previous picture before validating the new one.
-    expect((await getUser(user.id)).profile_picture_id).toBeNull();
+    // Flask deletes the old picture before validating, but only flushes: the
+    // 400 rolls the DB changes back (the blob delete already happened), so a
+    // subsequent GET still returns the old, now-dangling profile_picture_url.
+    expect((await getUser(user.id)).profile_picture_id).toBe(oldPictureId);
+    const stillThere = await env.DB.prepare("SELECT * FROM file WHERE id = ?1")
+      .bind(oldPictureId)
+      .first<FileRow>();
+    expect(stillThere).not.toBeNull();
+    expect(await env.KV.get(`file:${oldFile?.path}`)).toBeNull();
+    const info = await SELF.fetch(`${B}/user_info`, {
+      headers: authHeaders(apiKey.code),
+    });
+    expect(
+      ((await info.json()) as Record<string, unknown>).profile_picture_url,
+    ).toBe(`https://app.sl.example.com/static/upload/${oldFile?.path}`);
   });
 });
 
@@ -386,6 +403,27 @@ describe("POST /api_key", () => {
         error: "request body cannot be empty",
       });
     }
+  });
+
+  it("500s on truthy non-object bodies without creating a key", async () => {
+    const { user, apiKey } = await newUserWithKey();
+    await giveSudo(apiKey.id);
+    // Flask: data.get("device") on a str/int/list raises AttributeError.
+    for (const body of ['"x"', "123", "[1]"]) {
+      const res = await SELF.fetch(`${B}/api_key`, {
+        method: "POST",
+        headers: jsonHeaders(apiKey.code),
+        body,
+      });
+      expect(res.status, body).toBe(500);
+      expect(await res.json(), body).toEqual({ error: "Internal error" });
+    }
+    const count = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM api_key WHERE user_id = ?1",
+    )
+      .bind(user.id)
+      .first<{ n: number }>();
+    expect(count?.n).toBe(1); // only the fixture key
   });
 
   it("cleans up the oldest unused keys beyond MAX_API_KEYS", async () => {
@@ -520,6 +558,31 @@ describe("PATCH /sudo", () => {
       headers: jsonHeaders(apiKey.code, "10.1.0.99"),
       body: JSON.stringify({}),
     });
+    expect(res.status).toBe(429);
+    expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
+  });
+
+  it("rate limits cookie-session requests per user, not per IP", async () => {
+    // flask-limiter keys logged-in (cookie) requests "userid:<id>": rotating
+    // IPs must not reset the 5/minute budget.
+    const user = await createUser(env.DB, { password: passwordHash });
+    const { headers } = await cookieSession(user.id);
+    const attempt = (ip: string) =>
+      SELF.fetch(`${B}/sudo`, {
+        method: "PATCH",
+        headers: {
+          ...headers,
+          "Content-Type": "application/json",
+          "CF-Connecting-IP": ip,
+        },
+        body: JSON.stringify({ password: "wrong" }),
+      });
+    for (let i = 0; i < 5; i++) {
+      const res = await attempt(`10.2.0.${i + 1}`);
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: "Invalid password" });
+    }
+    const res = await attempt("10.2.0.6");
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({ error: "Rate limit exceeded" });
   });
@@ -1013,6 +1076,15 @@ describe("GET /notifications", () => {
     }
   });
 
+  it("500s on a negative page like Postgres's negative-OFFSET error", async () => {
+    const { apiKey } = await newUserWithKey();
+    const res = await SELF.fetch(`${B}/notifications?page=-1`, {
+      headers: authHeaders(apiKey.code),
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "Internal error" });
+  });
+
   it("orders unread first, newest first, with humanized created_at", async () => {
     const { user, apiKey } = await newUserWithKey();
     const now = new Date();
@@ -1341,6 +1413,8 @@ describe("apple", () => {
       {},
       { unified_receipt: {} },
       { unified_receipt: { latest_receipt_info: [] } },
+      // {} is falsy in Python: same "Empty Response" as an empty array.
+      { unified_receipt: { latest_receipt_info: {} } },
     ]) {
       const res = await SELF.fetch(`${B}/apple/update_notification`, {
         method: "POST",
@@ -1371,6 +1445,46 @@ describe("apple", () => {
     });
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "Processing failed" });
+  });
+
+  it("POST /apple/update_notification 500s when latest_receipt is missing for a known transaction", async () => {
+    const user = await createUser(env.DB);
+    const sub = await insertRow<AppleSubscriptionRow>("apple_subscription", {
+      user_id: user.id,
+      expires_date: toStr(addDays(new Date(), -30)),
+      original_transaction_id: "OT-NO-RECEIPT",
+      receipt_data: "old-receipt",
+      plan: "yearly",
+      product_id: "old-product",
+    });
+
+    // Flask: data["unified_receipt"]["latest_receipt"] raises KeyError → 500,
+    // nothing committed.
+    const res = await SELF.fetch(`${B}/apple/update_notification`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        unified_receipt: {
+          latest_receipt_info: [
+            {
+              original_transaction_id: "OT-NO-RECEIPT",
+              expires_date_ms: "1587442317000",
+              product_id: "io.simplelogin.ios_app.subscription.premium.yearly",
+            },
+          ],
+        },
+      }),
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "Internal error" });
+
+    const fresh = await env.DB.prepare(
+      "SELECT * FROM apple_subscription WHERE id = ?1",
+    )
+      .bind(sub.id)
+      .first<AppleSubscriptionRow>();
+    expect(fresh?.receipt_data).toBe("old-receipt");
+    expect(fresh?.product_id).toBe("old-product");
   });
 
   it("POST /apple/update_notification updates the newest transaction", async () => {

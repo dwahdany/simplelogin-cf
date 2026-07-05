@@ -4,12 +4,15 @@ import { toEpoch } from "../src/lib/dates";
 import type { ContactRow } from "../src/lib/rows";
 import type { AliasInfo } from "../src/lib/serializer";
 import {
+  englishStem,
   getAliasInfosWithPaginationV3,
   getAliasInfoV2,
+  ilikeToRegExp,
   reverseAliasDisplay,
   serializeAliasInfo,
   serializeAliasInfoV2,
   serializeContact,
+  tsVectorMatches,
 } from "../src/lib/serializer";
 import {
   createAlias,
@@ -525,5 +528,254 @@ describe("getAliasInfosWithPaginationV3", () => {
     expect(page1.length).toBe(1);
     const ids = new Set([...page0, ...page1].map((i) => i.alias.id));
     expect(ids.size).toBe(21);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v3 search filter primitives — Postgres ILIKE + english full-text semantics
+// ---------------------------------------------------------------------------
+
+describe("englishStem (Snowball/Porter2, as Postgres 'english' config)", () => {
+  // expected values generated with snowballstemmer==2.2.0 — Snowball 2.x is
+  // what Postgres 13 (SimpleLogin's CI target) ships in its english dictionary
+  const CASES: [string, string][] = [
+    ["running", "run"],
+    ["runs", "run"],
+    ["easily", "easili"],
+    ["happily", "happili"],
+    ["generously", "generous"],
+    ["national", "nation"],
+    ["rational", "ration"],
+    ["relational", "relat"],
+    ["conditional", "condit"],
+    ["agreement", "agreement"],
+    ["arguing", "argu"],
+    ["argues", "argu"],
+    ["dying", "die"],
+    ["lying", "lie"],
+    ["tying", "tie"],
+    ["skies", "sky"],
+    ["sky", "sky"],
+    ["news", "news"],
+    ["early", "earli"],
+    ["only", "onli"],
+    ["singly", "singl"],
+    ["communication", "communic"],
+    ["generation", "generat"],
+    ["generate", "generat"],
+    ["arsenal", "arsenal"],
+    ["hopeful", "hope"],
+    ["hopefulness", "hope"],
+    ["goodness", "good"],
+    ["possibly", "possibl"],
+    ["possible", "possibl"],
+    ["ability", "abil"],
+    ["abilities", "abil"],
+    ["active", "activ"],
+    ["activity", "activ"],
+    ["activities", "activ"],
+    ["sensational", "sensat"],
+    ["sensibility", "sensibl"],
+    ["conspicuous", "conspicu"],
+    ["conspicuously", "conspicu"],
+    ["dependent", "depend"],
+    ["dependence", "depend"],
+    ["adjustment", "adjust"],
+    ["adjustable", "adjust"],
+    ["feed", "feed"],
+    ["agreed", "agre"],
+    ["disagreed", "disagre"],
+    ["exceed", "exceed"],
+    ["proceed", "proceed"],
+    ["succeeding", "succeed"],
+    ["inning", "inning"],
+    ["outing", "outing"],
+    ["canning", "canning"],
+    ["herring", "herring"],
+    ["earring", "earring"],
+    ["cries", "cri"],
+    ["cried", "cri"],
+    ["crying", "cri"],
+    ["denied", "deni"],
+    ["denying", "deni"],
+    ["betray", "betray"],
+    ["betrayal", "betray"],
+    ["ties", "tie"],
+    ["cities", "citi"],
+    ["city", "citi"],
+    ["bias", "bias"],
+    ["atlas", "atlas"],
+    ["cosmos", "cosmos"],
+    ["andes", "andes"],
+    ["howe", "howe"],
+    ["idly", "idl"],
+    ["gently", "gentl"],
+    ["ugly", "ugli"],
+    ["controlled", "control"],
+    ["controlling", "control"],
+    ["roll", "roll"],
+    ["rolled", "roll"],
+    ["size", "size"],
+    ["sized", "size"],
+    ["sizing", "size"],
+    ["hopping", "hop"],
+    ["hoping", "hope"],
+    ["tanned", "tan"],
+    ["falling", "fall"],
+    ["filing", "file"],
+    ["failing", "fail"],
+    ["fizzed", "fizz"],
+    ["hissed", "hiss"],
+    ["luxuriously", "luxuri"],
+    ["luxury", "luxuri"],
+    ["oscillate", "oscil"],
+    ["oscillation", "oscil"],
+    ["universe", "univers"],
+    ["university", "univers"],
+    ["universities", "univers"],
+    ["congratulations", "congratul"],
+    ["congress", "congress"],
+    ["doing", "do"],
+    ["itself", "itself"],
+    ["yellow", "yellow"],
+    ["youth", "youth"],
+    ["yearly", "year"],
+    ["sprayed", "spray"],
+    ["enjoy", "enjoy"],
+    ["enjoyment", "enjoy"],
+    ["employ", "employ"],
+    ["employer", "employ"],
+    ["employment", "employ"],
+    ["destroy", "destroy"],
+    ["destroyed", "destroy"],
+    ["vietnamization", "vietnam"],
+    ["predication", "predic"],
+    ["operator", "oper"],
+    ["feudalism", "feudal"],
+    ["decisiveness", "decis"],
+    ["callousness", "callous"],
+    ["formality", "formal"],
+    ["sensitivity", "sensit"],
+    ["electricity", "electr"],
+    ["electrical", "electr"],
+    ["hopeless", "hopeless"],
+    ["hopelessly", "hopeless"],
+    ["triumphantly", "triumphant"],
+    ["communism", "communism"],
+    ["community", "communiti"],
+    ["radically", "radic"],
+    ["differently", "differ"],
+    ["daily", "daili"],
+    ["walked", "walk"],
+    ["walking", "walk"],
+    ["shopped", "shop"],
+    ["shopping", "shop"],
+    ["banking", "bank"],
+    ["newsletters", "newslett"],
+  ];
+
+  it("matches the reference Snowball english stemmer", () => {
+    for (const [word, expected] of CASES) {
+      expect(englishStem(word), word).toBe(expected);
+    }
+  });
+});
+
+describe("ilikeToRegExp (Postgres ILIKE containment)", () => {
+  it("is case-insensitive beyond ASCII, unlike SQLite LIKE", () => {
+    expect(ilikeToRegExp("über").test("Über alles")).toBe(true);
+    expect(ilikeToRegExp("ÜBER").test("über alles")).toBe(true);
+    expect(ilikeToRegExp("uber").test("Über alles")).toBe(false);
+  });
+
+  it("keeps % and _ as wildcards and escapes regex metacharacters", () => {
+    expect(ilikeToRegExp("a%z").test("xx a middle z yy")).toBe(true);
+    expect(ilikeToRegExp("a_c").test("abc")).toBe(true);
+    expect(ilikeToRegExp("a_c").test("ac")).toBe(false);
+    expect(ilikeToRegExp("a.c").test("abc")).toBe(false);
+    expect(ilikeToRegExp("a.c").test("a.c")).toBe(true);
+  });
+});
+
+describe("tsVectorMatches (ts_vector @@ plainto_tsquery('english'))", () => {
+  it("matches stemmed forms in both directions", () => {
+    expect(tsVectorMatches("run daily", "running")).toBe(true);
+    expect(tsVectorMatches("running every day", "runs")).toBe(true);
+    expect(tsVectorMatches("walking to work", "walked")).toBe(true);
+  });
+
+  it("ANDs all query lexemes", () => {
+    expect(tsVectorMatches("run daily", "running daily")).toBe(true);
+    expect(tsVectorMatches("run daily", "running weekly")).toBe(false);
+  });
+
+  it("an all-stopword or empty query matches nothing (empty tsquery)", () => {
+    expect(tsVectorMatches("we shop here", "were")).toBe(false);
+    expect(tsVectorMatches("anything", "the a of")).toBe(false);
+    expect(tsVectorMatches("anything", "")).toBe(false);
+  });
+
+  it("a NULL note never matches", () => {
+    expect(tsVectorMatches(null, "running")).toBe(false);
+  });
+});
+
+describe("getAliasInfosWithPaginationV3 query filter (Postgres semantics)", () => {
+  it("matches English-stemmed note words like Postgres full-text search", async () => {
+    const user = await createUser(env.DB);
+    const mb = user.default_mailbox_id!;
+    const hit = await createAlias(env.DB, user.id, mb, {
+      email: "sport@sl.test",
+      note: "run daily",
+    });
+    await createAlias(env.DB, user.id, mb, {
+      email: "other@sl.test",
+      note: "cycling weekly",
+    });
+
+    // 'running' stems to 'run', which is in the note's ts_vector — even
+    // though LIKE '%running%' would never match "run daily"
+    const infos = await getAliasInfosWithPaginationV3(env.DB, user, 0, {
+      query: "running",
+    });
+    expect(infos.map((i) => i.alias.id)).toEqual([hit.id]);
+  });
+
+  it("matches non-ASCII case-insensitively (ILIKE, not SQLite LIKE)", async () => {
+    const user = await createUser(env.DB);
+    const mb = user.default_mailbox_id!;
+    const hit = await createAlias(env.DB, user.id, mb, {
+      email: "de@sl.test",
+      note: "Über alles",
+    });
+    await createAlias(env.DB, user.id, mb, { email: "plain@sl.test" });
+
+    const infos = await getAliasInfosWithPaginationV3(env.DB, user, 0, {
+      query: "über",
+    });
+    expect(infos.map((i) => i.alias.id)).toEqual([hit.id]);
+  });
+
+  it("paginates AFTER filtering, preserving the SQL sort order", async () => {
+    const user = await createUser(env.DB);
+    const mb = user.default_mailbox_id!;
+    const matching: number[] = [];
+    for (let i = 0; i < 25; i++) {
+      const alias = await createAlias(env.DB, user.id, mb, {
+        note: i % 2 === 0 ? "needle here" : "nothing",
+        created_at: `2024-01-01 00:00:${String(i).padStart(2, "0")}+00:00`,
+      });
+      if (i % 2 === 0) matching.push(alias.id);
+    }
+    // newest-first: matching ids reversed, page 0 = first 13 of them
+    const expected = [...matching].reverse();
+    const page0 = await getAliasInfosWithPaginationV3(env.DB, user, 0, {
+      query: "needle",
+    });
+    expect(page0.map((i) => i.alias.id)).toEqual(expected);
+    const page1 = await getAliasInfosWithPaginationV3(env.DB, user, 1, {
+      query: "needle",
+    });
+    expect(page1).toEqual([]);
   });
 });
