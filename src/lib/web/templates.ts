@@ -21,7 +21,6 @@ const precompiledLoader = {
   },
 };
 
-// biome-ignore lint/suspicious/noExplicitAny: nunjucks has no bundled types
 const env: any = new (nunjucks as any).Environment(precompiledLoader, {
   autoescape: true,
 });
