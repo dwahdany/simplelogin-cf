@@ -36,6 +36,7 @@
     // "rewrite" = Flask-parity forwards (From = reverse alias) via SEND_EMAIL;
     // requires the domain onboarded onto Email Sending (paid) or strict
     // receivers reject the mail. "passthrough" = message.forward() as-is.
-    "FORWARD_MODE": "passthrough"
+    // Email Sending onboarded for mail.example.com on 2026-07-06.
+    "FORWARD_MODE": "rewrite"
   }
 }
