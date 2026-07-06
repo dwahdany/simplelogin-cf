@@ -8,10 +8,17 @@
  * src/lib/web/forms.ts does.
  */
 
-import { env, SELF } from "cloudflare:test";
+import {
+  createExecutionContext,
+  env,
+  SELF,
+  waitOnExecutionContext,
+} from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import worker from "../src/index";
 import { timestampSign } from "../src/lib/crypto";
 import { addDays, toStr } from "../src/lib/dates";
+import { sentEmails } from "../src/lib/mailer";
 import type { UserRow } from "../src/lib/rows";
 import { createUser } from "./fixtures";
 
@@ -421,6 +428,40 @@ describe("GET|POST /dashboard/coupon", () => {
     expect(coupon?.used).toBe(0);
   });
 
+  it("extends an active manual sub ending Feb 29 to Feb 28 (arrow year clamping)", async () => {
+    const user = await createUser(env.DB);
+    // next Feb 29 strictly in the future (leap years are >= 4 apart, so the
+    // following year never has one)
+    let leapYear = new Date().getUTCFullYear() + 1;
+    while (
+      !((leapYear % 4 === 0 && leapYear % 100 !== 0) || leapYear % 400 === 0)
+    ) {
+      leapYear++;
+    }
+    await insert("manual_subscription", {
+      user_id: user.id,
+      end_at: `${leapYear}-02-29 12:00:00+00:00`,
+    });
+    const code = `coupon-${++seq}`;
+    await insert("coupon", { code, nb_year: 1 });
+    const s = await webSession(user.id);
+    const res = await post("/dashboard/coupon", s.cookie, {
+      csrf_token: await s.csrfToken(),
+      code,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      "Your account has been upgraded to Premium, thanks for your support!",
+    );
+    const row = await env.DB.prepare(
+      "SELECT end_at FROM manual_subscription WHERE user_id = ?1",
+    )
+      .bind(user.id)
+      .first<{ end_at: string }>();
+    // arrow shift(years=1) clamps Feb 29 -> Feb 28, not Mar 1
+    expect(row?.end_at).toBe(`${leapYear + 1}-02-28 12:00:00+00:00`);
+  });
+
   it("redirects lifetime-coupon codes to the lifetime licence page", async () => {
     const user = await createUser(env.DB);
     const code = `lt-${++seq}`;
@@ -442,17 +483,20 @@ describe("GET|POST /dashboard/coupon", () => {
 });
 
 describe("GET|POST /dashboard/lifetime_licence", () => {
-  it("renders the licence form (both path spellings)", async () => {
+  it("renders the licence form", async () => {
     const user = await createUser(env.DB);
     const s = await webSession(user.id);
-    for (const path of [
-      "/dashboard/lifetime_licence",
-      "/dashboard/lifetime_licence",
-    ]) {
-      const res = await get(path, s.cookie);
-      expect(res.status).toBe(200);
-      expect(await res.text()).toContain('placeholder="Licence Code"');
-    }
+    const res = await get("/dashboard/lifetime_licence", s.cookie);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('placeholder="Licence Code"');
+  });
+
+  it("404s on the hyphen spelling /lifetime-licence (route does not exist in Flask)", async () => {
+    const user = await createUser(env.DB);
+    const s = await webSession(user.id);
+    const res = await get("/dashboard/lifetime-licence", s.cookie);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("This page does not exist.");
   });
 
   it("redirects lifetime users with a warning", async () => {
@@ -506,11 +550,55 @@ describe("GET|POST /dashboard/lifetime_licence", () => {
     expect(u?.lifetime).toBe(1);
     expect(u?.paid_lifetime).toBe(1);
     const lc = await env.DB.prepare(
-      "SELECT nb_used FROM lifetime_coupon WHERE code = ?1",
+      "SELECT nb_used, updated_at FROM lifetime_coupon WHERE code = ?1",
     )
       .bind(code)
-      .first<{ nb_used: number }>();
+      .first<{ nb_used: number; updated_at: string | null }>();
     expect(lc?.nb_used).toBe(2);
+    // Flask's Core UPDATE stamps updated_at via the ModelMixin onupdate default
+    expect(lc?.updated_at).toMatch(
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\+00:00$/,
+    );
+  });
+
+  it("notifies the admin with the Flask User-repr subject (None for null fields)", async () => {
+    const user = await createUser(env.DB); // name is NULL -> "None"
+    const code = `lt-${++seq}`;
+    await insert("lifetime_coupon", { code, nb_used: 2, comment: null });
+    const s = await webSession(user.id);
+    sentEmails.length = 0;
+
+    // ADMIN_EMAIL is not part of the test bindings — dispatch directly with
+    // an extended env (same isolate, same D1/KV instances as SELF).
+    const adminEnv = { ...env, ADMIN_EMAIL: "admin@sl.example.com" };
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request(`${B}/dashboard/lifetime_licence`, {
+        method: "POST",
+        headers: {
+          Cookie: s.cookie,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          csrf_token: await s.csrfToken(),
+          code,
+        }).toString(),
+        redirect: "manual",
+      }),
+      adminEnv,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/");
+    expect(sentEmails).toHaveLength(1);
+    expect(sentEmails[0].to).toBe("admin@sl.example.com");
+    // f"User {user} ..." uses User.__repr__ = "<User {id} {name} {email}>";
+    // Python None renders as "None" (both name and comment here).
+    expect(sentEmails[0].subject).toBe(
+      `User <User ${user.id} None ${user.email}> used lifetime coupon(None). Coupon nb_used: 1`,
+    );
   });
 
   it("re-renders with a warning on an invalid code", async () => {

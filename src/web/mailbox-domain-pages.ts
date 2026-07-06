@@ -123,9 +123,37 @@ function intFieldRequired(raw: string | null): number | null {
   return n === 0 ? null : n;
 }
 
-/** wtforms 2.3.3 Email() validator regex `^.+@([^.@][^@]+)$` — spaces pass! */
+// wtforms 2.3.3 Email() delegates to the email_validator package
+// (check_deliverability=False, allow_smtputf8=True, allow_empty_local=False).
+// Syntax-only port: dot-atom local part (unicode allowed by smtputf8),
+// hostname-shaped domain with at least one dot whose TLD ends in a letter.
+// No IDNA library on Workers: non-ASCII labels are accepted as-is.
+const EV_LOCAL_ATOM_RE = /^[A-Za-z0-9_!#$%&'*+\-/=?^`{|}~\u{80}-\u{10FFFF}]+$/u;
+const EV_DOMAIN_LABEL_RE =
+  /^[A-Za-z0-9\u{80}-\u{10FFFF}](?:[A-Za-z0-9\-\u{80}-\u{10FFFF}]{0,61}[A-Za-z0-9\u{80}-\u{10FFFF}])?$/u;
+
+/** wtforms 2.3.3 Email() validator (via email_validator ~=2.2). */
 function isEmailFieldValid(v: string): boolean {
-  return /^.+@[^.@][^@]+$/.test(v);
+  if (v.length > 254) return false; // EMAIL_MAX_LENGTH
+  const at = v.lastIndexOf("@");
+  if (at === -1) return false;
+  const local = v.slice(0, at);
+  const domain = v.slice(at + 1);
+  // validate_email_local_part: non-empty dot-atom, <= 64 chars
+  if (local.length === 0 || local.length > 64) return false;
+  for (const atom of local.split(".")) {
+    if (!EV_LOCAL_ATOM_RE.test(atom)) return false;
+  }
+  // validate_email_domain_name (globally_deliverable=True)
+  if (domain.length === 0 || domain.length > 253) return false;
+  if (!domain.includes(".")) return false;
+  for (const label of domain.split(".")) {
+    if (!EV_DOMAIN_LABEL_RE.test(label)) return false;
+    // RFC 5890 R-LDH labels: "??--" is only allowed as Punycode ("xn--")
+    if (/^(?!xn)..--/i.test(label)) return false;
+  }
+  // "all TLDs currently end with a letter" (email_validator DOMAIN_NAME_REGEX)
+  return /[A-Za-z\u{80}-\u{10FFFF}]$/u.test(domain);
 }
 
 /** is_valid_domain (RFC-1035 label check, app/custom_domain_utils.py). */
@@ -141,6 +169,85 @@ function isValidDomain(domain: string): boolean {
         !label.startsWith("-") &&
         !label.endsWith("-"),
     );
+}
+
+/**
+ * Python `re` pattern → JS RegExp source+flags. Flask validates auto-create
+ * rule regexes with re.compile (domain_detail.py L437-443) and matches with
+ * re2/re fullmatch (regex_utils.py), whose syntax differs from JS RegExp:
+ * - `(?P<name>...)` / `(?P=name)` are Python-only → translated to the JS
+ *   equivalents `(?<name>...)` / `\k<name>`;
+ * - bare `(?<name>...)` and `\k<name>` are Python ERRORS ("unknown extension
+ *   ?<n" / "bad escape \k") even though JS accepts them → rejected;
+ * - global inline flags like `(?i)` (start of pattern only, as required by
+ *   Python 3.11+) become JS flags.
+ * Exotic Python-only syntax ((?x) verbose mode, \A/\Z, conditionals) is not
+ * modeled: it throws here / at RegExp() and counts as an invalid pattern.
+ */
+function translatePythonRegex(pattern: string): {
+  source: string;
+  flags: string;
+} {
+  let src = pattern;
+  let flags = "";
+  const flagsMatch = /^\(\?([aiLmsux]+)\)/.exec(src);
+  if (flagsMatch) {
+    if (/[Lx]/.test(flagsMatch[1])) {
+      throw new Error(`unsupported inline flags ${flagsMatch[1]}`);
+    }
+    for (const f of flagsMatch[1]) if ("ims".includes(f)) flags += f;
+    src = src.slice(flagsMatch[0].length);
+  }
+  let out = "";
+  let inClass = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "\\") {
+      const next = src[i + 1] ?? "";
+      // Python re: "bad escape \k" (JS would read it as a named backref)
+      if (!inClass && next === "k") throw new Error("bad escape \\k");
+      out += ch + next;
+      i++;
+      continue;
+    }
+    if (inClass) {
+      if (ch === "]") inClass = false;
+      out += ch;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "(" && src.startsWith("(?P<", i)) {
+      out += "(?"; // drop the "P": JS named-group syntax
+      i += 2; // loop's i++ lands on "<"
+      continue;
+    }
+    if (ch === "(" && src.startsWith("(?P=", i)) {
+      const end = src.indexOf(")", i);
+      if (end === -1) throw new Error("missing ), unterminated name");
+      const name = src.slice(i + 4, end);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+        throw new Error(`bad character in group name ${name}`);
+      }
+      out += `\\k<${name}>`;
+      i = end;
+      continue;
+    }
+    if (
+      ch === "(" &&
+      src.startsWith("(?<", i) &&
+      src[i + 3] !== "=" &&
+      src[i + 3] !== "!"
+    ) {
+      // Python re: "unknown extension ?<x" — only lookbehinds use (?<
+      throw new Error(`unknown extension ?<${src[i + 3] ?? ""}`);
+    }
+    out += ch;
+  }
+  return { source: out, flags };
 }
 
 function isAdminDisabled(mb: MailboxRow): boolean {
@@ -265,6 +372,66 @@ function isValidEmail(email: string): boolean {
   return isValidMailboxDomainSyntax(domain);
 }
 
+/** True when `e` is D1 telling us the (optional) blocklist table is absent. */
+function isMissingTableError(e: unknown): boolean {
+  return String(e).includes("no such table");
+}
+
+/**
+ * is_invalid_mailbox_domain (email_utils.py L793): the domain or ANY parent
+ * suffix (excluding the bare TLD) is listed in invalid_mailbox_domain. A
+ * missing table counts as an empty blocklist (optional table, like the API).
+ */
+async function isInvalidMailboxDomain(
+  db: D1Database,
+  domain: string,
+): Promise<boolean> {
+  const parts = domain.split(".");
+  const suffixes: string[] = [];
+  for (let i = 0; i < parts.length - 1; i++) {
+    suffixes.push(parts.slice(i).join("."));
+  }
+  if (suffixes.length === 0) return false;
+  const placeholders = suffixes.map((_, i) => `?${i + 1}`).join(", ");
+  try {
+    const row = await db
+      .prepare(
+        `SELECT 1 FROM invalid_mailbox_domain WHERE domain IN (${placeholders}) LIMIT 1`,
+      )
+      .bind(...suffixes)
+      .first();
+    return !!row;
+  } catch (e) {
+    if (isMissingTableError(e)) return false;
+    throw e;
+  }
+}
+
+/** ForbiddenMxIp.filter(ip.in_(mx_ips)) — missing table = empty blocklist. */
+async function hasForbiddenMxIp(
+  db: D1Database,
+  ips: string[],
+): Promise<boolean> {
+  const placeholders = ips.map((_, i) => `?${i + 1}`).join(", ");
+  try {
+    const row = await db
+      .prepare(
+        `SELECT 1 FROM forbidden_mx_ip WHERE ip IN (${placeholders}) LIMIT 1`,
+      )
+      .bind(...ips)
+      .first();
+    return !!row;
+  } catch (e) {
+    if (isMissingTableError(e)) return false;
+    throw e;
+  }
+}
+
+/**
+ * email_can_be_used_as_mailbox_with_reason() + check_domain_for_mailbox()
+ * (email_utils.py L660-L779): returns the reason value string or null.
+ * The domain is always ASCII here — isValidEmail() ran first.
+ */
 async function emailCannotBeUsedReason(
   db: D1Database,
   email: string,
@@ -282,6 +449,25 @@ async function emailCannotBeUsedReason(
     .first();
   if (customDomain) {
     return "This email address belongs to a custom domain that has already been registered";
+  }
+  if (await isInvalidMailboxDomain(db, domain)) {
+    return "We don't allow mailboxes using this domain";
+  }
+  // SKIP_MX_LOOKUP_ON_CHECK is hardcoded False (config.py, tests only).
+  const mxDomains = await mailboxDnsClient.getMxDomainList(domain);
+  if (mxDomains.length === 0) {
+    return "We couldn't get any MX records configured for this domain";
+  }
+  const mxIps = new Set<string>();
+  for (const mxDomain of mxDomains) {
+    if (await isInvalidMailboxDomain(db, mxDomain)) {
+      return "We don't allow mailboxes using this domain";
+    }
+    const aRecord = await mailboxDnsClient.getARecord(mxDomain);
+    if (aRecord !== null) mxIps.add(aRecord);
+  }
+  if (mxIps.size > 0 && (await hasForbiddenMxIp(db, [...mxIps]))) {
+    return "We don't allow mailbox domains that point to these MX records";
   }
   const disabledUser = await db
     .prepare("SELECT 1 FROM users WHERE email = ?1 AND disabled = 1")
@@ -485,9 +671,9 @@ interface DnsAnswer {
 
 async function dohLookup(
   name: string,
-  type: "TXT" | "MX" | "CNAME",
+  type: "TXT" | "MX" | "CNAME" | "A",
 ): Promise<DnsAnswer[]> {
-  const typeNum = { TXT: 16, MX: 15, CNAME: 5 }[type];
+  const typeNum = { TXT: 16, MX: 15, CNAME: 5, A: 1 }[type];
   try {
     const res = await fetch(
       `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`,
@@ -525,6 +711,42 @@ async function getMxDomains(domain: string): Promise<Map<number, string[]>> {
     map.set(prio, list);
   }
   return map;
+}
+
+/**
+ * DNS client used by the mailbox-domain checks (get_mx_domain_list +
+ * get_a_record in app/email_utils.py check_domain_for_mailbox), with the
+ * same test seam as src/routes/mailboxes.ts `setDnsClient` (which cannot be
+ * imported from here).
+ */
+export interface MailboxDnsClient {
+  /** get_mx_domain_list(): MX hosts without the trailing dot; [] on failure. */
+  getMxDomainList(hostname: string): Promise<string[]>;
+  /** get_a_record(): first A-record IP for the hostname, or null. */
+  getARecord(hostname: string): Promise<string | null>;
+}
+
+const dohMailboxDnsClient: MailboxDnsClient = {
+  async getMxDomainList(hostname) {
+    const mxDomains: string[] = [];
+    for (const answer of await dohLookup(hostname, "MX")) {
+      // record data looks like "20 alt2.aspmx.l.google.com."
+      const host = answer.data.split(" ")[1];
+      if (host) mxDomains.push(host.endsWith(".") ? host.slice(0, -1) : host);
+    }
+    return mxDomains;
+  },
+  async getARecord(hostname) {
+    const answers = await dohLookup(hostname, "A");
+    return answers[0]?.data ?? null;
+  },
+};
+
+let mailboxDnsClient: MailboxDnsClient = dohMailboxDnsClient;
+
+/** Test seam (tests run in the same isolate as SELF). `null` restores DoH. */
+export function setMailboxDnsClient(client: MailboxDnsClient | null): void {
+  mailboxDnsClient = client ?? dohMailboxDnsClient;
 }
 
 async function getCnameRecord(name: string): Promise<string | null> {
@@ -659,9 +881,13 @@ webMailboxDomainPagesRoutes.on(
         const transferRaw = field(fd, "transfer_mailbox_id");
         let transferValid = true;
         let transferMailboxId: number | null = null;
-        if (transferRaw !== null && transferRaw.trim() !== "") {
-          if (!/^[+-]?\d+$/.test(transferRaw.trim())) transferValid = false;
-          else transferMailboxId = Number.parseInt(transferRaw.trim(), 10);
+        if (transferRaw !== null) {
+          // wtforms IntegerField coerces ANY submitted value: int('') raises,
+          // so a present-but-empty field is a validation error, not "absent"
+          // (DeleteMailboxForm has no Optional() — mailbox.py L29-33).
+          const trimmed = transferRaw.trim();
+          if (!/^[+-]?\d+$/.test(trimmed)) transferValid = false;
+          else transferMailboxId = Number.parseInt(trimmed, 10);
         }
         if (!ok || mailboxId === null || !transferValid) {
           await flash(c, "Invalid request", "warning");
@@ -1076,17 +1302,20 @@ webMailboxDomainPagesRoutes.on(
           await flash(c, "SPF enforcement globally not enabled", "error");
           return c.redirect(urlFor("dashboard.index"), 302);
         }
-        const enabled = field(fd, "spf-status") === "on";
+        const spfStatus = field(fd, "spf-status");
+        const enabled = spfStatus === "on";
         await db
           .prepare(
             "UPDATE mailbox SET force_spf = ?1, updated_at = ?2 WHERE id = ?3",
           )
           .bind(enabled ? 1 : 0, nowStr(), mailbox.id)
           .run();
-        // Faithful operator-precedence bug in the Flask flash message.
+        // Faithful operator-precedence bug (mailbox_detail.py L89-94): the
+        // message is keyed on the TRUTHINESS of spf-status (any non-empty
+        // value), while the DB write is keyed on == "on".
         await flash(
           c,
-          enabled ? "SPF enforcement was enabled" : "disabled successfully",
+          spfStatus ? "SPF enforcement was enabled" : "disabled successfully",
           "success",
         );
         return c.redirect(detailUrl, 302);
@@ -1378,6 +1607,18 @@ webMailboxDomainPagesRoutes.on(
             .first()
         ) {
           return failRender(`${domain} already used in a SimpleLogin mailbox`);
+        }
+        // CustomDomain.create raises SubdomainInTrashError for ANY domain in
+        // deleted_subdomain (models.py L2682-2686); the custom_domain view
+        // does not catch it, so Flask 500s with no row created. Same here:
+        // throw and let app.onError render the 500 page.
+        if (
+          await db
+            .prepare("SELECT 1 FROM deleted_subdomain WHERE domain = ?1")
+            .bind(domain)
+            .first()
+        ) {
+          throw new Error(`SubdomainInTrashError: ${domain}`);
         }
         // ownership inheritance from a verified parent domain of the same user
         const parents = await db
@@ -1843,6 +2084,12 @@ webMailboxDomainPagesRoutes.on(
             return failWarn("Something went wrong, please retry");
           mailboxIds.push(Number(raw));
         }
+        // set_custom_domain_mailboxes fetches with IN(): duplicate ids
+        // collapse to fewer rows and the count check fails
+        // (custom_domain_utils.py L178-190).
+        if (new Set(mailboxIds).size !== mailboxIds.length) {
+          return failWarn("Something went wrong, please retry");
+        }
         const found: MailboxRow[] = [];
         for (const id of mailboxIds) {
           const mb = await getMailboxById(db, id);
@@ -2128,9 +2375,12 @@ webMailboxDomainPagesRoutes.on(
               await flash(c, "You must select at least 1 mailbox", "warning");
               return c.redirect(selfUrl, 302);
             }
+            // re.compile() semantics (domain_detail.py L437-443), see
+            // translatePythonRegex.
             let regexOk = true;
             try {
-              new RegExp(regexRaw);
+              const t = translatePythonRegex(regexRaw);
+              new RegExp(t.source, t.flags);
             } catch {
               regexOk = false;
             }
@@ -2195,12 +2445,15 @@ webMailboxDomainPagesRoutes.on(
           let matched: AutoCreateRuleRow | null = null;
           for (const rule of rules) {
             try {
-              if (new RegExp(`^(?:${rule.regex})$`).test(local)) {
+              // regex_match() = re2/re fullmatch (regex_utils.py); Python
+              // patterns are translated first (translatePythonRegex).
+              const t = translatePythonRegex(rule.regex);
+              if (new RegExp(`^(?:${t.source})$`, t.flags).test(local)) {
                 matched = rule;
                 break;
               }
             } catch {
-              // Python-only regex syntax: treated as non-matching
+              // untranslatable Python-only syntax: treated as non-matching
             }
           }
           if (matched) {

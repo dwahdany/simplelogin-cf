@@ -19,6 +19,7 @@
  *   15 GET|POST /unsubscribe/<int:alias_id>    login (RFC 8058 One-Click exempt)
  *   16 GET|POST /block_contact/<int:contact_id> login
  *   17 GET      /unsubscribe/encoded/<payload> login — SHA3 signer deferred
+ *   18 GET|POST /alias_trash                   login
  * (/internal/exit-sudo-mode is owned by src/web/infra.ts.)
  */
 
@@ -45,6 +46,7 @@ import {
   isPremium,
   lifetimeOrActiveSubscription,
   manualActive,
+  maxAliasForFreeAccount,
   paddleActive,
   partnerActive,
   premiumInputsForUser,
@@ -103,6 +105,18 @@ async function formBody(c: Ctx): Promise<Record<string, string | File>> {
 function field(body: Record<string, unknown>, name: string): string | null {
   const v = body[name];
   return typeof v === "string" ? v : null;
+}
+
+/**
+ * Python int(str): surrounding whitespace, optional sign, ASCII digits with
+ * single underscores between digit groups. Everything else ("0x2", "1e0",
+ * "1x", "") raises ValueError => null here. Number()/parseInt are laxer and
+ * must NOT be used where Flask calls int() on user input.
+ */
+function pyInt(raw: string): number | null {
+  const s = raw.trim();
+  if (!/^[+-]?\d+(_\d+)*$/.test(s)) return null;
+  return Number.parseInt(s.replaceAll("_", ""), 10);
 }
 
 /** flask-wtf CSRF check on the posted csrf_token field. */
@@ -212,7 +226,12 @@ function hashRecoveryCode(secret: string, raw: string): string {
 }
 
 function recoveryHmacSecret(env: ExtraEnv): string {
-  return env.RECOVERY_CODE_HMAC_SECRET ?? env.FLASK_SECRET;
+  // app/config.py L605-606: `or` fallback (empty string falls back too) and
+  // the fallback key is FLASK_SECRET + "generatearandomtoken", NOT the bare
+  // FLASK_SECRET — codes must hash identically to Flask-stored rows.
+  return (
+    env.RECOVERY_CODE_HMAC_SECRET || `${env.FLASK_SECRET}generatearandomtoken`
+  );
 }
 
 /** RecoveryCode.generate(user): wipe + insert 8 raw codes, return the raws. */
@@ -646,8 +665,11 @@ webSettingsPagesRoutes.post("/setting", async (c) => {
     case "update-profile": {
       // BLOCKER B1 (S3/R2): profile_picture uploads are skipped — only the
       // name is updated, matching the "treat like absent config" stance.
+      // WTForms coerces a missing/empty name field to "" (setting.py L93
+      // compares that against the raw column), so a NULL-name user posting
+      // an empty name IS a change: Flask writes '' and flashes success.
       const name = field(body, "name") ?? "";
-      if (name !== (user.name ?? "")) {
+      if (name !== user.name) {
         await updateUser(db, user.id, { name });
         await flash(c, "Your profile has been updated", "success");
         return c.redirect(settingUrl, 302);
@@ -667,11 +689,11 @@ webSettingsPagesRoutes.post("/setting", async (c) => {
       return c.redirect(settingUrl, 302);
     }
     case "change-alias-generator": {
-      const raw = field(body, "alias-generator-scheme") ?? "";
-      const scheme = Number(raw);
-      // int() ValueError => 500, bug-compatible
-      if (raw.trim() === "" || !Number.isInteger(scheme))
-        throw new Error(`invalid literal for int(): ${raw}`);
+      const raw = field(body, "alias-generator-scheme");
+      // setting.py L142 int(): TypeError on a missing field, ValueError on
+      // non-int strings ("0x2", "1e0") => 500 with no write, bug-compatible
+      const scheme = raw === null ? null : pyInt(raw);
+      if (scheme === null) throw new Error(`invalid literal for int(): ${raw}`);
       if (scheme === 1 || scheme === 2)
         await updateUser(db, user.id, { alias_generator: scheme });
       await flash(c, "Your preference has been updated", "success");
@@ -688,9 +710,15 @@ webSettingsPagesRoutes.post("/setting", async (c) => {
       return c.redirect(settingUrl, 302);
     }
     case "random-alias-suffix": {
-      const raw = field(body, "random-alias-suffix-generator") ?? "";
-      const scheme = Number(raw);
-      if (raw.trim() === "" || !Number.isInteger(scheme)) {
+      const raw = field(body, "random-alias-suffix-generator");
+      if (raw === null) {
+        // setting.py L161: int(None) raises TypeError which the
+        // `except ValueError` does NOT catch => 500, bug-compatible
+        throw new Error("int() argument must be a string, not 'NoneType'");
+      }
+      // int() ValueError ("1e0", "0x2", "abc", "") => flash + redirect
+      const scheme = pyInt(raw);
+      if (scheme === null) {
         await flash(c, "Invalid value", "error");
         return c.redirect(settingUrl, 302);
       }
@@ -700,10 +728,10 @@ webSettingsPagesRoutes.post("/setting", async (c) => {
       return c.redirect(settingUrl, 302);
     }
     case "change-sender-format": {
-      const raw = field(body, "sender-format") ?? "";
-      const value = Number(raw);
-      if (raw.trim() === "" || !Number.isInteger(value))
-        throw new Error(`invalid literal for int(): ${raw}`);
+      const raw = field(body, "sender-format");
+      // setting.py L172 int(): TypeError/ValueError => 500, bug-compatible
+      const value = raw === null ? null : pyInt(raw);
+      if (value === null) throw new Error(`invalid literal for int(): ${raw}`);
       if ([0, 2, 5, 6, 7].includes(value)) {
         await updateUser(db, user.id, {
           sender_format: value,
@@ -1129,26 +1157,35 @@ webSettingsPagesRoutes.post("/unlink_proton_account", async (c) => {
   }
   const partnerUser = await db
     .prepare(
-      `SELECT pu.id AS id FROM partner_user pu
+      `SELECT pu.id AS id, pu.partner_email AS partner_email,
+              pu.external_user_id AS external_user_id
+       FROM partner_user pu
        JOIN partner p ON pu.partner_id = p.id
        WHERE pu.user_id = ?1 AND p.name = 'Proton'`,
     )
     .bind(user.id)
-    .first<{ id: number }>();
+    .first<{
+      id: number;
+      partner_email: string | null;
+      external_user_id: string | null;
+    }>();
   if (!partnerUser) {
     // Known Flask 500 (AttributeError on None) — kept bug-compatible.
     throw new Error("user is not linked to a Proton account");
   }
-  await db
-    .prepare("DELETE FROM partner_user WHERE id = ?1")
-    .bind(partnerUser.id)
-    .run();
+  // app/proton/proton_unlink.py L27-31: audit row is written BEFORE the
+  // delete, with the partner_email/external_user_id detail (Python prints
+  // the literal `None` for missing values).
   await emitUserAuditLog(
     db,
     user,
     "unlink_account",
-    `User ${user.id} has unlinked their Proton account`,
+    `User has unlinked the account (email=${partnerUser.partner_email ?? "None"} | external_user_id=${partnerUser.external_user_id ?? "None"})`,
   );
+  await db
+    .prepare("DELETE FROM partner_user WHERE id = ?1")
+    .bind(partnerUser.id)
+    .run();
   await flash(c, "Your Proton account has been unlinked", "success");
   return c.redirect(urlFor("dashboard.account_setting"), 302);
 });
@@ -1703,8 +1740,10 @@ webSettingsPagesRoutes.on(["GET", "POST"], "/notifications", async (c) => {
   const db = c.env.DB;
   const user = c.get("webUser");
   const PAGE_LIMIT = 20;
-  let page = Number.parseInt(c.req.query("page") ?? "", 10);
-  if (Number.isNaN(page)) page = 0;
+  // notification.py L44-49: int() ValueError swallowed => page stays 0
+  // ("1x", "0x2" etc. must NOT be parsed like parseInt would).
+  const rawPage = c.req.query("page");
+  const page = rawPage ? (pyInt(rawPage) ?? 0) : 0;
   // Flask 500s on negative OFFSET (Postgres); SQLite treats it as 0.
   const rows = await db
     .prepare(
@@ -1860,11 +1899,13 @@ webSettingsPagesRoutes.on(
           .bind(nowStr(), contact.id)
           .run();
         if (alias) {
+          // contact_utils.py L154 interpolates contact.email, a property
+          // aliasing website_email (models.py L2123) — NOT reply_email.
           await emitAliasAuditLog(
             db,
             alias,
             "update_contact",
-            `Set contact state ${contact.id} ${contact.reply_email} -> ${contact.website_email} to blocked True`,
+            `Set contact state ${contact.id} ${contact.website_email} -> ${contact.website_email} to blocked True`,
           );
         }
         await flash(
@@ -1895,3 +1936,273 @@ webSettingsPagesRoutes.on(
     );
   },
 );
+
+// ---------------------------------------------------------------------------
+// 18. GET|POST /alias_trash (app/dashboard/views/alias_trash.py)
+// ---------------------------------------------------------------------------
+
+const TRASH_PAGE_LIMIT = 20; // config.PAGE_LIMIT
+
+class BucketRateLimitError extends Error {}
+
+// config.py L586-590 defaults: "100,86400:200,604800" / "5,3600:20,604800"
+const ALIAS_RESTORE_ONE_RATE_LIMIT: ReadonlyArray<readonly [number, number]> = [
+  [100, 86400],
+  [200, 604800],
+];
+const ALIAS_RESTORE_ALL_RATE_LIMIT: ReadonlyArray<readonly [number, number]> = [
+  [5, 3600],
+  [20, 604800],
+];
+
+/**
+ * rate_limiter.check_bucket_limit — D1 buckets like alias-pages.ts. Flask
+ * bug parity: restore-one shares the `alias_restore_all_*` lock names
+ * (alias_delete.py L179 uses the same key prefix for both modes).
+ */
+async function checkRestoreBucketLimits(
+  db: D1Database,
+  env: Env,
+  userId: number,
+  limits: ReadonlyArray<readonly [number, number]>,
+): Promise<void> {
+  if (env.DISABLE_RATE_LIMIT !== undefined) return;
+  const nowSec = Math.floor(Date.now() / 1000);
+  for (const [maxHits, bucketSeconds] of limits) {
+    const bucketId = nowSec - (nowSec % bucketSeconds);
+    const key = `bl:alias_restore_all_${bucketSeconds}:${userId}:${bucketId}`;
+    const row = await db
+      .prepare(
+        `INSERT INTO rate_limit (key, window_start, count) VALUES (?1, ?2, 1)
+         ON CONFLICT(key) DO UPDATE SET count = count + 1 RETURNING count`,
+      )
+      .bind(key, bucketId)
+      .first<{ count: number }>();
+    if ((row?.count ?? 1) > maxHits) throw new BucketRateLimitError();
+  }
+}
+
+/** User.can_create_num_aliases(num) (models.py L973). */
+async function canCreateNumAliases(
+  db: D1Database,
+  env: Env,
+  user: UserRow,
+  numAliases: number,
+): Promise<boolean> {
+  // User.is_active(): delete_on NULL, or (Flask quirk) delete_on in the past
+  if (user.delete_on !== null && toDate(user.delete_on).getTime() >= Date.now())
+    return false;
+  if (user.disabled) return false;
+  const inputs = await premiumInputsForUser(db, user);
+  if (lifetimeOrActiveSubscription(inputs, new Date())) return true;
+  const row = await db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM alias WHERE user_id = ?1 AND delete_on IS NULL",
+    )
+    .bind(user.id)
+    .first<{ n: number }>();
+  return (row?.n ?? 0) + numAliases <= maxAliasForFreeAccount(user, env);
+}
+
+/**
+ * alias_delete.perform_alias_deletion for an already-trashed alias
+ * (clear_trash path): move to the domain/global tombstone table, emit the
+ * DeleteAlias audit row, then drop the alias row.
+ */
+async function permanentlyDeleteTrashedAlias(
+  db: D1Database,
+  alias: AliasRow,
+  user: UserRow,
+): Promise<void> {
+  if (alias.custom_domain_id) {
+    const existing = await db
+      .prepare(
+        "SELECT 1 FROM domain_deleted_alias WHERE email = ?1 AND domain_id = ?2 LIMIT 1",
+      )
+      .bind(alias.email, alias.custom_domain_id)
+      .first();
+    if (!existing) {
+      await db
+        .prepare(
+          `INSERT INTO domain_deleted_alias (user_id, email, domain_id, reason, alias_id, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+        )
+        .bind(
+          user.id,
+          alias.email,
+          alias.custom_domain_id,
+          alias.delete_reason ?? 0,
+          alias.id,
+          nowStr(),
+        )
+        .run();
+    }
+  } else {
+    const existing = await db
+      .prepare("SELECT 1 FROM deleted_alias WHERE email = ?1 LIMIT 1")
+      .bind(alias.email)
+      .first();
+    if (!existing) {
+      await db
+        .prepare(
+          "INSERT INTO deleted_alias (email, reason, alias_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(alias.email, alias.delete_reason ?? 0, alias.id, nowStr())
+        .run();
+    }
+  }
+  // alias_delete.py __delete_alias: audit row before the DELETE
+  await emitAliasAuditLog(db, alias, "delete", "Alias deleted by user action");
+  await db.prepare("DELETE FROM alias WHERE id = ?1").bind(alias.id).run();
+}
+
+/** alias_delete.__perform_alias_restore (no-op when not trashed). */
+async function performAliasRestore(
+  db: D1Database,
+  alias: AliasRow,
+): Promise<void> {
+  if (alias.delete_on === null) return;
+  await db
+    .prepare(
+      `UPDATE alias SET delete_on = NULL, delete_reason = NULL, enabled = 1,
+       updated_at = ?1 WHERE id = ?2`,
+    )
+    .bind(nowStr(), alias.id)
+    .run();
+  await emitAliasAuditLog(
+    db,
+    alias,
+    "restored_alias",
+    `Restored alias ${alias.id} from trash`,
+  );
+}
+
+function trashedAliases(db: D1Database, userId: number) {
+  return db
+    .prepare("SELECT * FROM alias WHERE user_id = ?1 AND delete_on IS NOT NULL")
+    .bind(userId)
+    .all<AliasRow>();
+}
+
+webSettingsPagesRoutes.use("/alias_trash", requireWebLogin);
+webSettingsPagesRoutes.on(["GET", "POST"], "/alias_trash", async (c) => {
+  const db = c.env.DB;
+  const user = c.get("webUser");
+  // int(request.args.get("page", 0)): ValueError => 0. Negative pages give a
+  // negative OFFSET: Flask 500s (Postgres) while SQLite treats it as 0 —
+  // same accepted divergence as /notifications.
+  const rawPage = c.req.query("page");
+  const page = rawPage === undefined ? 0 : (pyInt(rawPage) ?? 0);
+
+  if (c.req.method === "POST") {
+    const body = await formBody(c);
+    const aliasIdRaw = field(body, "alias_id");
+    // SettingForm.validate(): CSRF + IntegerField coercion — a present but
+    // non-integer alias_id fails validation; a missing one is fine (None).
+    if (
+      !(await csrfOk(c, body)) ||
+      (aliasIdRaw !== null && pyInt(aliasIdRaw) === null)
+    ) {
+      await flash(c, "Invalid request", "warning");
+      return c.redirect("/dashboard/alias_trash", 302);
+    }
+    const action = (field(body, "action") ?? "").trim();
+
+    if (action === "trash-all") {
+      // alias_delete.clear_trash: every trashed alias is permanently deleted
+      const trashed = await trashedAliases(db, user.id);
+      for (const alias of trashed.results) {
+        await permanentlyDeleteTrashedAlias(db, alias, user);
+      }
+      await flash(c, `Deleted ${trashed.results.length} aliases`, "success");
+    } else if (action === "restore-one") {
+      if (aliasIdRaw === null) {
+        // int(None) TypeError is NOT caught by `except ValueError` => 500
+        throw new Error("int() argument must be a string, not 'NoneType'");
+      }
+      const aliasId = pyInt(aliasIdRaw) as number;
+      try {
+        await checkRestoreBucketLimits(
+          db,
+          c.env,
+          user.id,
+          ALIAS_RESTORE_ONE_RATE_LIMIT,
+        );
+      } catch (e) {
+        if (e instanceof BucketRateLimitError) return renderErrorPage(c, 429);
+        throw e;
+      }
+      const alias = await db
+        .prepare("SELECT * FROM alias WHERE id = ?1 AND user_id = ?2")
+        .bind(aliasId, user.id)
+        .first<AliasRow>();
+      if (alias && !(await canCreateNumAliases(db, c.env, user, 1))) {
+        await flash(
+          c,
+          "You do not have enough quota to restore this alias",
+          "error",
+        );
+      } else {
+        if (alias) await performAliasRestore(db, alias);
+        // Flask parity: restore_alias returns None for an unknown/foreign
+        // alias and the view still flashes success.
+        await flash(c, "Restored alias", "success");
+      }
+    } else if (action === "restore-all") {
+      try {
+        await checkRestoreBucketLimits(
+          db,
+          c.env,
+          user.id,
+          ALIAS_RESTORE_ALL_RATE_LIMIT,
+        );
+      } catch (e) {
+        if (e instanceof BucketRateLimitError) return renderErrorPage(c, 429);
+        throw e;
+      }
+      const trashed = await trashedAliases(db, user.id);
+      if (
+        !(await canCreateNumAliases(db, c.env, user, trashed.results.length))
+      ) {
+        await flash(
+          c,
+          "You do not have enough quota to restore all aliases",
+          "error",
+        );
+      } else {
+        for (const alias of trashed.results) {
+          await performAliasRestore(db, alias);
+        }
+        await flash(c, `Restored ${trashed.results.length} aliases`, "success");
+      }
+    }
+    // every POST action falls through to the 200 render (no redirect)
+  }
+
+  const aliasInTrash = await db
+    .prepare(
+      `SELECT * FROM alias WHERE user_id = ?1 AND delete_on IS NOT NULL
+       ORDER BY delete_on ASC LIMIT ?2 OFFSET ?3`,
+    )
+    .bind(user.id, TRASH_PAGE_LIMIT, page * TRASH_PAGE_LIMIT)
+    .all<AliasRow>();
+  const countRow = await db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM alias WHERE user_id = ?1 AND delete_on IS NOT NULL",
+    )
+    .bind(user.id)
+    .first<{ n: number }>();
+
+  return webRender(
+    c,
+    "dashboard-settings/alias_trash.html",
+    {
+      alias_in_trash: aliasInTrash.results,
+      alias_trash_count: countRow?.n ?? 0,
+      page,
+      last_page: aliasInTrash.results.length < TRASH_PAGE_LIMIT,
+      form: { csrf_token: csrfTokenField(await generateCsrfToken(c)) },
+    },
+    { currentUser: await settingsCurrentUser(c, user) },
+  );
+});

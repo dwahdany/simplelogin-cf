@@ -352,6 +352,28 @@ describe("GET|POST /auth/register", () => {
       .first<{ action: string }>();
     expect(audit?.action).toBe("create_user");
 
+    // Alias.create emits an alias_audit_log row for the newsletter alias
+    // (app/models.py L1862: action "create", message "New alias created")
+    const aliasAudit = await env.DB.prepare(
+      "SELECT alias_id, alias_email, action, message FROM alias_audit_log WHERE user_id = ?1",
+    )
+      .bind(user?.id)
+      .first<{
+        alias_id: number;
+        alias_email: string;
+        action: string;
+        message: string;
+      }>();
+    expect(aliasAudit?.action).toBe("create");
+    expect(aliasAudit?.message).toBe("New alias created");
+    expect(aliasAudit?.alias_id).toBe(user?.newsletter_alias_id);
+    const newsletterAlias = await env.DB.prepare(
+      "SELECT email FROM alias WHERE id = ?1",
+    )
+      .bind(user?.newsletter_alias_id)
+      .first<{ email: string }>();
+    expect(aliasAudit?.alias_email).toBe(newsletterAlias?.email);
+
     const mail = sentEmails.find(
       (m) => m.subject === "Just one more step to join SimpleLogin",
     );
@@ -373,6 +395,38 @@ describe("GET|POST /auth/register", () => {
     );
     expect(res.status).toBe(200);
     expect(await res.text()).toContain(`Email ${existing.email} already used`);
+  }, 20000);
+
+  it("POST with an email on a blocklisted mailbox domain (parent-suffix match) flashes the personal-inbox error", async () => {
+    // invalid_mailbox_domain is an optional table (absent from the D1
+    // migrations) — email_can_be_used_as_mailbox must enforce it when present
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS invalid_mailbox_domain (
+         id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE)`,
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO invalid_mailbox_domain (domain) VALUES (?1)",
+    )
+      .bind("blocked-inbox.test")
+      .run();
+
+    // subdomain of the blocklisted domain: is_invalid_mailbox_domain walks
+    // parent suffixes (email_utils.py L793)
+    const email = "someone@mail.blocked-inbox.test";
+    const { cookie, csrf } = await formSession("/auth/register");
+    const res = await postForm(
+      "/auth/register",
+      { csrf_token: csrf, email, password: "longEnough-Passw0rd" },
+      { cookie },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      'toastr.error("You cannot use this email address as your personal inbox.");',
+    );
+    const user = await env.DB.prepare("SELECT 1 FROM users WHERE email = ?1")
+      .bind(email)
+      .first();
+    expect(user).toBeNull();
   }, 20000);
 
   it("POST with a short password shows the wtforms Length message", async () => {
@@ -776,6 +830,19 @@ describe("GET|POST /auth/mfa", () => {
     );
   });
 
+  it("redirects to login with the MFA warning when mfa_user_id points at a deleted user", async () => {
+    // Flask mfa.py L48: `if not (user and user.enable_otp)` — None-safe
+    const { cookie } = await makeSession({ extra: { mfa_user_id: 424242 } });
+    const res = await get("/auth/mfa", { cookie });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/auth/login");
+    const sess = await kvSession(cookie);
+    expect(sess?.flashes?.[0]).toEqual({
+      category: "warning",
+      message: "Only user with MFA enabled should go to this page",
+    });
+  });
+
   it("GET renders the token form", async () => {
     const { cookie } = await makeSession({
       extra: { mfa_user_id: otpUser.id },
@@ -834,13 +901,16 @@ describe("GET|POST /auth/mfa", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('toastr.warning("Incorrect token");');
-    expect(
-      sentEmails.find(
-        (m) =>
-          m.subject ===
-          "Unsuccessful attempt to login to your SimpleLogin account",
-      ),
-    ).toBeTruthy();
+    const alert = sentEmails.find(
+      (m) =>
+        m.subject ===
+        "Unsuccessful attempt to login to your SimpleLogin account",
+    );
+    expect(alert).toBeTruthy();
+    // send_invalid_totp_login_email(user, "TOTP") (mfa.py L105)
+    expect(alert?.text).toContain(
+      "An invalid TOTP code was provided but the email and password were correct.",
+    );
   });
 
   it("device-cookie fast path logs straight in", async () => {
@@ -935,13 +1005,24 @@ describe("GET|POST /auth/recovery", () => {
     );
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('toastr.error("Incorrect code");');
-    expect(
-      sentEmails.find(
-        (m) =>
-          m.subject ===
-          "Unsuccessful attempt to login to your SimpleLogin account",
-      ),
-    ).toBeTruthy();
+    const alert = sentEmails.find(
+      (m) =>
+        m.subject ===
+        "Unsuccessful attempt to login to your SimpleLogin account",
+    );
+    expect(alert).toBeTruthy();
+    // send_invalid_totp_login_email(user, "recovery") (recovery.py L76)
+    expect(alert?.text).toContain(
+      "An invalid recovery code was provided but the email and password were correct.",
+    );
+  });
+
+  it("renders the 500 page when mfa_user_id points at a deleted user (Flask raises here)", async () => {
+    // recovery.py L37 calls user.two_factor_authentication_enabled() on the
+    // None user -> unhandled exception, unlike the None-safe /mfa and /fido
+    const { cookie } = await makeSession({ extra: { mfa_user_id: 424242 } });
+    const res = await get("/auth/recovery", { cookie });
+    expect(res.status).toBe(500);
   });
 });
 
@@ -1067,6 +1148,19 @@ describe("GET|POST /auth/fido (WebAuthn deferred)", () => {
     expect(sess?.flashes?.[0]?.message).toBe(
       "Only user with security key linked should go to this page",
     );
+  });
+
+  it("guards: deleted user behind mfa_user_id is bounced to login, not a 500", async () => {
+    // Flask fido.py L53: `if not (user and user.fido_enabled())` — None-safe
+    const { cookie } = await makeSession({ extra: { mfa_user_id: 424242 } });
+    const res = await get("/auth/fido", { cookie });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/auth/login");
+    const sess = await kvSession(cookie);
+    expect(sess?.flashes?.[0]).toEqual({
+      category: "warning",
+      message: "Only user with security key linked should go to this page",
+    });
   });
 
   it("GET renders the page shell and stores a challenge in the session", async () => {

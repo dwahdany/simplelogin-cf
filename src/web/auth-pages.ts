@@ -278,6 +278,21 @@ async function emitUserAuditLog(
     .run();
 }
 
+/** emit_alias_audit_log (app/alias_audit_log_utils.py L26). */
+async function emitAliasAuditLog(
+  db: D1Database,
+  alias: { id: number; user_id: number; email: string },
+  action: string,
+  message: string,
+): Promise<void> {
+  await db
+    .prepare(
+      "INSERT INTO alias_audit_log (user_id, alias_id, alias_email, action, message) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(alias.user_id, alias.id, alias.email, action, message)
+    .run();
+}
+
 const MFA_USER_ID = "mfa_user_id";
 
 async function setSessionExtra(
@@ -380,6 +395,37 @@ function isValidEmail(email: string): boolean {
   return !/^\d+$/.test(labels[labels.length - 1]);
 }
 
+/**
+ * is_invalid_mailbox_domain (email_utils.py L793): the domain or ANY parent
+ * suffix (excluding the bare TLD) is listed in invalid_mailbox_domain. A
+ * missing table counts as an empty blocklist (same stance as
+ * src/routes/mailboxes.ts).
+ */
+async function isInvalidMailboxDomain(
+  db: D1Database,
+  domain: string,
+): Promise<boolean> {
+  const parts = domain.split(".");
+  const suffixes: string[] = [];
+  for (let i = 0; i < parts.length - 1; i++) {
+    suffixes.push(parts.slice(i).join("."));
+  }
+  if (suffixes.length === 0) return false;
+  const placeholders = suffixes.map((_, i) => `?${i + 1}`).join(", ");
+  try {
+    const row = await db
+      .prepare(
+        `SELECT 1 FROM invalid_mailbox_domain WHERE domain IN (${placeholders}) LIMIT 1`,
+      )
+      .bind(...suffixes)
+      .first();
+    return !!row;
+  } catch (e) {
+    if (String(e).includes("no such table")) return false;
+    throw e;
+  }
+}
+
 /** email_can_be_used_as_mailbox minus MX/abuse checks (API-port stance). */
 async function emailCanBeUsedAsMailbox(
   db: D1Database,
@@ -399,6 +445,8 @@ async function emailCanBeUsedAsMailbox(
     .bind(domain)
     .first();
   if (customDomain) return false;
+
+  if (await isInvalidMailboxDomain(db, domain)) return false;
 
   const owner = await db
     .prepare("SELECT disabled FROM users WHERE email = ?1")
@@ -508,6 +556,15 @@ async function createWebUser(
         mailbox?.id ?? null,
       )
       .first<{ id: number }>();
+    // Alias.create -> emit_alias_audit_log(CreateAlias) (app/models.py L1862)
+    if (alias) {
+      await emitAliasAuditLog(
+        db,
+        { id: alias.id, user_id: user.id, email: candidate },
+        "create",
+        "New alias created",
+      );
+    }
     await db
       .prepare(
         "UPDATE users SET newsletter_alias_id = ?1, updated_at = ?2 WHERE id = ?3",
@@ -612,10 +669,15 @@ async function sendResetPasswordEmail(env: Env, user: UserRow): Promise<void> {
   });
 }
 
-/** send_invalid_totp_login_email — capped at 1/24h via sent_alert (API-port copy). */
+/**
+ * send_invalid_totp_login_email(user, totp_type) — capped at 1/24h via
+ * sent_alert. totpType is "TOTP" (mfa.py L105) or "recovery" (recovery.py L76)
+ * and is interpolated into the body like the Jinja template does.
+ */
 async function sendInvalidTotpLoginEmail(
   env: Env,
   user: UserRow,
+  totpType: "TOTP" | "recovery",
 ): Promise<void> {
   if (!canSendOrReceive(user)) return;
   const alertType = "invalid_totp_login";
@@ -638,7 +700,7 @@ async function sendInvalidTotpLoginEmail(
     subject: "Unsuccessful attempt to login to your SimpleLogin account",
     text:
       "There has been an unsuccessful attempt to login to your SimpleLogin account.\n" +
-      "An invalid TOTP code was provided but the email and password were correct.\n\n" +
+      `An invalid ${totpType} code was provided but the email and password were correct.\n\n` +
       "This request has been blocked. However, if this was not you, please change your password immediately.\n" +
       `${env.URL}/dashboard/setting#change_password\n`,
   });
@@ -1223,21 +1285,21 @@ webAuthPagesRoutes.on(["GET", "POST"], "/change_email", async (c) => {
 // MFA interstitial shared guards
 // ---------------------------------------------------------------------------
 
+/**
+ * Returns user: null when mfa_user_id points at a deleted user — /mfa and
+ * /fido guard None-safely (`if not (user and ...)`, mfa.py L48 / fido.py L53)
+ * while /recovery raises (recovery.py L37 calls a method on the None user).
+ */
 async function mfaInterstitialUser(
   c: Ctx,
-): Promise<{ user: UserRow } | { response: Response }> {
+): Promise<{ user: UserRow | null } | { response: Response }> {
   const sess = await getSession(c);
   const mfaUserId = sess?.extra?.[MFA_USER_ID];
   if (typeof mfaUserId !== "number") {
     await flash(c, "Unknown error, redirect back to main page", "warning");
     return { response: c.redirect(urlFor("auth.login"), 302) };
   }
-  const user = await getUserById(c.env.DB, mfaUserId);
-  if (!user) {
-    // Flask has no None-check here and raises -> web 500 page
-    throw new Error(`mfa_user_id ${mfaUserId} points at a missing user`);
-  }
-  return { user };
+  return { user: await getUserById(c.env.DB, mfaUserId) };
 }
 
 /** Device-cookie fast path shared by /mfa and /fido. Returns a redirect Response or null. */
@@ -1293,7 +1355,8 @@ webAuthPagesRoutes.on(["GET", "POST"], "/mfa", async (c) => {
   const guard = await mfaInterstitialUser(c);
   if ("response" in guard) return guard.response;
   const user = guard.user;
-  if (!user.enable_otp) {
+  // `if not (user and user.enable_otp)` (mfa.py L48) — None-safe
+  if (!user?.enable_otp) {
     await flash(
       c,
       "Only user with MFA enabled should go to this page",
@@ -1333,7 +1396,7 @@ webAuthPagesRoutes.on(["GET", "POST"], "/mfa", async (c) => {
       }
       await flash(c, "Incorrect token", "warning");
       await limiter.deduct();
-      await sendInvalidTotpLoginEmail(c.env, user);
+      await sendInvalidTotpLoginEmail(c.env, user, "TOTP");
       // failed TOTP clears the token field (nothing echoed below)
     }
   }
@@ -1367,6 +1430,11 @@ webAuthPagesRoutes.on(["GET", "POST"], "/recovery", async (c) => {
   const guard = await mfaInterstitialUser(c);
   if ("response" in guard) return guard.response;
   const user = guard.user;
+  if (!user) {
+    // recovery.py L37 calls user.two_factor_authentication_enabled() on the
+    // None user and raises -> web 500 page (unlike /mfa and /fido)
+    throw new Error("mfa_user_id points at a missing user");
+  }
   if (!(user.enable_otp || user.fido_uuid !== null)) {
     await flash(
       c,
@@ -1412,7 +1480,7 @@ webAuthPagesRoutes.on(["GET", "POST"], "/recovery", async (c) => {
       } else {
         await limiter.deduct();
         await flash(c, "Incorrect code", "error");
-        await sendInvalidTotpLoginEmail(c.env, user);
+        await sendInvalidTotpLoginEmail(c.env, user, "recovery");
       }
     }
   }
@@ -1500,7 +1568,8 @@ webAuthPagesRoutes.on(["GET", "POST"], "/fido", async (c) => {
   const guard = await mfaInterstitialUser(c);
   if ("response" in guard) return guard.response;
   const user = guard.user;
-  if (user.fido_uuid === null) {
+  // `if not (user and user.fido_enabled())` (fido.py L53) — None-safe
+  if (!user || user.fido_uuid === null) {
     await flash(
       c,
       "Only user with security key linked should go to this page",

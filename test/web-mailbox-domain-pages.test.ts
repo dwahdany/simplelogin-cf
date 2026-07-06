@@ -12,6 +12,7 @@ import { sentEmails } from "../src/lib/mailer";
 import type { MailboxRow, UserRow } from "../src/lib/rows";
 import { createSession } from "../src/lib/session";
 import type { WebEnv } from "../src/lib/web/webauth";
+import { setMailboxDnsClient } from "../src/web/mailbox-domain-pages";
 import {
   createAlias,
   createContact,
@@ -21,6 +22,37 @@ import {
 } from "./fixtures";
 
 const BASE = "http://example.com";
+
+// ---- in-memory DNS client (like Flask tests' InMemoryDNSClient) ----
+
+/** MX hosts per hostname; unknown hostnames get a generic MX so mailbox
+ * creation succeeds by default. Set an empty array for an MX-less domain. */
+const mxRecords = new Map<string, string[]>();
+/** A records per MX hostname; unknown hostnames resolve to null. */
+const aRecords = new Map<string, string>();
+
+// Tests and SELF share this isolate, so the routes see this client.
+setMailboxDnsClient({
+  async getMxDomainList(hostname) {
+    return mxRecords.get(hostname) ?? ["mx.mock.test"];
+  },
+  async getARecord(hostname) {
+    return aRecords.get(hostname) ?? null;
+  },
+});
+
+/** The optional blocklist tables (absent from the D1 migrations). */
+async function createBlocklistTables(): Promise<void> {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS invalid_mailbox_domain (
+       id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE)`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS forbidden_mx_ip (
+       id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL UNIQUE,
+       comment TEXT)`,
+  ).run();
+}
 
 /** Build a logged-in (optionally sudo-fresh) KV session, return its cookie. */
 async function sessionCookieFor(userId: number, sudo = false): Promise<string> {
@@ -178,7 +210,7 @@ describe("route 1: /dashboard/mailbox", () => {
     const res = await post("/dashboard/mailbox", cookie, {
       "form-name": "create",
       csrf_token: csrf,
-      email: "New Box@Example.com",
+      email: "NewBox@Example.com",
     });
     expect(res.status).toBe(302);
     const mb = await env.DB.prepare(
@@ -222,6 +254,113 @@ describe("route 1: /dashboard/mailbox", () => {
     expect(await getFlashes(cookie)).toEqual([
       { category: "warning", message: "Invalid request" },
     ]);
+  });
+
+  it("POST create with a space in the local part is form-invalid (wtforms Email -> email_validator)", async () => {
+    const user = await createUser(env.DB);
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf("/dashboard/mailbox", cookie);
+    const res = await post("/dashboard/mailbox", cookie, {
+      "form-name": "create",
+      csrf_token: csrf,
+      email: "joe doe@gmail.com",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/mailbox");
+    expect(await getFlashes(cookie)).toEqual([
+      { category: "warning", message: "Invalid request" },
+    ]);
+    // Flask never gets to the lower/strip step: no mailbox row is written
+    expect(
+      await env.DB.prepare("SELECT 1 FROM mailbox WHERE email = ?1")
+        .bind("joedoe@gmail.com")
+        .first(),
+    ).toBeNull();
+  });
+
+  it("POST create refuses a domain with no MX records", async () => {
+    const user = await createUser(env.DB);
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf("/dashboard/mailbox", cookie);
+    mxRecords.set("nomx.example.com", []);
+    sentEmails.length = 0;
+    const res = await post("/dashboard/mailbox", cookie, {
+      "form-name": "create",
+      csrf_token: csrf,
+      email: "box@nomx.example.com",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/mailbox");
+    expect(await getFlashes(cookie)).toEqual([
+      {
+        category: "warning",
+        message:
+          "Invalid email: We couldn't get any MX records configured for this domain",
+      },
+    ]);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM mailbox WHERE email = ?1")
+        .bind("box@nomx.example.com")
+        .first(),
+    ).toBeNull();
+    expect(sentEmails.length).toBe(0);
+  });
+
+  it("POST create refuses blocklisted mailbox domains (parent-suffix match)", async () => {
+    await createBlocklistTables();
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO invalid_mailbox_domain (domain) VALUES ('blocked-domain.test')",
+    ).run();
+    const user = await createUser(env.DB);
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf("/dashboard/mailbox", cookie);
+    const res = await post("/dashboard/mailbox", cookie, {
+      "form-name": "create",
+      csrf_token: csrf,
+      email: "box@mail.blocked-domain.test",
+    });
+    expect(res.status).toBe(302);
+    expect(await getFlashes(cookie)).toEqual([
+      {
+        category: "warning",
+        message: "Invalid email: We don't allow mailboxes using this domain",
+      },
+    ]);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM mailbox WHERE email = ?1")
+        .bind("box@mail.blocked-domain.test")
+        .first(),
+    ).toBeNull();
+  });
+
+  it("POST create refuses domains whose MX resolves to a forbidden IP", async () => {
+    await createBlocklistTables();
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO forbidden_mx_ip (ip) VALUES ('10.11.12.13')",
+    ).run();
+    mxRecords.set("evil-mx.example.com", ["mx.evil-mx.test"]);
+    aRecords.set("mx.evil-mx.test", "10.11.12.13");
+    const user = await createUser(env.DB);
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf("/dashboard/mailbox", cookie);
+    const res = await post("/dashboard/mailbox", cookie, {
+      "form-name": "create",
+      csrf_token: csrf,
+      email: "box@evil-mx.example.com",
+    });
+    expect(res.status).toBe(302);
+    expect(await getFlashes(cookie)).toEqual([
+      {
+        category: "warning",
+        message:
+          "Invalid email: We don't allow mailbox domains that point to these MX records",
+      },
+    ]);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM mailbox WHERE email = ?1")
+        .bind("box@evil-mx.example.com")
+        .first(),
+    ).toBeNull();
   });
 
   it("POST with a bad CSRF token flashes Invalid request", async () => {
@@ -301,6 +440,36 @@ describe("route 1: /dashboard/mailbox", () => {
           "You will receive a confirmation email when the deletion is finished",
       },
     ]);
+  });
+
+  it("POST delete with an empty transfer_mailbox_id is Invalid request (wtforms int coercion)", async () => {
+    const user = await createUser(env.DB);
+    const other = await createMailbox(
+      env.DB,
+      user.id,
+      `keep-${user.id}@example.com`,
+    );
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf("/dashboard/mailbox", cookie);
+    const res = await post("/dashboard/mailbox", cookie, {
+      "form-name": "delete",
+      csrf_token: csrf,
+      mailbox_id: String(other.id),
+      transfer_mailbox_id: "", // int('') raises -> form invalid in Flask
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/mailbox");
+    expect(await getFlashes(cookie)).toEqual([
+      { category: "warning", message: "Invalid request" },
+    ]);
+    // no delete-mailbox job scheduled for this mailbox
+    const job = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM job
+       WHERE name = 'delete-mailbox' AND json_extract(payload, '$.mailbox_id') = ?1`,
+    )
+      .bind(other.id)
+      .first<{ n: number }>();
+    expect(job?.n).toBe(0);
   });
 
   it("POST delete of the default mailbox is refused", async () => {
@@ -519,6 +688,52 @@ describe("route 3: /dashboard/mailbox/<id>", () => {
     expect(await res.text()).toContain("Invalid email address.");
   });
 
+  it("update-email with a space in the local part re-renders with the field error", async () => {
+    const { mb, cookie, csrf } = await setup();
+    sentEmails.length = 0;
+    const res = await post(`/dashboard/mailbox/${mb.id}`, cookie, {
+      "form-name": "update-email",
+      csrf_token: csrf,
+      email: "joe doe@gmail.com",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Invalid email address.");
+    const row = await env.DB.prepare(
+      "SELECT new_email FROM mailbox WHERE id = ?1",
+    )
+      .bind(mb.id)
+      .first<{ new_email: string | null }>();
+    expect(row?.new_email).toBeNull();
+    expect(sentEmails.length).toBe(0);
+  });
+
+  it("update-email to a domain with no MX records flashes the error", async () => {
+    const { mb, cookie, csrf } = await setup();
+    mxRecords.set("nomx-change.example.com", []);
+    sentEmails.length = 0;
+    const res = await post(`/dashboard/mailbox/${mb.id}`, cookie, {
+      "form-name": "update-email",
+      csrf_token: csrf,
+      email: `x-${mb.id}@nomx-change.example.com`,
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(`/dashboard/mailbox/${mb.id}`);
+    expect(await getFlashes(cookie)).toEqual([
+      {
+        category: "error",
+        message:
+          "Invalid email: We couldn't get any MX records configured for this domain",
+      },
+    ]);
+    const row = await env.DB.prepare(
+      "SELECT new_email FROM mailbox WHERE id = ?1",
+    )
+      .bind(mb.id)
+      .first<{ new_email: string | null }>();
+    expect(row?.new_email).toBeNull();
+    expect(sentEmails.length).toBe(0);
+  });
+
   it("add/delete authorized address", async () => {
     const { mb, cookie, csrf } = await setup();
     const res = await post(`/dashboard/mailbox/${mb.id}`, cookie, {
@@ -611,6 +826,67 @@ describe("route 3: /dashboard/mailbox/<id>", () => {
       .bind(mb.id)
       .first<{ pgp_public_key: string | null }>();
     expect(row?.pgp_public_key).toBeNull();
+  });
+
+  it("force-spf flash replicates Flask's operator-precedence bug", async () => {
+    const { mb, cookie, csrf } = await setup();
+    const envx = env as unknown as Record<string, unknown>;
+    envx.ENFORCE_SPF = "1";
+    try {
+      // spf-status='off': the DB write keys on == 'on' (disabled) but the
+      // flash keys on truthiness (mailbox_detail.py L89-94) -> "enabled"
+      const res = await post(`/dashboard/mailbox/${mb.id}`, cookie, {
+        "form-name": "force-spf",
+        csrf_token: csrf,
+        "spf-status": "off",
+      });
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe(`/dashboard/mailbox/${mb.id}`);
+      const row = await env.DB.prepare(
+        "SELECT force_spf FROM mailbox WHERE id = ?1",
+      )
+        .bind(mb.id)
+        .first<{ force_spf: number }>();
+      expect(row?.force_spf).toBe(0);
+      expect(await getFlashes(cookie)).toEqual([
+        { category: "success", message: "SPF enforcement was enabled" },
+      ]);
+      await clearFlashes(cookie);
+
+      // spf-status='on': enabled + "enabled" flash
+      await post(`/dashboard/mailbox/${mb.id}`, cookie, {
+        "form-name": "force-spf",
+        csrf_token: csrf,
+        "spf-status": "on",
+      });
+      const row2 = await env.DB.prepare(
+        "SELECT force_spf FROM mailbox WHERE id = ?1",
+      )
+        .bind(mb.id)
+        .first<{ force_spf: number }>();
+      expect(row2?.force_spf).toBe(1);
+      expect(await getFlashes(cookie)).toEqual([
+        { category: "success", message: "SPF enforcement was enabled" },
+      ]);
+      await clearFlashes(cookie);
+
+      // spf-status absent: disabled + "disabled successfully" flash
+      await post(`/dashboard/mailbox/${mb.id}`, cookie, {
+        "form-name": "force-spf",
+        csrf_token: csrf,
+      });
+      const row3 = await env.DB.prepare(
+        "SELECT force_spf FROM mailbox WHERE id = ?1",
+      )
+        .bind(mb.id)
+        .first<{ force_spf: number }>();
+      expect(row3?.force_spf).toBe(0);
+      expect(await getFlashes(cookie)).toEqual([
+        { category: "success", message: "disabled successfully" },
+      ]);
+    } finally {
+      delete envx.ENFORCE_SPF;
+    }
   });
 
   it("force-spf is rejected when ENFORCE_SPF is not configured", async () => {
@@ -782,6 +1058,28 @@ describe("route 6: /dashboard/custom_domain", () => {
     });
     expect(res.status).toBe(200);
     expect(await res.text()).toContain(`${domain} already used`);
+  });
+
+  it("POST create with a domain in deleted_subdomain 500s like Flask", async () => {
+    const user = await createUser(env.DB);
+    const cookie = await sessionCookieFor(user.id);
+    const domain = `trashed${user.id}.subs.example.com`;
+    await env.DB.prepare("INSERT INTO deleted_subdomain (domain) VALUES (?1)")
+      .bind(domain)
+      .run();
+    const csrf = await getCsrf("/dashboard/custom_domain", cookie);
+    const res = await post("/dashboard/custom_domain", cookie, {
+      "form-name": "create",
+      csrf_token: csrf,
+      domain,
+    });
+    // CustomDomain.create raises SubdomainInTrashError, uncaught by the view
+    expect(res.status).toBe(500);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM custom_domain WHERE domain = ?1")
+        .bind(domain)
+        .first(),
+    ).toBeNull();
   });
 
   it("non-premium users cannot create custom domains", async () => {
@@ -969,6 +1267,39 @@ describe("route 8: /dashboard/domains/<id>/info", () => {
     ]);
     expect(await getFlashes(cookie)).toEqual([
       { category: "success", message: `${domain} mailboxes has been updated` },
+    ]);
+  });
+
+  it("update with duplicate mailbox_ids fails cleanly like Flask", async () => {
+    const { user, id, cookie, csrf } = await setup();
+    // establish an existing link first
+    await post(`/dashboard/domains/${id}/info`, cookie, {
+      "form-name": "update",
+      csrf_token: csrf,
+      mailbox_ids: [String(user.default_mailbox_id)],
+    });
+    await clearFlashes(cookie);
+    const res = await post(`/dashboard/domains/${id}/info`, cookie, {
+      "form-name": "update",
+      csrf_token: csrf,
+      mailbox_ids: [
+        String(user.default_mailbox_id),
+        String(user.default_mailbox_id),
+      ],
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(`/dashboard/domains/${id}/info`);
+    expect(await getFlashes(cookie)).toEqual([
+      { category: "warning", message: "Something went wrong, please retry" },
+    ]);
+    // existing links are untouched (Flask fails before any delete/insert)
+    const rows = await env.DB.prepare(
+      "SELECT mailbox_id FROM domain_mailbox WHERE domain_id = ?1",
+    )
+      .bind(id)
+      .all<{ mailbox_id: number }>();
+    expect(rows.results.map((r) => r.mailbox_id)).toEqual([
+      user.default_mailbox_id,
     ]);
   });
 
@@ -1197,6 +1528,60 @@ describe("route 10: /dashboard/domains/<id>/auto-create", () => {
     expect(await res.text()).toContain(
       "Another rule with the same order already exists",
     );
+  });
+
+  it("regex validation/matching follows Python re, not JS RegExp", async () => {
+    const { user, id, domain, cookie, csrf } = await setup();
+    const path = `/dashboard/domains/${id}/auto-create`;
+    // Python-only named-group syntax is accepted (re.compile allows it)
+    const res = await post(path, cookie, {
+      "form-name": "create-auto-create-rule",
+      csrf_token: csrf,
+      regex: "(?P<u>[a-z]+)",
+      display_name: "",
+      order: "3",
+      mailbox_ids: [String(user.default_mailbox_id)],
+    });
+    expect(res.status).toBe(302);
+    expect(await getFlashes(cookie)).toEqual([
+      { category: "success", message: "New auto create rule has been created" },
+    ]);
+    await clearFlashes(cookie);
+    const rule = await env.DB.prepare(
+      "SELECT regex FROM auto_create_rule WHERE custom_domain_id = ?1",
+    )
+      .bind(id)
+      .first<{ regex: string }>();
+    expect(rule?.regex).toBe("(?P<u>[a-z]+)");
+
+    // the test form matches the stored Python pattern (re2/re fullmatch)
+    const res2 = await post(path, cookie, {
+      "form-name": "test-auto-create-rule",
+      csrf_token: csrf,
+      local: "abc",
+    });
+    expect(res2.status).toBe(200);
+    expect(await res2.text()).toContain(`abc@${domain} passes rule #3`);
+
+    // JS-only named-group syntax is an "unknown extension" for Python re
+    const res3 = await post(path, cookie, {
+      "form-name": "create-auto-create-rule",
+      csrf_token: csrf,
+      regex: "(?<u>[a-z]+)",
+      display_name: "",
+      order: "4",
+      mailbox_ids: [String(user.default_mailbox_id)],
+    });
+    expect(res3.status).toBe(302);
+    expect(await getFlashes(cookie)).toEqual([
+      { category: "error", message: "Invalid regex (?<u>[a-z]+)" },
+    ]);
+    const count = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM auto_create_rule WHERE custom_domain_id = ?1",
+    )
+      .bind(id)
+      .first<{ n: number }>();
+    expect(count?.n).toBe(1);
   });
 
   it("missing mailbox selection flashes the warning", async () => {

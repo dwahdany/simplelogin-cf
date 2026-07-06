@@ -98,10 +98,20 @@ function intConfig(v: string | undefined): number {
 /** 'YYYY-MM-DD' from a stored timestamp/date string. */
 const dateOnly = (s: string): string => s.slice(0, 10);
 
-/** arrow shift(years=n) equivalent on the stored timestamp format. */
+/**
+ * arrow shift(years=n) equivalent (dateutil relativedelta): when the target
+ * year has no Feb 29 the day is clamped to Feb 28, unlike Date.setUTCFullYear
+ * which would roll over to Mar 1.
+ */
 function addYears(d: Date, years: number): Date {
   const out = new Date(d.getTime());
+  const day = out.getUTCDate();
+  out.setUTCDate(1);
   out.setUTCFullYear(out.getUTCFullYear() + years);
+  const lastDay = new Date(
+    Date.UTC(out.getUTCFullYear(), out.getUTCMonth() + 1, 0),
+  ).getUTCDate();
+  out.setUTCDate(Math.min(day, lastDay));
   return out;
 }
 
@@ -561,13 +571,15 @@ async function redeemLifetimeCoupon(
     .first();
   if (!exists) return null;
 
+  // Flask's Core UPDATE picks up the ModelMixin onupdate default, so
+  // updated_at is stamped alongside the decrement.
   const coupon = await db
     .prepare(
-      `UPDATE lifetime_coupon SET nb_used = nb_used - 1
+      `UPDATE lifetime_coupon SET nb_used = nb_used - 1, updated_at = ?2
        WHERE code = ?1 AND nb_used > 0
        RETURNING *`,
     )
-    .bind(code)
+    .bind(code, nowStr())
     .first<LifetimeCouponRow>();
   if (!coupon) return null;
 
@@ -581,12 +593,12 @@ async function redeemLifetimeCoupon(
     .bind(coupon.id, coupon.paid, nowStr(), user.id)
     .run();
 
-  // Admin notification (config-gated; Flask interpolates the User repr —
-  // simplified here to "id email").
+  // Admin notification (config-gated). Flask interpolates the User __repr__
+  // ("<User {id} {name} {email}>") and Python None renders as "None".
   if (env.ADMIN_EMAIL) {
     await sendTransactionalEmail(env, {
       to: env.ADMIN_EMAIL,
-      subject: `User ${user.id} ${user.email} used lifetime coupon(${coupon.comment}). Coupon nb_used: ${coupon.nb_used}`,
+      subject: `User <User ${user.id} ${user.name ?? "None"} ${user.email}> used lifetime coupon(${coupon.comment ?? "None"}). Coupon nb_used: ${coupon.nb_used}`,
       text: "",
     });
   }
@@ -771,17 +783,11 @@ async function lifetimeLicenceHandler(c: Context<WebEnv>): Promise<Response> {
   );
 }
 
-// Flask registers /lifetime_licence; the shared urlFor map emits
-// /dashboard/lifetime-licence — serve both spellings (see notes).
+// Flask registers only /lifetime_licence (underscore); the hyphen spelling
+// does not exist and must 404.
 webBillingPagesRoutes.on(
   ["GET", "POST"],
   "/lifetime_licence",
-  requireWebLogin,
-  lifetimeLicenceHandler,
-);
-webBillingPagesRoutes.on(
-  ["GET", "POST"],
-  "/lifetime-licence",
   requireWebLogin,
   lifetimeLicenceHandler,
 );

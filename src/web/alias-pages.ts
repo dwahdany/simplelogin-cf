@@ -80,6 +80,7 @@ const PAGE_LIMIT = 20;
 const MAILBOX_FLAG_ADMIN_DISABLED = 1;
 const ALIAS_TRASH_DAYS = 30;
 const DELETE_IMMEDIATELY = 1; // UserAliasDeleteAction.DeleteImmediately
+const REASON_MANUAL_ACTION = 2; // AliasDeleteReason.ManualAction
 const AliasGenerator = { word: 1, uuid: 2 } as const;
 
 // env knobs not part of the typed Env contract
@@ -189,12 +190,35 @@ function isValidEmail(email: string): boolean {
   return true;
 }
 
-/** email_validator.validate_email raising — returns the flashable message. */
+/** email_validator.validate_email raising — returns the flashable message.
+ * Messages and check order mirror email-validator 2.2.0 (pinned by Flask):
+ * local-part checks run before domain checks, and within the local part:
+ * empty -> too long -> dot-atom -> trailing dot -> leading dot -> "..". */
 function validateEmailMessage(email: string): string | null {
-  const atCount = email.split("@").length - 1;
-  if (atCount !== 1) {
-    return "The email address is not valid. It must have exactly one @-sign.";
+  const at = email.indexOf("@");
+  if (at === -1) return "An email address must have an @-sign.";
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (local.length === 0) return "There must be something before the @-sign.";
+  if (local.length > 64) {
+    const over = local.length - 64;
+    return `The email address is too long before the @-sign (${over} character${over === 1 ? "" : "s"} too many).`;
   }
+  if (!LOCAL_PART_RE.test(local)) {
+    if (local.endsWith(".")) {
+      return "An email address cannot have a period immediately before the @-sign.";
+    }
+    if (local.startsWith(".")) {
+      return "An email address cannot start with a period.";
+    }
+    if (local.includes("..")) {
+      return "An email address cannot have two periods in a row.";
+    }
+    return "The email address contains invalid characters before the @-sign.";
+  }
+  if (domain.length === 0) return "There must be something after the @-sign.";
+  // Remaining (domain-side) failures are unreachable from the custom-alias
+  // flow: suffixes come from verified domains.
   if (!isValidEmail(email)) return "The email address is not valid.";
   return null;
 }
@@ -261,13 +285,15 @@ async function fetchWebAliasInfos(
   else if (opts.filter === "hibp") {
     conds.push("EXISTS (SELECT 1 FROM alias_hibp ah WHERE ah.alias_id = a.id)");
   }
-  if (opts.mailboxId != null) {
+  // Python `if mailbox_id:` / `if directory_id:` — id 0 is falsy and skips
+  // the filter entirely (serializer.py get_alias_infos_with_pagination_v3).
+  if (opts.mailboxId) {
     conds.push(
       "(a.mailbox_id = ? OR EXISTS (SELECT 1 FROM alias_mailbox am WHERE am.alias_id = a.id AND am.mailbox_id = ?))",
     );
     params.push(opts.mailboxId, opts.mailboxId);
   }
-  if (opts.directoryId != null) {
+  if (opts.directoryId) {
     conds.push("a.directory_id = ?");
     params.push(opts.directoryId);
   }
@@ -474,6 +500,7 @@ async function deleteIfCustomDomain(
   db: D1Database,
   alias: AliasRow,
   user: UserRow,
+  reason: number,
 ): Promise<boolean> {
   if (!alias.custom_domain_id) return false;
   const existing = await db
@@ -488,7 +515,14 @@ async function deleteIfCustomDomain(
         `INSERT INTO domain_deleted_alias (user_id, email, domain_id, reason, alias_id, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
       )
-      .bind(user.id, alias.email, alias.custom_domain_id, 0, alias.id, nowStr())
+      .bind(
+        user.id,
+        alias.email,
+        alias.custom_domain_id,
+        reason,
+        alias.id,
+        nowStr(),
+      )
       .run();
   }
   await db.prepare("DELETE FROM alias WHERE id = ?1").bind(alias.id).run();
@@ -499,8 +533,9 @@ async function performAliasDeletion(
   db: D1Database,
   alias: AliasRow,
   user: UserRow,
+  reason: number,
 ): Promise<void> {
-  if (await deleteIfCustomDomain(db, alias, user)) return;
+  if (await deleteIfCustomDomain(db, alias, user, reason)) return;
   const existing = await db
     .prepare("SELECT 1 FROM deleted_alias WHERE email = ?1 LIMIT 1")
     .bind(alias.email)
@@ -510,7 +545,8 @@ async function performAliasDeletion(
       .prepare(
         "INSERT INTO deleted_alias (email, reason, alias_id, created_at) VALUES (?1, ?2, ?3, ?4)",
       )
-      .bind(alias.email, alias.delete_reason || 0, alias.id, nowStr())
+      // Python `alias.delete_reason or reason` — 0 (Unspecified) also falls back
+      .bind(alias.email, alias.delete_reason || reason, alias.id, nowStr())
       .run();
   }
   await db.prepare("DELETE FROM alias WHERE id = ?1").bind(alias.id).run();
@@ -520,29 +556,36 @@ async function moveAliasToTrash(
   db: D1Database,
   alias: AliasRow,
   user: UserRow,
+  reason: number,
 ): Promise<void> {
-  if (await deleteIfCustomDomain(db, alias, user)) return;
+  if (await deleteIfCustomDomain(db, alias, user, reason)) return;
   await db
     .prepare(
       "UPDATE alias SET delete_on = ?1, delete_reason = ?2, enabled = 0, updated_at = ?3 WHERE id = ?4",
     )
-    .bind(toStr(addDays(new Date(), ALIAS_TRASH_DAYS)), 0, nowStr(), alias.id)
+    .bind(
+      toStr(addDays(new Date(), ALIAS_TRASH_DAYS)),
+      reason,
+      nowStr(),
+      alias.id,
+    )
     .run();
 }
 
-/** alias_delete.delete_alias — AliasDeleteReason.ManualAction. */
+/** alias_delete.delete_alias — trash vs hard-delete decision. */
 async function deleteAliasForUser(
   db: D1Database,
   alias: AliasRow,
   user: UserRow,
+  reason: number,
 ): Promise<void> {
   if (
     alias.delete_on !== null ||
     user.alias_delete_action === DELETE_IMMEDIATELY
   ) {
-    await performAliasDeletion(db, alias, user);
+    await performAliasDeletion(db, alias, user, reason);
   } else {
-    await moveAliasToTrash(db, alias, user);
+    await moveAliasToTrash(db, alias, user, reason);
   }
 }
 
@@ -969,6 +1012,21 @@ async function canCreateContactsWeb(
   return !envStr(env, "DISABLE_CREATE_CONTACTS_FOR_FREE_USERS");
 }
 
+/** contact_utils.__update_contact_if_needed (name only — mail_from is always
+ * null here): rename the existing contact before the "already added" error. */
+async function updateContactNameIfNeededWeb(
+  db: D1Database,
+  contact: ContactRow,
+  name: string | null,
+): Promise<void> {
+  if (name && contact.name !== name) {
+    await db
+      .prepare("UPDATE contact SET name = ?1, updated_at = ?2 WHERE id = ?3")
+      .bind(name, nowStr(), contact.id)
+      .run();
+  }
+}
+
 /** create_contact web wrapper — returns the row or a flashable error message. */
 async function createContactWeb(
   db: D1Database,
@@ -999,6 +1057,7 @@ async function createContactWeb(
     .bind(alias.id, email)
     .first<ContactRow>();
   if (existing) {
+    await updateContactNameIfNeededWeb(db, existing, name);
     return { error: `${existing.website_email} is already added` };
   }
 
@@ -1028,7 +1087,19 @@ async function createContactWeb(
     return { contact };
   } catch (e) {
     if (e instanceof Error && e.message.includes("UNIQUE constraint")) {
-      return { error: `${email} is already added` };
+      // IntegrityError path: fetch the winner and update its name too.
+      const winner = await db
+        .prepare(
+          "SELECT * FROM contact WHERE alias_id = ?1 AND website_email = ?2",
+        )
+        .bind(alias.id, email)
+        .first<ContactRow>();
+      if (winner) {
+        await updateContactNameIfNeededWeb(db, winner, name);
+        return { error: `${winner.website_email} is already added` };
+      }
+      // ContactCreateError.Unknown -> ErrAddressInvalid("Invalid address")
+      return { error: "Invalid address is not a valid email address" };
     }
     throw e;
   }
@@ -1164,7 +1235,7 @@ webAliasPagesRoutes.on(["GET", "POST"], "/", requireWebLogin, async (c) => {
         );
       }
       if (formName === "delete-alias") {
-        await deleteAliasForUser(db, alias, user);
+        await deleteAliasForUser(db, alias, user, REASON_MANUAL_ACTION);
         if (user.alias_delete_action !== DELETE_IMMEDIATELY) {
           await flash(
             c,
@@ -1481,14 +1552,18 @@ webAliasPagesRoutes.on(
     ctx.mailboxes = mailboxes.map((m) => ({ id: m.id, email: m.email }));
 
     const signedSuffix = formGet(body, "signed-alias-suffix");
-    const suffix = signedSuffix
-      ? await timestampUnsign(
-          customAliasSecret(c.env),
-          signedSuffix.trim(),
-          600,
-        )
-      : null;
-    if (suffix === null) {
+    // Flask: check_suffix_signature(None) raises a non-BadSignature exception
+    // (want_bytes(None)) caught by `except Exception` -> distinct flash.
+    if (signedSuffix === undefined) {
+      await flash(c, "Unknown error, refresh the page", "error");
+      return c.redirect(reqUrl(c), 302);
+    }
+    const suffix = await timestampUnsign(
+      customAliasSecret(c.env),
+      signedSuffix.trim(),
+      600,
+    );
+    if (!suffix) {
       await flash(c, "Alias creation time is expired, please retry", "warning");
       return c.redirect(reqUrl(c), 302);
     }
@@ -1625,10 +1700,20 @@ async function handleAliasLog(c: Ctx, pageId: number): Promise<Response> {
       }
     >();
 
-  // bounced_mailbox(): mailbox email or first verified alias mailbox (legacy)
-  const aliasMailboxes = await verifiedMailboxes(db, user.id);
-  const primaryMb = aliasMailboxes.find((m) => m.id === alias.mailbox_id);
-  const fallbackMailboxEmail = primaryMb?.email ?? "";
+  // bounced_mailbox() legacy fallback: contact.alias.mailboxes[0].email —
+  // Alias.mailboxes is primary + alias_mailbox rows, verified only, sorted
+  // alphabetically by email. Flask 500s (IndexError) when the list is empty;
+  // we render "" instead (documented Flask-500 -> clean deviation).
+  const fallbackMb = await db
+    .prepare(
+      `SELECT email FROM mailbox
+       WHERE verified = 1 AND (id = ?1 OR id IN
+         (SELECT mailbox_id FROM alias_mailbox WHERE alias_id = ?2))
+       ORDER BY email LIMIT 1`,
+    )
+    .bind(alias.mailbox_id, alias.id)
+    .first<{ email: string }>();
+  const fallbackMailboxEmail = fallbackMb?.email ?? "";
 
   const logs = await Promise.all(
     logRows.results.map(async (r) => {

@@ -8,6 +8,8 @@
  */
 
 import { env, SELF } from "cloudflare:test";
+import { hmac } from "@noble/hashes/hmac.js";
+import { sha3_224 } from "@noble/hashes/sha3.js";
 import { Secret, TOTP } from "otpauth";
 import { beforeEach, describe, expect, it } from "vitest";
 import { hashPassword } from "../src/lib/crypto";
@@ -97,6 +99,25 @@ function userRow(id: number): Promise<UserRow | null> {
     .first<UserRow>();
 }
 
+/**
+ * RecoveryCode._hash_code with the config.py fallback secret: base64url
+ * (no padding) of HMAC-SHA3-224 keyed on FLASK_SECRET + "generatearandomtoken"
+ * (RECOVERY_CODE_HMAC_SECRET is unset in tests).
+ */
+const RECOVERY_HMAC_SECRET = "test-flask-secretgeneratearandomtoken";
+
+function hashRecoveryCodeLikeFlask(raw: string): string {
+  const encoder = new TextEncoder();
+  const mac = hmac(
+    sha3_224,
+    encoder.encode(RECOVERY_HMAC_SECRET),
+    encoder.encode(raw),
+  );
+  let bin = "";
+  for (const b of mac) bin += String.fromCharCode(b);
+  return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
 beforeEach(() => {
   sentEmails.length = 0;
 });
@@ -114,6 +135,7 @@ describe("auth gating", () => {
       "/dashboard/notifications",
       "/dashboard/mfa_setup",
       "/dashboard/delete_account",
+      "/dashboard/alias_trash",
     ]) {
       const res = await get(path);
       expect(res.status).toBe(302);
@@ -231,7 +253,7 @@ describe("GET/POST /dashboard/setting", () => {
   });
 
   it("re-renders (200, no flash) when the profile did not change", async () => {
-    const user = await createUser(env.DB);
+    const user = await createUser(env.DB, { name: "" });
     const cookie = await webSession(user);
     const csrf = await getCsrf("/dashboard/setting", cookie);
     const res = await post("/dashboard/setting", cookie, {
@@ -242,6 +264,25 @@ describe("GET/POST /dashboard/setting", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).not.toContain("Your profile has been updated");
+  });
+
+  it("NULL name + empty post IS a change: writes '' and flashes (Flask parity)", async () => {
+    // setting.py L93: '' != None => commit + flash + 302
+    const user = await createUser(env.DB); // name stays NULL
+    expect(user.name).toBeNull();
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/setting", cookie);
+    const res = await post("/dashboard/setting", cookie, {
+      csrf_token: csrf,
+      "form-name": "update-profile",
+      name: "",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/setting");
+    expect((await userRow(user.id))?.name).toBe("");
+    expect(await flashes(cookie)).toEqual([
+      { category: "success", message: "Your profile has been updated" },
+    ]);
   });
 
   it("change-blocked-behaviour writes and falls through to a 200 render", async () => {
@@ -272,6 +313,72 @@ describe("GET/POST /dashboard/setting", () => {
     expect(await flashes(cookie)).toEqual([
       { category: "error", message: "Invalid value" },
     ]);
+  });
+
+  it("random-alias-suffix rejects int()-invalid literals ('1e0') without a write", async () => {
+    // Number('1e0') === 1, but Flask's int('1e0') raises ValueError =>
+    // flash 'Invalid value', no DB write (setting.py L161-164).
+    const user = await createUser(env.DB);
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/setting", cookie);
+    const res = await post("/dashboard/setting", cookie, {
+      csrf_token: csrf,
+      "form-name": "random-alias-suffix",
+      "random-alias-suffix-generator": "1e0",
+    });
+    expect(res.status).toBe(302);
+    expect((await userRow(user.id))?.random_alias_suffix).toBe(
+      user.random_alias_suffix,
+    );
+    expect(await flashes(cookie)).toEqual([
+      { category: "error", message: "Invalid value" },
+    ]);
+  });
+
+  it("random-alias-suffix 500s when the field is missing (int(None) TypeError)", async () => {
+    const user = await createUser(env.DB);
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/setting", cookie);
+    const res = await post("/dashboard/setting", cookie, {
+      csrf_token: csrf,
+      "form-name": "random-alias-suffix",
+    });
+    expect(res.status).toBe(500);
+    expect((await userRow(user.id))?.random_alias_suffix).toBe(
+      user.random_alias_suffix,
+    );
+  });
+
+  it("change-alias-generator 500s on int()-invalid literals ('0x2') without a write", async () => {
+    // Number('0x2') === 2 would pass the enum check; Flask int('0x2')
+    // raises ValueError => 500, no DB write (setting.py L142).
+    const user = await createUser(env.DB);
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/setting", cookie);
+    const res = await post("/dashboard/setting", cookie, {
+      csrf_token: csrf,
+      "form-name": "change-alias-generator",
+      "alias-generator-scheme": "0x2",
+    });
+    expect(res.status).toBe(500);
+    expect((await userRow(user.id))?.alias_generator).toBe(
+      user.alias_generator,
+    );
+    expect(await flashes(cookie)).toEqual([]);
+  });
+
+  it("change-sender-format 500s on int()-invalid literals ('1e0') without a write", async () => {
+    const user = await createUser(env.DB);
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/setting", cookie);
+    const res = await post("/dashboard/setting", cookie, {
+      csrf_token: csrf,
+      "form-name": "change-sender-format",
+      "sender-format": "1e0",
+    });
+    expect(res.status).toBe(500);
+    expect((await userRow(user.id))?.sender_format).toBe(user.sender_format);
+    expect(await flashes(cookie)).toEqual([]);
   });
 
   it("data breach monitoring is premium-gated", async () => {
@@ -573,6 +680,16 @@ describe("POST /dashboard/unlink_proton_account", () => {
       .bind(user.id)
       .first();
     expect(pu).toBeNull();
+    // proton_unlink.py L27-31: audit message carries the partner detail.
+    const audit = await env.DB.prepare(
+      "SELECT action, message FROM user_audit_log WHERE user_id = ?1",
+    )
+      .bind(user.id)
+      .first<{ action: string; message: string }>();
+    expect(audit?.action).toBe("unlink_account");
+    expect(audit?.message).toBe(
+      "User has unlinked the account (email=p@proton.me | external_user_id=ext-1)",
+    );
     expect((await flashes(cookie)).pop()?.message).toBe(
       "Your Proton account has been unlinked",
     );
@@ -829,6 +946,20 @@ describe("GET/POST /dashboard/mfa_setup", () => {
       .bind(user.id)
       .first<{ n: number }>();
     expect(codes?.n).toBe(8);
+
+    // Stored hashes must match Flask's HMAC-SHA3-224 keyed on the
+    // FLASK_SECRET + "generatearandomtoken" fallback (config.py L605-606).
+    const rawCodes = [...html.matchAll(/<li>([a-z]{8})<\/li>/g)].map(
+      (m) => m[1],
+    );
+    const stored = await env.DB.prepare(
+      "SELECT code FROM recovery_code WHERE user_id = ?1",
+    )
+      .bind(user.id)
+      .all<{ code: string }>();
+    expect(stored.results.map((r) => r.code).sort()).toEqual(
+      rawCodes.map(hashRecoveryCodeLikeFlask).sort(),
+    );
   });
 
   it("flashes Incorrect token on a bad code", async () => {
@@ -1094,6 +1225,17 @@ describe("notification pages", () => {
     expect(html).toContain("Second");
     expect(html).toContain("More ➡");
   });
+
+  it("?page=1x falls back to page 0 (int() ValueError, Flask parity)", async () => {
+    // parseInt('1x') === 1 would render the (empty) second page; Flask's
+    // int('1x') raises ValueError and keeps page 0 (notification.py L44-49).
+    const user = await createUser(env.DB);
+    await makeNotification(user.id, "OnlyOne", "m1");
+    const cookie = await webSession(user);
+    const res = await get("/dashboard/notifications?page=1x", cookie);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("OnlyOne");
+  });
 });
 
 // --------------------------------------------------------------------------
@@ -1242,6 +1384,17 @@ describe("unsubscribe + block_contact", () => {
     expect((await flashes(cookie)).pop()?.message).toBe(
       `Emails sent from ${contact.website_email} are now blocked`,
     );
+    // contact_utils.py L154: contact.email (== website_email) in BOTH slots,
+    // never the reverse-alias (reply_email).
+    const audit = await env.DB.prepare(
+      "SELECT action, message FROM alias_audit_log WHERE alias_id = ?1",
+    )
+      .bind(alias.id)
+      .first<{ action: string; message: string }>();
+    expect(audit?.action).toBe("update_contact");
+    expect(audit?.message).toBe(
+      `Set contact state ${contact.id} ${contact.website_email} -> ${contact.website_email} to blocked True`,
+    );
   });
 
   it("block_contact on an already-blocked contact redirects without a flash", async () => {
@@ -1276,5 +1429,243 @@ describe("unsubscribe + block_contact", () => {
       category: "error",
       message: "Invalid unsubscribe request",
     });
+  });
+});
+
+// --------------------------------------------------------------------------
+// 18. /dashboard/alias_trash
+// --------------------------------------------------------------------------
+
+describe("GET/POST /dashboard/alias_trash", () => {
+  function trashAlias(
+    userId: number,
+    mailboxId: number,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return createAlias(env.DB, userId, mailboxId, {
+      delete_on: "2030-01-01 00:00:00+00:00",
+      delete_reason: 2, // AliasDeleteReason.ManualAction
+      enabled: 0,
+      ...overrides,
+    });
+  }
+
+  function aliasRow(id: number) {
+    return env.DB.prepare("SELECT * FROM alias WHERE id = ?1").bind(id).first<{
+      delete_on: string | null;
+      delete_reason: number | null;
+      enabled: number;
+    }>();
+  }
+
+  it("GET lists trashed aliases with the count", async () => {
+    const user = await createUser(env.DB);
+    const mb = user.default_mailbox_id as number;
+    const trashed = await trashAlias(user.id, mb);
+    const active = await createAlias(env.DB, user.id, mb);
+    const cookie = await webSession(user);
+    const res = await get("/dashboard/alias_trash", cookie);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("1 Deleted alias");
+    expect(html).toContain(trashed.email);
+    expect(html).not.toContain(active.email); // active aliases stay hidden
+  });
+
+  it("?page=1x falls back to page 0 (int() ValueError, Flask parity)", async () => {
+    const user = await createUser(env.DB);
+    const trashed = await trashAlias(
+      user.id,
+      user.default_mailbox_id as number,
+    );
+    const cookie = await webSession(user);
+    const res = await get("/dashboard/alias_trash?page=1x", cookie);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(trashed.email);
+  });
+
+  it("restore-one restores the alias, audit-logs it and 200-renders the flash", async () => {
+    const user = await createUser(env.DB);
+    const trashed = await trashAlias(
+      user.id,
+      user.default_mailbox_id as number,
+    );
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/alias_trash", cookie);
+    const res = await post("/dashboard/alias_trash", cookie, {
+      csrf_token: csrf,
+      action: "restore-one",
+      alias_id: String(trashed.id),
+    });
+    expect(res.status).toBe(200); // Flask falls through to the render
+    expect(await res.text()).toContain("Restored alias");
+    const fresh = await aliasRow(trashed.id);
+    expect(fresh?.delete_on).toBeNull();
+    expect(fresh?.delete_reason).toBeNull();
+    expect(fresh?.enabled).toBe(1);
+    const audit = await env.DB.prepare(
+      "SELECT action, message FROM alias_audit_log WHERE alias_id = ?1",
+    )
+      .bind(trashed.id)
+      .first<{ action: string; message: string }>();
+    expect(audit?.action).toBe("restored_alias");
+    expect(audit?.message).toBe(`Restored alias ${trashed.id} from trash`);
+  });
+
+  it("restore-one still flashes success for an unknown/foreign alias (Flask parity)", async () => {
+    const other = await createUser(env.DB);
+    const theirs = await trashAlias(
+      other.id,
+      other.default_mailbox_id as number,
+    );
+    const user = await createUser(env.DB);
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/alias_trash", cookie);
+    const res = await post("/dashboard/alias_trash", cookie, {
+      csrf_token: csrf,
+      action: "restore-one",
+      alias_id: String(theirs.id),
+    });
+    expect(res.status).toBe(200);
+    // restore_alias returns None and alias_trash.py L41 flashes anyway
+    expect(await res.text()).toContain("Restored alias");
+    expect((await aliasRow(theirs.id))?.delete_on).not.toBeNull();
+  });
+
+  it("restore-one flashes the quota error for capped free users", async () => {
+    // MAX_NB_EMAIL_FREE_PLAN=3 in tests; trial does NOT lift the alias cap
+    const user = await createUser(env.DB);
+    const mb = user.default_mailbox_id as number;
+    for (let i = 0; i < 3; i++) await createAlias(env.DB, user.id, mb);
+    const trashed = await trashAlias(user.id, mb);
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/alias_trash", cookie);
+    const res = await post("/dashboard/alias_trash", cookie, {
+      csrf_token: csrf,
+      action: "restore-one",
+      alias_id: String(trashed.id),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      "You do not have enough quota to restore this alias",
+    );
+    expect((await aliasRow(trashed.id))?.delete_on).not.toBeNull();
+  });
+
+  it("restore-all restores every trashed alias and counts them", async () => {
+    const user = await createUser(env.DB);
+    const mb = user.default_mailbox_id as number;
+    const t1 = await trashAlias(user.id, mb);
+    const t2 = await trashAlias(user.id, mb);
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/alias_trash", cookie);
+    const res = await post("/dashboard/alias_trash", cookie, {
+      csrf_token: csrf,
+      action: "restore-all",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Restored 2 aliases");
+    expect((await aliasRow(t1.id))?.delete_on).toBeNull();
+    expect((await aliasRow(t2.id))?.delete_on).toBeNull();
+  });
+
+  it("restore-all flashes the quota error when the batch exceeds the cap", async () => {
+    const user = await createUser(env.DB);
+    const mb = user.default_mailbox_id as number;
+    await createAlias(env.DB, user.id, mb);
+    await createAlias(env.DB, user.id, mb);
+    const t1 = await trashAlias(user.id, mb);
+    const t2 = await trashAlias(user.id, mb); // 2 active + 2 to restore > 3
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/alias_trash", cookie);
+    const res = await post("/dashboard/alias_trash", cookie, {
+      csrf_token: csrf,
+      action: "restore-all",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      "You do not have enough quota to restore all aliases",
+    );
+    expect((await aliasRow(t1.id))?.delete_on).not.toBeNull();
+    expect((await aliasRow(t2.id))?.delete_on).not.toBeNull();
+  });
+
+  it("trash-all permanently deletes trashed aliases into deleted_alias + audit log", async () => {
+    const user = await createUser(env.DB);
+    const mb = user.default_mailbox_id as number;
+    const t1 = await trashAlias(user.id, mb);
+    const t2 = await trashAlias(user.id, mb);
+    const active = await createAlias(env.DB, user.id, mb);
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/alias_trash", cookie);
+    const res = await post("/dashboard/alias_trash", cookie, {
+      csrf_token: csrf,
+      action: "trash-all",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Deleted 2 aliases");
+    expect(await aliasRow(t1.id)).toBeNull();
+    expect(await aliasRow(t2.id)).toBeNull();
+    expect(await aliasRow(active.id)).not.toBeNull(); // untouched
+    for (const t of [t1, t2]) {
+      const tomb = await env.DB.prepare(
+        "SELECT reason FROM deleted_alias WHERE email = ?1",
+      )
+        .bind(t.email)
+        .first<{ reason: number }>();
+      expect(tomb?.reason).toBe(2); // alias.delete_reason carried over
+      const audit = await env.DB.prepare(
+        "SELECT action, message FROM alias_audit_log WHERE alias_id = ?1",
+      )
+        .bind(t.id)
+        .first<{ action: string; message: string }>();
+      expect(audit?.action).toBe("delete");
+      expect(audit?.message).toBe("Alias deleted by user action");
+    }
+  });
+
+  it("rejects CSRF failures and non-integer alias ids with Invalid request", async () => {
+    const user = await createUser(env.DB);
+    const trashed = await trashAlias(
+      user.id,
+      user.default_mailbox_id as number,
+    );
+    const cookie = await webSession(user);
+
+    let res = await post("/dashboard/alias_trash", cookie, {
+      action: "trash-all",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/alias_trash");
+    expect((await flashes(cookie)).pop()).toEqual({
+      category: "warning",
+      message: "Invalid request",
+    });
+
+    // IntegerField coercion failure => form.validate() false
+    const csrf = await getCsrf("/dashboard/alias_trash", cookie);
+    res = await post("/dashboard/alias_trash", cookie, {
+      csrf_token: csrf,
+      action: "restore-one",
+      alias_id: "abc",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/alias_trash");
+    expect((await flashes(cookie)).pop()).toEqual({
+      category: "warning",
+      message: "Invalid request",
+    });
+    expect((await aliasRow(trashed.id))?.delete_on).not.toBeNull();
+  });
+
+  it("restore-one 500s when alias_id is missing (int(None) TypeError parity)", async () => {
+    const user = await createUser(env.DB);
+    const cookie = await webSession(user);
+    const csrf = await getCsrf("/dashboard/alias_trash", cookie);
+    const res = await post("/dashboard/alias_trash", cookie, {
+      csrf_token: csrf,
+      action: "restore-one",
+    });
+    expect(res.status).toBe(500);
   });
 });

@@ -12,7 +12,12 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { generateVerpEmail, handleEmail, outboundEmails } from "../src/email";
+import {
+  generateVerpEmail,
+  handleEmail,
+  outboundEmails,
+  replaceInMimeBody,
+} from "../src/email";
 import type { Env } from "../src/lib/env";
 import { sentEmails } from "../src/lib/mailer";
 import type {
@@ -115,6 +120,40 @@ function rawHeader(raw: string, name: string): string | null {
 
 /** Escape a domain for use inside a RegExp. */
 const reDomain = (d: string) => d.replace(/\./g, "\\.");
+
+/** Body of a serialized message (everything after the first blank line). */
+function bodyOf(raw: string): string {
+  const idx = raw.indexOf("\r\n\r\n");
+  return idx === -1 ? "" : raw.slice(idx + 4);
+}
+
+/** Raw MIME parts of a multipart section (excludes preamble/epilogue). */
+function mimeParts(section: string, boundary: string): string[] {
+  const segments = section.split(`--${boundary}`);
+  const parts: string[] = [];
+  for (let i = 1; i < segments.length; i++) {
+    if (segments[i].startsWith("--")) break; // closing delimiter
+    parts.push(segments[i]);
+  }
+  return parts;
+}
+
+/** Body of a single MIME part (everything after its header block). */
+function partBody(part: string): string {
+  const idx = part.indexOf("\r\n\r\n");
+  return idx === -1 ? "" : part.slice(idx + 4);
+}
+
+function decodeQpText(s: string): string {
+  return s
+    .replace(/=\r\n/g, "")
+    .replace(/=\n/g, "")
+    .replace(/=([0-9A-Fa-f]{2})/g, (_m, h: string) =>
+      String.fromCharCode(Number.parseInt(h, 16)),
+    );
+}
+
+const decodeB64Text = (s: string): string => atob(s.replace(/\s+/g, ""));
 
 async function deliver(message: MockMessage, testEnv: Env = env) {
   const ctx = createExecutionContext();
@@ -1379,6 +1418,232 @@ describe("reply phase", () => {
         contact.id,
       ),
     ).toBe(0);
+  });
+});
+
+// =================== reply phase reverse-alias replacement ================
+
+/** Enable the user's replace_reverse_alias flag (default off). */
+async function enableReplaceReverseAlias(userId: number): Promise<void> {
+  await env.DB.prepare(
+    "UPDATE users SET replace_reverse_alias = 1 WHERE id = ?1",
+  )
+    .bind(userId)
+    .run();
+}
+
+describe("reply phase reverse-alias replacement", () => {
+  it("replaces the reverse alias and mailbox in a plain 7bit reply body", async () => {
+    const { user, alias, contact } = await replySetup();
+    await enableReplaceReverseAlias(user.id);
+    const { testEnv } = envWithSendMock();
+    const body =
+      `On Mon, 1 Jan 2025, Friend <${contact.reply_email}> wrote:\r\n` +
+      "> earlier message\r\n" +
+      `Replying from ${user.email}.\r\n`;
+    const msg = makeMessage({
+      from: user.email,
+      to: contact.reply_email,
+      raw: buildRaw(
+        [
+          ["From", user.email],
+          ["To", contact.reply_email],
+          ["Subject", "Re: hello"],
+          ["Content-Type", "text/plain"],
+        ],
+        body,
+      ),
+    });
+    await deliver(msg, testEnv);
+
+    const out = outboundEmails.at(-1);
+    expect(out).toBeDefined();
+    const outBody = bodyOf(out?.raw ?? "");
+    // reverse alias -> contact real address, mailbox -> alias
+    expect(outBody).toContain(contact.website_email);
+    expect(outBody).toContain(alias.email);
+    expect(outBody).not.toContain(contact.reply_email);
+    expect(outBody).not.toContain(user.email);
+    // never leaks anywhere in the delivered message
+    expect(out?.raw).not.toContain(contact.reply_email);
+    expect(out?.raw).not.toContain(user.email);
+  });
+
+  it("replaces a reverse alias split across a quoted-printable soft line break", async () => {
+    const { user, alias, contact } = await replySetup();
+    await enableReplaceReverseAlias(user.id);
+    const { testEnv } = envWithSendMock();
+    const ra = contact.reply_email;
+    const split = `${ra.slice(0, 6)}=\r\n${ra.slice(6)}`; // spans a QP soft break
+    const body = `On Mon, Friend <${split}> wrote:\r\nsent from ${user.email}\r\n`;
+    const msg = makeMessage({
+      from: user.email,
+      to: contact.reply_email,
+      raw: buildRaw(
+        [
+          ["From", user.email],
+          ["To", contact.reply_email],
+          ["Subject", "Re: qp"],
+          ["Content-Type", "text/plain; charset=utf-8"],
+          ["Content-Transfer-Encoding", "quoted-printable"],
+        ],
+        body,
+      ),
+    });
+    await deliver(msg, testEnv);
+
+    const out = outboundEmails.at(-1);
+    const outBody = bodyOf(out?.raw ?? "");
+    const decoded = decodeQpText(outBody);
+    expect(decoded).toContain(contact.website_email);
+    expect(decoded).toContain(alias.email);
+    expect(decoded).not.toContain(ra);
+    expect(decoded).not.toContain(user.email);
+    // output is still valid QP: no line exceeds 76 columns
+    for (const line of outBody.split("\r\n"))
+      expect(line.length).toBeLessThanOrEqual(76);
+  });
+
+  it("replaces in every text part of a multipart reply, leaving attachments intact", async () => {
+    const { user, alias, contact } = await replySetup();
+    await enableReplaceReverseAlias(user.id);
+    const { testEnv } = envWithSendMock();
+    const ra = contact.reply_email;
+    const splitRa = `${ra.slice(0, 6)}=\r\n${ra.slice(6)}`;
+    const html = `<p>Reply to <a href="mailto:${ra}">${ra}</a> - mailbox ${user.email}</p>`;
+    const htmlB64 = btoa(html);
+    // 1x1 PNG; passes through untouched (application/octet-stream).
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const mpBody =
+      "This is a MIME multipart message.\r\n" +
+      "--OUTER\r\n" +
+      'Content-Type: multipart/alternative; boundary="INNER"\r\n\r\n' +
+      "--INNER\r\n" +
+      "Content-Type: text/plain; charset=utf-8\r\n" +
+      "Content-Transfer-Encoding: quoted-printable\r\n\r\n" +
+      `On Mon, Friend <${splitRa}> wrote:\r\nsent from ${user.email}\r\n` +
+      "--INNER\r\n" +
+      "Content-Type: text/html; charset=utf-8\r\n" +
+      "Content-Transfer-Encoding: base64\r\n\r\n" +
+      `${htmlB64}\r\n` +
+      "--INNER--\r\n" +
+      "--OUTER\r\n" +
+      'Content-Type: application/octet-stream; name="logo.png"\r\n' +
+      "Content-Transfer-Encoding: base64\r\n" +
+      'Content-Disposition: attachment; filename="logo.png"\r\n\r\n' +
+      `${png}\r\n` +
+      "--OUTER--\r\n";
+    const msg = makeMessage({
+      from: user.email,
+      to: contact.reply_email,
+      raw: buildRaw(
+        [
+          ["From", user.email],
+          ["To", contact.reply_email],
+          ["Subject", "Re: multipart"],
+          ["MIME-Version", "1.0"],
+          ["Content-Type", 'multipart/mixed; boundary="OUTER"'],
+        ],
+        mpBody,
+      ),
+    });
+    await deliver(msg, testEnv);
+
+    const raw = outboundEmails.at(-1)?.raw ?? "";
+    // reverse alias and mailbox gone from the whole message (base64 part too)
+    expect(raw).not.toContain(ra);
+    expect(raw).not.toContain(user.email);
+    // boundaries intact (2 openers + closing "--OUTER--"/"--INNER--" each)
+    expect(raw.split("--OUTER").length - 1).toBe(3);
+    expect(raw.split("--INNER").length - 1).toBe(3);
+    expect(raw).toContain("--OUTER--");
+    expect(raw).toContain("--INNER--");
+    // attachment byte-identical
+    expect(raw).toContain(`${png}\r\n`);
+
+    const outerParts = mimeParts(bodyOf(raw), "OUTER");
+    expect(outerParts).toHaveLength(2);
+    const innerParts = mimeParts(partBody(outerParts[0]), "INNER");
+    expect(innerParts).toHaveLength(2);
+
+    const plain = decodeQpText(partBody(innerParts[0]));
+    expect(plain).toContain(contact.website_email);
+    expect(plain).toContain(alias.email);
+    expect(plain).not.toContain(ra);
+    expect(plain).not.toContain(user.email);
+
+    const htmlOut = decodeB64Text(partBody(innerParts[1]));
+    expect(htmlOut).toContain(contact.website_email);
+    expect(htmlOut).toContain(alias.email);
+    expect(htmlOut).not.toContain(ra);
+    expect(htmlOut).not.toContain(user.email);
+  });
+
+  it("leaves the body byte-identical when replace_reverse_alias is off", async () => {
+    const { user, contact } = await replySetup(); // flag defaults to 0
+    const { testEnv } = envWithSendMock();
+    const body = `Quoting <${contact.reply_email}> and mailbox ${user.email} here.\r\n`;
+    const msg = makeMessage({
+      from: user.email,
+      to: contact.reply_email,
+      raw: buildRaw(
+        [
+          ["From", user.email],
+          ["To", contact.reply_email],
+          ["Subject", "Re: off"],
+          ["Content-Type", "text/plain"],
+        ],
+        body,
+      ),
+    });
+    await deliver(msg, testEnv);
+
+    const out = outboundEmails.at(-1);
+    expect(bodyOf(out?.raw ?? "")).toBe(body);
+    expect(out?.raw).toContain(contact.reply_email);
+    expect(out?.raw).toContain(user.email);
+  });
+});
+
+describe("replaceInMimeBody", () => {
+  it("returns the body unchanged for malformed multipart (boundary never appears)", () => {
+    const headers = [
+      { name: "Content-Type", value: 'multipart/mixed; boundary="NOPE"' },
+    ];
+    const body = new TextEncoder().encode(
+      "write to secret@reverse.example - no boundary here\r\n",
+    );
+    const out = replaceInMimeBody(headers, body, [
+      ["secret@reverse.example", "real@person.example"],
+    ]);
+    expect(new TextDecoder().decode(out)).toBe(
+      "write to secret@reverse.example - no boundary here\r\n",
+    );
+  });
+
+  it("passes a non-text part through untouched", () => {
+    const headers = [{ name: "Content-Type", value: "application/pdf" }];
+    const body = new TextEncoder().encode("secret@reverse.example inside\r\n");
+    const out = replaceInMimeBody(headers, body, [
+      ["secret@reverse.example", "real@person.example"],
+    ]);
+    expect(new TextDecoder().decode(out)).toBe(
+      "secret@reverse.example inside\r\n",
+    );
+  });
+
+  it("replaces in a text/plain leaf with no explicit encoding", () => {
+    const headers = [{ name: "Content-Type", value: "text/plain" }];
+    const body = new TextEncoder().encode(
+      "write to secret@reverse.example please\r\n",
+    );
+    const out = replaceInMimeBody(headers, body, [
+      ["secret@reverse.example", "real@person.example"],
+    ]);
+    expect(new TextDecoder().decode(out)).toBe(
+      "write to real@person.example please\r\n",
+    );
   });
 });
 

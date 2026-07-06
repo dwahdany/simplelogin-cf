@@ -188,6 +188,20 @@ describe("index page (GET)", () => {
     expect(html).toContain(disabled.email);
     expect(html).not.toContain(`id="alias-container-${enabled.id}"`);
   });
+
+  it("ignores filter=mailbox:0 and filter=directory:0 (falsy ids)", async () => {
+    const s = await webSession();
+    const alias = await createAlias(
+      env.DB,
+      s.user.id,
+      s.user.default_mailbox_id as number,
+    );
+    for (const filter of ["mailbox:0", "directory:0"]) {
+      const res = await get(`/dashboard/?filter=${filter}`, s.cookie);
+      expect(res.status, filter).toBe(200);
+      expect(await res.text(), filter).toContain(alias.email);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -274,6 +288,8 @@ describe("index page (POST)", () => {
     const row = await aliasRow(alias.id);
     expect(row?.delete_on).not.toBeNull();
     expect(row?.enabled).toBe(0);
+    // AliasDeleteReason.ManualAction
+    expect(row?.delete_reason).toBe(2);
     const f = await flashes(s.token);
     expect(f[0].message).toBe(
       `Alias ${alias.email} has been moved to the trash`,
@@ -297,10 +313,40 @@ describe("index page (POST)", () => {
       "SELECT * FROM deleted_alias WHERE email = ?1",
     )
       .bind(alias.email)
-      .first();
+      .first<{ reason: number }>();
     expect(deleted).not.toBeNull();
+    // AliasDeleteReason.ManualAction
+    expect(deleted?.reason).toBe(2);
     const f = await flashes(s.token);
     expect(f[0].message).toBe(`Alias ${alias.email} has been deleted`);
+  });
+
+  it("records ManualAction in domain_deleted_alias for custom-domain aliases", async () => {
+    const s = await webSession();
+    const cd = await env.DB.prepare(
+      "INSERT INTO custom_domain (user_id, domain, verified, ownership_verified) VALUES (?1, ?2, 1, 1) RETURNING id",
+    )
+      .bind(s.user.id, `del-${s.user.id}.example`)
+      .first<{ id: number }>();
+    const alias = await createAlias(
+      env.DB,
+      s.user.id,
+      s.user.default_mailbox_id as number,
+      { custom_domain_id: cd?.id },
+    );
+    await post("/dashboard/", s.cookie, {
+      "form-name": "delete-alias",
+      "alias-id": String(alias.id),
+      csrf_token: s.csrf,
+    });
+    expect(await aliasRow(alias.id)).toBeNull();
+    const dda = await env.DB.prepare(
+      "SELECT reason FROM domain_deleted_alias WHERE email = ?1 AND domain_id = ?2",
+    )
+      .bind(alias.email, cd?.id)
+      .first<{ reason: number }>();
+    // AliasDeleteReason.ManualAction
+    expect(dda?.reason).toBe(2);
   });
 
   it("disables an alias", async () => {
@@ -532,6 +578,73 @@ describe("custom alias page", () => {
     });
   });
 
+  it("flashes 'Unknown error, refresh the page' when the signed suffix field is missing", async () => {
+    await seedPublicDomain();
+    const s = await webSession();
+    const res = await post("/dashboard/custom_alias", s.cookie, {
+      prefix: "hello",
+      mailboxes: [String(s.user.default_mailbox_id)],
+      csrf_token: s.csrf,
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/custom_alias");
+    const f = await flashes(s.token);
+    expect(f[0]).toEqual({
+      category: "error",
+      message: "Unknown error, refresh the page",
+    });
+  });
+
+  it("flashes email-validator's message for a prefix starting with a period", async () => {
+    await seedPublicDomain();
+    const s = await webSession();
+    const signed = await timestampSign(
+      `${FLASK_SECRET}custom_alias`,
+      ".word@sl.example.com",
+    );
+    const res = await post("/dashboard/custom_alias", s.cookie, {
+      prefix: ".abc",
+      "signed-alias-suffix": signed,
+      mailboxes: [String(s.user.default_mailbox_id)],
+      csrf_token: s.csrf,
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/custom_alias");
+    const f = await flashes(s.token);
+    expect(f[0]).toEqual({
+      category: "error",
+      message: "An email address cannot start with a period.",
+    });
+  });
+
+  it("flashes email-validator's message for a prefix ending with a period", async () => {
+    const s = await webSession();
+    const domain = `cd${s.user.id}.example`;
+    await env.DB.prepare(
+      "INSERT INTO custom_domain (user_id, domain, verified, ownership_verified) VALUES (?1, ?2, 1, 1)",
+    )
+      .bind(s.user.id, domain)
+      .run();
+    const signed = await timestampSign(
+      `${FLASK_SECRET}custom_alias`,
+      `@${domain}`,
+    );
+    const res = await post("/dashboard/custom_alias", s.cookie, {
+      prefix: "abc.",
+      "signed-alias-suffix": signed,
+      mailboxes: [String(s.user.default_mailbox_id)],
+      csrf_token: s.csrf,
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/custom_alias");
+    const f = await flashes(s.token);
+    expect(f[0]).toEqual({
+      category: "error",
+      message:
+        "An email address cannot have a period immediately before the @-sign.",
+    });
+  });
+
   it("re-renders (200) when the alias already belongs to the user", async () => {
     await seedPublicDomain();
     const s = await webSession();
@@ -597,6 +710,34 @@ describe("alias log", () => {
     // paginated variant also works
     const res2 = await get(`/dashboard/alias_log/${alias.id}/0`, s.cookie);
     expect(res2.status).toBe(200);
+  });
+
+  it("falls back to the alphabetically-first verified alias mailbox for legacy bounces", async () => {
+    const s = await webSession();
+    const alias = await createAlias(
+      env.DB,
+      s.user.id,
+      s.user.default_mailbox_id as number,
+    );
+    // secondary alias mailbox that sorts before the primary (user...@example.com)
+    const mb2 = await createMailbox(
+      env.DB,
+      s.user.id,
+      `aaa-second-${s.user.id}@example.com`,
+    );
+    await env.DB.prepare(
+      "INSERT INTO alias_mailbox (alias_id, mailbox_id) VALUES (?1, ?2)",
+    )
+      .bind(alias.id, mb2.id)
+      .run();
+    const contact = await createContact(env.DB, s.user.id, alias.id);
+    // legacy row: bounced without bounced_mailbox_id
+    await createEmailLog(env.DB, s.user.id, contact.id, { bounced: 1 });
+
+    const res = await get(`/dashboard/alias_log/${alias.id}`, s.cookie);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(mb2.email);
   });
 
   it("redirects with a flash for someone else's alias", async () => {
@@ -988,6 +1129,39 @@ describe("alias contact manager", () => {
       category: "error",
       message: "dup@example.net is already added",
     });
+  });
+
+  it("updates the contact name when re-adding an existing address with a new name", async () => {
+    const s = await webSession();
+    const alias = await createAlias(
+      env.DB,
+      s.user.id,
+      s.user.default_mailbox_id as number,
+    );
+    const contact = await createContact(env.DB, s.user.id, alias.id, {
+      website_email: "dupname@example.net",
+      name: "Old Name",
+    });
+    const res = await post(
+      `/dashboard/alias_contact_manager/${alias.id}`,
+      s.cookie,
+      {
+        "form-name": "create",
+        email: "New Name <dupname@example.net>",
+        csrf_token: s.csrf,
+      },
+    );
+    expect(res.status).toBe(302);
+    const f = await flashes(s.token);
+    expect(f[0]).toEqual({
+      category: "error",
+      message: "dupname@example.net is already added",
+    });
+    // __update_contact_if_needed renames the contact before erroring
+    const row = await env.DB.prepare("SELECT name FROM contact WHERE id = ?1")
+      .bind(contact.id)
+      .first<{ name: string }>();
+    expect(row?.name).toBe("New Name");
   });
 
   it("deletes a contact", async () => {

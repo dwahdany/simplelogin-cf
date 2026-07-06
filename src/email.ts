@@ -1376,12 +1376,25 @@ async function handleReplyPhase(
 
   await replaceOriginalMessageId(db, alias, emailLog, hs);
 
+  // Replace the reverse-alias and mailbox addresses in the body by the
+  // contact's real address and the alias (email_handler.py: the reverse alias
+  // is usually quoted when replying). Config-gated ENABLE_ALL_REVERSE_ALIAS_
+  // REPLACEMENT (replacing every contact's reverse alias) is off upstream, so
+  // it is intentionally not ported here.
+  let outBody = body;
+  if (user.replace_reverse_alias) {
+    outBody = replaceInMimeBody(hs, body, [
+      [contact.reply_email, contact.website_email],
+      [mailbox.email, alias.email],
+    ]);
+  }
+
   if (!getHeader(hs, "Date"))
     setHeader(hs, "Date", formatDateRfc2822(new Date()));
   setHeader(hs, "X-SimpleLogin-Type", "Reply");
   setHeader(hs, "X-SimpleLogin-EmailLog-ID", String(emailLog.id));
 
-  const rawOut = serializeMessage(hs, body);
+  const rawOut = serializeMessage(hs, outBody);
   const verpFrom = await generateVerpEmail(
     env,
     VERP_TYPE_BOUNCE_REPLY,
@@ -1399,7 +1412,7 @@ async function handleReplyPhase(
         env,
         alias,
         hs,
-        body,
+        outBody,
         origTo,
         origCc,
         mb,
@@ -2013,7 +2026,7 @@ function extractFromHeaderAddress(raw: Uint8Array): string | null {
 
 // ======================== raw message / header tools ======================
 
-interface HeaderLine {
+export interface HeaderLine {
   name: string;
   value: string;
 }
@@ -2066,6 +2079,7 @@ async function readAll(
 function splitRawMessage(bytes: Uint8Array): {
   headerText: string;
   body: Uint8Array;
+  bodyStart: number;
 } {
   let headerEnd = bytes.length;
   let bodyStart = bytes.length;
@@ -2085,6 +2099,7 @@ function splitRawMessage(bytes: Uint8Array): {
   return {
     headerText: new TextDecoder().decode(bytes.slice(0, headerEnd)),
     body: bytes.slice(bodyStart),
+    bodyStart,
   };
 }
 
@@ -2145,6 +2160,464 @@ function getHeaderValue(headers: Headers, name: string): string | null {
   if (value === null) return null;
   // sanitize_header: strip, \n -> " ", drop \r
   return value.trim().replaceAll("\n", " ").replaceAll("\r", "");
+}
+
+// ================= reverse-alias body replacement =========================
+// Port of app/email_utils.py `replace(msg, old, new)`, invoked by the reply
+// phase when the user enabled `replace_reverse_alias`: the reverse-alias
+// address and the mailbox address (both commonly quoted when a user replies)
+// are swapped for the contact's real address and the alias address in the
+// message body. We walk the MIME tree, transfer-decode each text/plain and
+// text/html leaf per its Content-Transfer-Encoding, apply the substitutions,
+// and re-encode with the same CTE. The set of content types touched vs. left
+// alone is copied verbatim from email_utils.replace(). Any non-text part and
+// any structure we can't parse is returned byte-for-byte unchanged so we never
+// corrupt mail.
+
+type Replacement = [string, string];
+
+const B64_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_LOOKUP: Int8Array = (() => {
+  const t = new Int8Array(256).fill(-1);
+  for (let i = 0; i < B64_ALPHABET.length; i++)
+    t[B64_ALPHABET.charCodeAt(i)] = i;
+  return t;
+})();
+const HEX_DIGITS = "0123456789ABCDEF";
+
+/**
+ * Apply `replacements` (each `[old, new]`; addresses are ASCII) to the decoded
+ * text of a MIME message described by its top-level `headers` and raw `body`
+ * bytes. Mirrors email_utils.replace(): the same content types are rewritten,
+ * skipped, or recursed into, and each text leaf is decoded/replaced/re-encoded
+ * per its Content-Transfer-Encoding.
+ */
+export function replaceInMimeBody(
+  headers: HeaderLine[],
+  body: Uint8Array,
+  replacements: Replacement[],
+): Uint8Array {
+  return replaceInEntity(headers, body, replacements);
+}
+
+function replaceInEntity(
+  headers: HeaderLine[],
+  body: Uint8Array,
+  replacements: Replacement[],
+): Uint8Array {
+  const { type, boundary } = parseContentType(
+    getHeader(headers, "Content-Type"),
+  );
+
+  // Content types email_utils.replace() explicitly leaves untouched. Note
+  // multipart/signed is here on purpose: rewriting inside it would break the
+  // signature.
+  if (
+    type.startsWith("image/") ||
+    type.startsWith("video/") ||
+    type.startsWith("audio/") ||
+    type.startsWith("application/") ||
+    type === "multipart/signed" ||
+    type === "text/calendar" ||
+    type === "text/directory" ||
+    type === "text/csv" ||
+    type === "text/x-python-script"
+  ) {
+    return body;
+  }
+
+  if (type === "text/plain" || type === "text/html")
+    return replaceInTextLeaf(headers, body, replacements);
+
+  if (
+    type === "multipart/alternative" ||
+    type === "multipart/related" ||
+    type === "multipart/mixed"
+  ) {
+    if (!boundary) return body; // malformed: no boundary -> never corrupt mail
+    return replaceInMultipart(body, boundary, replacements);
+  }
+
+  // message/rfc822: email_utils.replace() recurses into the single embedded
+  // message (get_payload() returns a one-element list); the whole body is that
+  // nested entity.
+  if (type === "message/rfc822") return replaceInNestedPart(body, replacements);
+
+  // Anything else: unchanged (email_utils.replace()'s trailing `return msg`).
+  return body;
+}
+
+/** MIME type (lowercased) and boundary param of a Content-Type header value. */
+function parseContentType(value: string | null): {
+  type: string;
+  boundary: string | null;
+} {
+  // Missing Content-Type -> RFC 2045 default text/plain (as Python's
+  // Message.get_content_type()).
+  if (!value) return { type: "text/plain", boundary: null };
+  const semi = value.indexOf(";");
+  const type = (semi === -1 ? value : value.slice(0, semi))
+    .trim()
+    .toLowerCase();
+  const m = value.match(/;\s*boundary\s*=\s*(?:"([^"]*)"|([^;\s]+))/i);
+  return { type, boundary: m ? (m[1] ?? m[2] ?? null) : null };
+}
+
+/** get_encoding(): normalize a Content-Transfer-Encoding to the codec to use. */
+function normalizeCte(
+  value: string | null,
+): "quoted-printable" | "base64" | "none" {
+  const cte = (value ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/^["']+/, "")
+    .replace(/["']+$/, "");
+  if (cte === "base64") return "base64";
+  if (cte === "quoted-printable") return "quoted-printable";
+  // "", 7bit/8bit/binary, utf-8, amazonses.com, or anything unknown: treat as
+  // no transfer coding, exactly like get_encoding()'s fall-through.
+  return "none";
+}
+
+function replaceInTextLeaf(
+  headers: HeaderLine[],
+  body: Uint8Array,
+  replacements: Replacement[],
+): Uint8Array {
+  const cte = normalizeCte(getHeader(headers, "Content-Transfer-Encoding"));
+
+  if (cte === "quoted-printable") {
+    const decoded = qpDecode(body);
+    const replaced = replaceBytes(decoded, replacements);
+    if (replaced === decoded) return body; // nothing matched: keep exact bytes
+    return qpEncode(replaced);
+  }
+
+  if (cte === "base64") {
+    const decoded = base64Decode(body);
+    const replaced = replaceBytes(decoded, replacements);
+    if (replaced === decoded) return body;
+    // b64 re-encode drops all surrounding whitespace; re-attach the body's
+    // trailing line terminator so a following multipart boundary stays on its
+    // own line.
+    return concatBytes(base64Encode(replaced), trailingTerminator(body));
+  }
+
+  // 7bit/8bit/binary/none: email_utils uses encode_text(), which is identity
+  // for these, so this is a straight byte replace on the raw payload.
+  return replaceBytes(body, replacements);
+}
+
+/**
+ * Byte-level substitution. We treat each byte as a code point (latin1-style)
+ * so the search/replace is byte-exact regardless of the declared charset;
+ * since the addresses are ASCII this is equivalent to Python's str.replace on
+ * any ASCII-superset charset (utf-8, latin-1, ...). Returns the input array
+ * unchanged (same reference) when nothing matched, so callers can preserve the
+ * original bytes exactly.
+ */
+function replaceBytes(
+  data: Uint8Array,
+  replacements: Replacement[],
+): Uint8Array {
+  let text = bytesToBinaryString(data);
+  let changed = false;
+  for (const [oldStr, newStr] of replacements) {
+    if (!oldStr || !text.includes(oldStr)) continue;
+    changed = true;
+    text = text.split(oldStr).join(newStr);
+  }
+  return changed ? binaryStringToBytes(text) : data;
+}
+
+function bytesToBinaryString(data: Uint8Array): string {
+  let s = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < data.length; i += CHUNK)
+    s += String.fromCharCode(...data.subarray(i, i + CHUNK));
+  return s;
+}
+
+function binaryStringToBytes(s: string): Uint8Array {
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+  return out;
+}
+
+/** Split a multipart body on `--boundary`, replacing only within each part. */
+function replaceInMultipart(
+  body: Uint8Array,
+  boundary: string,
+  replacements: Replacement[],
+): Uint8Array {
+  const marker = new TextEncoder().encode(`--${boundary}`);
+  const delims = findBoundaryDelimiters(body, marker);
+  if (delims.length === 0) return body; // malformed: boundary never appears
+
+  // Reassemble preamble + [delimiter line + part]* + epilogue. Framing bytes
+  // (preamble, delimiter lines, epilogue) are copied verbatim; only the part
+  // content ranges are recursed into.
+  const pieces: Uint8Array[] = [body.subarray(0, delims[0].start)];
+  for (let k = 0; k < delims.length; k++) {
+    const d = delims[k];
+    pieces.push(body.subarray(d.start, d.lineEnd));
+    if (d.closing) {
+      pieces.push(body.subarray(d.lineEnd)); // epilogue
+      break;
+    }
+    const contentEnd = delims[k + 1] ? delims[k + 1].start : body.length;
+    pieces.push(
+      replaceInNestedPart(body.subarray(d.lineEnd, contentEnd), replacements),
+    );
+  }
+  return concatBytes(...pieces);
+}
+
+interface BoundaryDelimiter {
+  start: number; // index of the leading '-'
+  lineEnd: number; // index just past the delimiter line's terminator (or EOF)
+  closing: boolean; // "--boundary--"
+}
+
+function findBoundaryDelimiters(
+  body: Uint8Array,
+  marker: Uint8Array,
+): BoundaryDelimiter[] {
+  const out: BoundaryDelimiter[] = [];
+  const n = body.length;
+  let i = 0;
+  while (i < n) {
+    // i is always at a line start (0, or right after a '\n').
+    if (bytesMatchAt(body, i, marker)) {
+      let p = i + marker.length;
+      let closing = false;
+      if (body[p] === 0x2d && body[p + 1] === 0x2d) {
+        closing = true;
+        p += 2;
+      }
+      // A real delimiter has only optional whitespace before its line break.
+      let valid = true;
+      while (p < n && body[p] !== 0x0a && body[p] !== 0x0d) {
+        if (body[p] !== 0x20 && body[p] !== 0x09) {
+          valid = false;
+          break;
+        }
+        p++;
+      }
+      if (valid) {
+        let lineEnd = p;
+        if (body[p] === 0x0d && body[p + 1] === 0x0a) lineEnd = p + 2;
+        else if (body[p] === 0x0d || body[p] === 0x0a) lineEnd = p + 1;
+        out.push({ start: i, lineEnd, closing });
+        i = lineEnd;
+        continue;
+      }
+    }
+    while (i < n && body[i] !== 0x0a) i++;
+    i++;
+  }
+  return out;
+}
+
+function bytesMatchAt(
+  data: Uint8Array,
+  pos: number,
+  needle: Uint8Array,
+): boolean {
+  if (pos + needle.length > data.length) return false;
+  for (let k = 0; k < needle.length; k++)
+    if (data[pos + k] !== needle[k]) return false;
+  return true;
+}
+
+/** Recurse into one MIME part (its own header block + body), preserving its
+ * header bytes verbatim and only rewriting the body. */
+function replaceInNestedPart(
+  part: Uint8Array,
+  replacements: Replacement[],
+): Uint8Array {
+  const { headerText, bodyStart } = splitRawMessage(part);
+  const partHeaders = parseHeaderBlock(headerText);
+  const origBody = part.subarray(bodyStart);
+  const newBody = replaceInEntity(partHeaders, origBody, replacements);
+  if (newBody === origBody) return part; // unchanged: keep exact bytes
+  return concatBytes(part.subarray(0, bodyStart), newBody);
+}
+
+/** Quoted-printable decode (RFC 2045): =XX hex, =<CRLF>/=<LF> soft breaks. */
+function qpDecode(data: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  const n = data.length;
+  for (let i = 0; i < n; i++) {
+    const c = data[i];
+    if (c !== 0x3d) {
+      out.push(c);
+      continue;
+    }
+    // soft line break: '=' at end of line
+    if (data[i + 1] === 0x0d && data[i + 2] === 0x0a) {
+      i += 2;
+      continue;
+    }
+    if (data[i + 1] === 0x0a) {
+      i += 1;
+      continue;
+    }
+    // =XX hex escape
+    if (isHexByte(data[i + 1]) && isHexByte(data[i + 2])) {
+      out.push((hexValue(data[i + 1]) << 4) | hexValue(data[i + 2]));
+      i += 2;
+      continue;
+    }
+    // lone '=' (malformed): keep it, matching quopri.decodestring.
+    out.push(c);
+  }
+  return Uint8Array.from(out);
+}
+
+function isHexByte(b: number | undefined): boolean {
+  return (
+    b !== undefined &&
+    ((b >= 0x30 && b <= 0x39) ||
+      (b >= 0x41 && b <= 0x46) ||
+      (b >= 0x61 && b <= 0x66))
+  );
+}
+
+function hexValue(b: number): number {
+  if (b >= 0x30 && b <= 0x39) return b - 0x30;
+  if (b >= 0x41 && b <= 0x46) return b - 0x41 + 10;
+  return b - 0x61 + 10;
+}
+
+/** Quoted-printable encode (RFC 2045) with CRLF hard breaks and `=`-soft-break
+ * wrapping so no output line exceeds 76 columns. */
+function qpEncode(data: Uint8Array): Uint8Array {
+  const result: number[] = [];
+  let line: number[] = [];
+
+  const flush = (terminator: number[]) => {
+    for (const c of line) result.push(c);
+    for (const c of terminator) result.push(c);
+    line = [];
+  };
+  const softBreak = () => {
+    line.push(0x3d); // trailing '=' marks a soft line break
+    flush([0x0d, 0x0a]);
+  };
+  const pushAtom = (atom: number[]) => {
+    // keep room for a possible trailing soft-break '=' (max line = 76).
+    if (line.length + atom.length > 75) softBreak();
+    for (const c of atom) line.push(c);
+  };
+  const encodeTrailingSpace = () => {
+    const last = line[line.length - 1];
+    if (last === 0x20 || last === 0x09) {
+      line.pop();
+      pushAtom(qpTriple(last));
+    }
+  };
+  const hardBreak = () => {
+    encodeTrailingSpace();
+    flush([0x0d, 0x0a]);
+  };
+
+  for (let i = 0; i < data.length; i++) {
+    const b = data[i];
+    if (b === 0x0d && data[i + 1] === 0x0a) {
+      hardBreak();
+      i++;
+    } else if (b === 0x0a) {
+      hardBreak();
+    } else if (b === 0x0d) {
+      pushAtom(qpTriple(b)); // lone CR -> =0D
+    } else if (b === 0x20 || b === 0x09) {
+      pushAtom([b]); // literal space/tab (fixed up if it ends a line)
+    } else if (b >= 0x21 && b <= 0x7e && b !== 0x3d) {
+      pushAtom([b]);
+    } else {
+      pushAtom(qpTriple(b));
+    }
+  }
+  encodeTrailingSpace();
+  for (const c of line) result.push(c);
+  return Uint8Array.from(result);
+}
+
+function qpTriple(b: number): number[] {
+  return [
+    0x3d,
+    HEX_DIGITS.charCodeAt((b >> 4) & 0x0f),
+    HEX_DIGITS.charCodeAt(b & 0x0f),
+  ];
+}
+
+/** Base64 decode, ignoring whitespace/padding/stray bytes (b64decode-style). */
+function base64Decode(data: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  let buffer = 0;
+  let bits = 0;
+  for (let i = 0; i < data.length; i++) {
+    const v = B64_LOOKUP[data[i]];
+    if (v < 0) continue; // whitespace, '=' padding, or any non-alphabet byte
+    buffer = (buffer << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((buffer >> bits) & 0xff);
+    }
+  }
+  return Uint8Array.from(out);
+}
+
+/** Base64 encode, wrapped at 76 columns with CRLF (RFC 2045). */
+function base64Encode(data: Uint8Array): Uint8Array {
+  let s = "";
+  let i = 0;
+  for (; i + 2 < data.length; i += 3) {
+    const n = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
+    s +=
+      B64_ALPHABET[(n >> 18) & 63] +
+      B64_ALPHABET[(n >> 12) & 63] +
+      B64_ALPHABET[(n >> 6) & 63] +
+      B64_ALPHABET[n & 63];
+  }
+  const rem = data.length - i;
+  if (rem === 1) {
+    const n = data[i] << 16;
+    s += `${B64_ALPHABET[(n >> 18) & 63]}${B64_ALPHABET[(n >> 12) & 63]}==`;
+  } else if (rem === 2) {
+    const n = (data[i] << 16) | (data[i + 1] << 8);
+    s +=
+      B64_ALPHABET[(n >> 18) & 63] +
+      B64_ALPHABET[(n >> 12) & 63] +
+      `${B64_ALPHABET[(n >> 6) & 63]}=`;
+  }
+  const lines: string[] = [];
+  for (let j = 0; j < s.length; j += 76) lines.push(s.slice(j, j + 76));
+  return new TextEncoder().encode(lines.join("\r\n"));
+}
+
+/** The trailing CRLF or LF of `data`, or an empty array if it has neither. */
+function trailingTerminator(data: Uint8Array): Uint8Array {
+  const n = data.length;
+  if (n >= 2 && data[n - 2] === 0x0d && data[n - 1] === 0x0a)
+    return new Uint8Array([0x0d, 0x0a]);
+  if (n >= 1 && data[n - 1] === 0x0a) return new Uint8Array([0x0a]);
+  return new Uint8Array(0);
+}
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
 }
 
 // ======================= address parsing / formatting =====================
