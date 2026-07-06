@@ -24,6 +24,8 @@ export default defineConfig(async () => {
             PREMIUM_ALIAS_DOMAINS: "",
             URL: "https://app.sl.example.com",
             MAX_NB_EMAIL_FREE_PLAN: "3",
+            // Tests assert the Flask-parity rebuild path.
+            FORWARD_MODE: "rewrite",
           },
         },
       }),

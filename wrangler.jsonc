@@ -32,6 +32,10 @@
     "ALIAS_DOMAINS": "mail.example.com",
     "PREMIUM_ALIAS_DOMAINS": "",
     "URL": "https://simplelogin.example.workers.dev",
-    "MAX_NB_EMAIL_FREE_PLAN": "3"
+    "MAX_NB_EMAIL_FREE_PLAN": "3",
+    // "rewrite" = Flask-parity forwards (From = reverse alias) via SEND_EMAIL;
+    // requires the domain onboarded onto Email Sending (paid) or strict
+    // receivers reject the mail. "passthrough" = message.forward() as-is.
+    "FORWARD_MODE": "passthrough"
   }
 }

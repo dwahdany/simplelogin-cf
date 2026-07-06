@@ -34,4 +34,11 @@ export interface Env {
   DKIM_PRIVATE_KEY?: string;
   /** DKIM selector; defaults to "dkim" (matches the Flask app). */
   DKIM_SELECTOR?: string;
+  /**
+   * Alias-forward delivery mode. "rewrite" rebuilds the message with the
+   * reverse alias as From (Flask parity) and sends via SEND_EMAIL — only
+   * deliverable to strict receivers when the domain is onboarded onto Email
+   * Sending (paid). Anything else = passthrough via message.forward().
+   */
+  FORWARD_MODE?: string;
 }

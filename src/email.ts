@@ -358,8 +358,17 @@ async function handleForwardPhase(
   // `message.raw` is single-use, but the forward phase rebuilds and sends one
   // copy per mailbox. Buffer the raw bytes once here and hand a fresh header
   // copy to each mailbox. Only needed on the SEND_EMAIL rebuild path; the
-  // message.forward() fallback (no binding) reads the message internally.
-  const buffered = env.SEND_EMAIL ? await readRawMessage(message) : null;
+  // message.forward() passthrough reads the message internally.
+  //
+  // FORWARD_MODE gates the rebuild: binding-sent mail is only delivered by
+  // strict receivers (Gmail) when the domain is onboarded onto Email Sending
+  // (paid — Cloudflare strips worker-added DKIM-Signature headers, so
+  // self-signing cannot satisfy DMARC). Until then "passthrough" uses
+  // message.forward(): reliable delivery, but From stays the original sender.
+  // Set FORWARD_MODE=rewrite after onboarding for full Flask-parity forwards.
+  const rewriteMode =
+    env.SEND_EMAIL !== undefined && env.FORWARD_MODE === "rewrite";
+  const buffered = rewriteMode ? await readRawMessage(message) : null;
 
   const results: Delivery[] = [];
   for (const mailbox of mailboxes) {
@@ -465,10 +474,11 @@ async function forwardToMailbox(
   if (nbRcpt > MAX_EMAIL_FORWARD_RECIPIENTS)
     return { success: false, status: E526 };
 
-  // Fallback for local dev without the SEND_EMAIL binding: forward as-is with
-  // the X-SimpleLogin-* headers. This CANNOT rewrite From/To/Cc, so Reply from
-  // the mailbox reaches the original sender — the binding path below is the
-  // faithful one.
+  // Passthrough delivery (FORWARD_MODE!=rewrite, or no SEND_EMAIL binding):
+  // forward as-is with the X-SimpleLogin-* headers. This CANNOT rewrite
+  // From/To/Cc, so Reply from the mailbox reaches the original sender — the
+  // rebuild path below is the faithful one (requires Email Sending onboarding
+  // so the mail is DKIM-signed by Cloudflare).
   if (!buffered) {
     const xHeaders = new Headers();
     xHeaders.set("X-SimpleLogin-Type", "Forward");
