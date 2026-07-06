@@ -120,7 +120,10 @@ class CannotCreateContactForReverseAlias extends Error {}
 class NonReverseAliasInReplyPhase extends Error {}
 
 export interface OutboundEmail {
+  /** Flask-parity VERP envelope sender (used verbatim when unbound). */
   envelopeFrom: string;
+  /** Sender actually handed to the send_email binding (= From header). */
+  bindingFrom?: string;
   to: string;
   raw: string;
 }
@@ -1951,8 +1954,19 @@ async function sendRawEmail(
   to: string,
   raw: Uint8Array,
 ): Promise<void> {
+  // Cloudflare's send_email binding rejects messages whose envelope sender
+  // differs from the MIME From header (verified in production: the aligned
+  // transactional mailer delivers, VERP-enveloped sends bounce with E407).
+  // So outbound binding sends go out with the From-header address as the
+  // envelope; the Flask-format VERP envelope is kept for the unbound/local
+  // mode and for parsing inbound bounces addressed to old VERP addresses.
+  // Bounces consequently come back to the alias/reverse-alias as regular
+  // inbound mail instead of the VERP mailbox.
+  const bindingFrom = extractFromHeaderAddress(raw) ?? envelopeFrom;
+
   outboundEmails.push({
     envelopeFrom,
+    bindingFrom,
     to,
     raw: new TextDecoder().decode(raw),
   });
@@ -1969,7 +1983,15 @@ async function sendRawEmail(
       controller.close();
     },
   });
-  await env.SEND_EMAIL.send(new EmailMessage(envelopeFrom, to, stream));
+  await env.SEND_EMAIL.send(new EmailMessage(bindingFrom, to, stream));
+}
+
+/** Address part of the From header of a serialized message, if parseable. */
+function extractFromHeaderAddress(raw: Uint8Array): string | null {
+  const { headerText } = splitRawMessage(raw);
+  const from = getHeader(parseHeaderBlock(headerText), "From");
+  if (!from) return null;
+  return parseOneAddress(from)?.address ?? null;
 }
 
 // ======================== raw message / header tools ======================

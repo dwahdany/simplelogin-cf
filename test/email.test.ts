@@ -276,15 +276,19 @@ describe("forward phase", () => {
     );
     expect(aliasAfter?.last_email_log_id).toBe(emailLog?.id);
 
-    // delivered through the SEND_EMAIL binding with a VERP envelope sender.
+    // Delivered through the SEND_EMAIL binding. The binding requires the
+    // envelope sender to equal the From header (the reverse alias); the
+    // Flask-parity VERP envelope is still recorded on outboundEmails.
     expect(sends).toHaveLength(1);
     expect(sends[0].to).toBe(mailbox.email);
-    expect(sends[0].from).toMatch(
-      new RegExp(`^sl\\.[a-z2-7]+\\.[a-z2-7]+@${reDomain(env.EMAIL_DOMAIN)}$`),
-    );
+    expect(sends[0].from).toBe(contact?.reply_email);
 
     const out = outboundEmails[0];
     expect(out.to).toBe(mailbox.email);
+    expect(out.envelopeFrom).toMatch(
+      new RegExp(`^sl\\.[a-z2-7]+\\.[a-z2-7]+@${reDomain(env.EMAIL_DOMAIN)}$`),
+    );
+    expect(out.bindingFrom).toBe(contact?.reply_email);
     // From is the reverse alias (default AT sender_format), NOT the sender.
     expect(rawHeader(out.raw, "From")).toBe(
       `"John Wick - john at wick.example" <${contact?.reply_email}>`,
@@ -1159,8 +1163,10 @@ describe("reply phase", () => {
     expect(msg.forwards).toHaveLength(0);
     expect(sends).toHaveLength(1);
     expect(sends[0].to).toBe("friend@remote.example");
-    // VERP envelope sender on the alias domain
-    expect(sends[0].from).toMatch(
+    // Binding sender = From header (the alias); VERP envelope kept on the
+    // outboundEmails capture only (binding rejects misaligned senders).
+    expect(sends[0].from).toBe(alias.email);
+    expect(outboundEmails.at(-1)?.envelopeFrom).toMatch(
       /^sl\.[a-z2-7]+\.[a-z2-7]+@sl\.example\.com$/,
     );
 
