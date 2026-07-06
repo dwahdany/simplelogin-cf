@@ -27,4 +27,11 @@ export interface Env {
    * `wrangler secret put FLASK_SECRET`; provided as a plain binding in tests.
    */
   FLASK_SECRET: string;
+  /**
+   * PKCS#8 PEM RSA private key used to DKIM-sign outbound mail. When unset,
+   * mail is sent unsigned (relies on the send binding / MTA to sign).
+   */
+  DKIM_PRIVATE_KEY?: string;
+  /** DKIM selector; defaults to "dkim" (matches the Flask app). */
+  DKIM_SELECTOR?: string;
 }

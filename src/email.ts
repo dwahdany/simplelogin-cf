@@ -17,6 +17,7 @@
 
 import { canonicalizeEmail, randomString, sanitizeEmail } from "./lib/crypto";
 import { nowStr, toDate } from "./lib/dates";
+import { dkimSignOutbound } from "./lib/dkim";
 import type { Env } from "./lib/env";
 import { sendTransactionalEmail } from "./lib/mailer";
 import {
@@ -1963,6 +1964,12 @@ async function sendRawEmail(
   // Bounces consequently come back to the alias/reverse-alias as regular
   // inbound mail instead of the VERP mailbox.
   const bindingFrom = extractFromHeaderAddress(raw) ?? envelopeFrom;
+
+  // Sign with DKIM before capturing/sending so both the outboundEmails seam
+  // and the binding see the signed message. Only sign mail whose From-header
+  // domain is one of ours (env.EMAIL_DOMAIN / ALIAS_DOMAINS); relayed foreign
+  // domains must not carry our signature.
+  raw = await dkimSignOutbound(env, bindingFrom, raw);
 
   outboundEmails.push({
     envelopeFrom,

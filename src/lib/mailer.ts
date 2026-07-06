@@ -7,6 +7,7 @@
  * worker in the same isolate, so the array is shared with SELF.fetch calls).
  */
 
+import { dkimSignOutbound } from "./dkim";
 import type { Env } from "./env";
 
 export interface OutgoingEmail {
@@ -80,8 +81,15 @@ export async function sendTransactionalEmail(
   const from = `no-reply@${env.EMAIL_DOMAIN}`;
   try {
     const { EmailMessage } = await import("cloudflare:email");
-    const raw = buildMime(from, msg);
-    await env.SEND_EMAIL.send(new EmailMessage(from, msg.to, raw));
+    const raw = new TextEncoder().encode(buildMime(from, msg));
+    const signed = await dkimSignOutbound(env, from, raw);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(signed);
+        controller.close();
+      },
+    });
+    await env.SEND_EMAIL.send(new EmailMessage(from, msg.to, stream));
   } catch (e) {
     console.error(`[mailer] send failed to=${msg.to}:`, e);
   }
