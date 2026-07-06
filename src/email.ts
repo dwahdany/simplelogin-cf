@@ -16,7 +16,7 @@
  */
 
 import { canonicalizeEmail, randomString, sanitizeEmail } from "./lib/crypto";
-import { nowStr, toDate } from "./lib/dates";
+import { addDays, nowStr, toDate, toStr } from "./lib/dates";
 import { dkimSignOutbound } from "./lib/dkim";
 import type { Env } from "./lib/env";
 import { sendTransactionalEmail } from "./lib/mailer";
@@ -57,6 +57,7 @@ const E501 = "550 SL E501";
 const E502 = "550 SL E502 Email not exist";
 const E503 = "550 SL E503";
 const E504 = "550 SL E504 Account disabled";
+const E510 = "550 SL E510 so such user";
 const E512 = "550 SL E512 No such email log";
 const E515 = "550 SL E515 Email not exist";
 const E516 = "550 SL E516 invalid mailbox";
@@ -80,11 +81,19 @@ const VERP_TYPE_BOUNCE_FORWARD = 0;
 const VERP_TYPE_BOUNCE_REPLY = 1;
 const VERP_TYPE_TRANSACTIONAL = 2;
 
-// Alert types (config.py) used for the sent_alert-based "at most once" cap.
+// Alert types (config.py). The first group is deduped once-ever
+// (send_email_at_most_times); the rate-controlled group is capped per rolling
+// window (send_email_with_rate_control, MAX_ALERT_24H per nb_day days).
 const ALERT_FROM_ADDRESS_IS_REVERSE_ALIAS = "from_address_is_reverse_alias";
 const ALERT_SEND_EMAIL_CYCLE = "cycle";
 const ALERT_MAILBOX_IS_ALIAS = "mailbox_is_alias";
 const ALERT_TO_NOREPLY = "to_noreply";
+const ALERT_REVERSE_ALIAS_UNKNOWN_MAILBOX = "reverse_alias_unknown_mailbox";
+const ALERT_DIRECTORY_DISABLED_ALIAS_CREATION =
+  "alert_directory_disabled_alias_creation";
+const ALERT_BOUNCE_EMAIL = "bounce";
+const ALERT_BOUNCE_EMAIL_REPLY_PHASE = "bounce-when-reply";
+const MAX_ALERT_24H = 4;
 
 // SenderFormatEnum (app/models.py) — how Contact.new_addr() formats the From.
 const SENDER_FORMAT_AT = 0; // "John Wick - john at wick.com"
@@ -329,10 +338,20 @@ async function handleForwardPhase(
       const parsed = parseOneAddress(part);
       if (!parsed || parsed.address === alias.email) continue;
       if (!isValidEmail(parsed.address)) continue;
-      const rtc = await createContact(db, env, parsed.address, alias, user, {
-        name: parsed.name,
-        allowEmptyEmail: false,
-      });
+      // Flask passes only the bare address to get_or_create_reply_to_contact,
+      // which re-parses it -> empty name, so reply-to contacts are nameless.
+      // get_or_create_reply_to_contact goes through contact_utils.create_contact,
+      // which catches CannotCreateContactForReverseAlias and returns None: a
+      // Reply-To that is itself a reverse alias is skipped, not rejected (E524).
+      let rtc: ContactRow | null;
+      try {
+        rtc = await createContact(db, env, parsed.address, alias, user, {
+          allowEmptyEmail: false,
+        });
+      } catch (e) {
+        if (e instanceof CannotCreateContactForReverseAlias) continue;
+        throw e;
+      }
       if (rtc) replyToContacts.push(rtc);
     }
   }
@@ -381,7 +400,7 @@ async function handleForwardPhase(
         )
         .bind(nowStr(), mailbox.id)
         .run();
-      await sendAlertAtMostOnce(
+      await sendAlertWithRateControl(
         db,
         env,
         user.id,
@@ -389,6 +408,8 @@ async function handleForwardPhase(
         user.email,
         `Your mailbox ${mailbox.email} is an alias`,
         `Your mailbox ${mailbox.email} is itself an alias and cannot receive forwarded emails. It has been unverified.`,
+        1,
+        1,
       );
       results.push({ success: false, status: E525 });
       continue;
@@ -444,7 +465,7 @@ async function forwardToMailbox(
 
   // Sanity check: same domain on both sides means a mis-configured mailbox.
   if (domainPart(alias.email) === domainPart(mailbox.email)) {
-    await sendAlertAtMostOnce(
+    await sendAlertWithRateControl(
       db,
       env,
       user.id,
@@ -452,6 +473,8 @@ async function forwardToMailbox(
       user.email,
       `Your mailbox ${mailbox.email} and alias ${alias.email} use the same domain`,
       `Your mailbox ${mailbox.email} and alias ${alias.email} use the same domain; forwarding is not possible.`,
+      1,
+      1,
     );
     return { success: false, status: E405 };
   }
@@ -508,13 +531,33 @@ async function forwardToMailbox(
   if (!getHeader(hs, "Content-Transfer-Encoding"))
     hs.push({ name: "Content-Transfer-Encoding", value: "7bit" });
 
-  // Step 7: generic subject (header only; the explanatory body banner is
-  // skipped — this port does not rewrite MIME bodies, like the reply phase).
-  if (mailbox.generic_subject)
-    setHeader(hs, "Subject", mailbox.generic_subject);
+  let outBody = buffered.body;
 
-  // Step 5 (invalid_email banner) and step 8 (PGP) are body rewrites: skipped
-  // like the reply phase. Step 4 (SpamAssassin) is config-gated off.
+  // Step 5: invalid-sender notice. The contact was created without a usable
+  // address (contact.invalid_email), so the reverse alias goes nowhere — warn
+  // the reader they cannot reply.
+  if (contact.invalid_email) {
+    const banner = `Email sent to ${alias.email} from an invalid address and cannot be replied`;
+    outBody = addBodyHeader(hs, outBody, banner, banner);
+  }
+
+  // Step 7: generic subject. Replace the Subject and prepend a banner carrying
+  // the original sender/subject so that information is not lost. `sender` is the
+  // original From, read before the step-11 reverse-alias rewrite below.
+  if (mailbox.generic_subject) {
+    const origSubject = getHeader(hs, "Subject") ?? "";
+    const sender = getHeader(hs, "From") ?? "";
+    setHeader(hs, "Subject", mailbox.generic_subject);
+    outBody = addBodyHeader(
+      hs,
+      outBody,
+      `Forwarded by SimpleLogin to ${alias.email} from "${sender}" with "${origSubject}" as subject`,
+      `Forwarded by SimpleLogin to ${alias.email} from "${sender}" with <b>${origSubject}</b> as subject`,
+    );
+  }
+
+  // Step 8 (PGP) is a body rewrite skipped like the reply phase. Step 4
+  // (SpamAssassin) is config-gated off.
 
   // Step 9: X-SimpleLogin-* headers (added after the whitelist so they stay).
   setHeader(hs, "X-SimpleLogin-Type", "Forward");
@@ -574,7 +617,7 @@ async function forwardToMailbox(
 
   // Step 18: send with a per-forward VERP envelope sender on the contact's
   // reverse-alias domain.
-  const rawOut = serializeMessage(hs, buffered.body);
+  const rawOut = serializeMessage(hs, outBody);
   const verpFrom = await generateVerpEmail(
     env,
     VERP_TYPE_BOUNCE_FORWARD,
@@ -673,11 +716,37 @@ async function replaceHeaderWhenForward(
     }
     // Non-ASCII / invalid contact addresses are skipped.
     if (!isValidEmail(contactEmail)) continue;
-    const contact = await createContact(db, env, contactEmail, alias, user, {
-      name: parsed?.name ?? "",
-      isCc: headerName.toLowerCase() === "cc",
-      allowEmptyEmail: false,
-    });
+    const contactName = (parsed?.name ?? "").slice(0, CONTACT_MAX_NAME_LENGTH);
+    const existing = await getContactByAliasAndEmail(
+      db,
+      alias.id,
+      contactEmail,
+    );
+    let contact: ContactRow | null;
+    if (existing) {
+      // replace_header_when_forward assigns the display name unconditionally
+      // when it differs (including an empty name), so a header carrying a bare
+      // address clears a name the contact was previously created with.
+      const newName = contactName || null;
+      if (existing.name !== newName) {
+        await db
+          .prepare(
+            "UPDATE contact SET name = ?1, updated_at = ?2 WHERE id = ?3",
+          )
+          .bind(newName, nowStr(), existing.id)
+          .run();
+        existing.name = newName;
+      }
+      contact = existing;
+    } else {
+      // New contacts go through create_contact, which raises
+      // CannotCreateContactForReverseAlias for a reverse-alias address (-> E524).
+      contact = await createContact(db, env, contactEmail, alias, user, {
+        name: contactName,
+        isCc: headerName.toLowerCase() === "cc",
+        allowEmptyEmail: false,
+      });
+    }
     if (contact) newAddrs.push(contactNewAddr(contact, user));
   }
 
@@ -737,8 +806,11 @@ async function replaceSlMessageIdByOriginal(
  * The mailto UNSUBSCRIBER address is not configured on this port, so
  * DisableAlias/BlockContact use the https unsubscribe link (encode_url), and
  * the PreserveOriginal path proxies only http(s) methods of the original
- * List-Unsubscribe (mailto-only originals require a signed link we can't build
- * without UNSUBSCRIBE_SECRET, so they are dropped).
+ * List-Unsubscribe. mailto-only originals are dropped: Flask emits a signed
+ * `/dashboard/unsubscribe/encoded?data=...` link, but that payload is signed
+ * with itsdangerous+SHA3-224 and the web decoder for it is a deferred blocker
+ * (settings-pages.ts B7); WebCrypto has no SHA3, so a link this worker produced
+ * could not be verified. FWD-5 stays blocked on those shared components.
  */
 function addUnsubscribeHeaders(
   env: Env,
@@ -894,11 +966,14 @@ async function tryAutoCreateViaDomain(
   const user = await getUserById(db, customDomain.user_id);
   if (!user || user.disabled) return null;
   if (!(await canCreateNewAlias(db, env, user))) {
-    await sendTransactionalEmail(env, {
-      to: user.email,
-      subject: `Alias ${address} cannot be created`,
-      text: `Alias ${address} cannot be created because you have reached the limit of aliases on your plan.`,
-    });
+    // send_cannot_create_domain_alias: suppressed for disabled / pending-delete
+    // users (user.can_send_or_receive()).
+    if (userCanSendOrReceive(user))
+      await sendTransactionalEmail(env, {
+        to: user.email,
+        subject: `Alias ${address} cannot be created`,
+        text: `Alias ${address} cannot be created because you have reached the limit of aliases on your plan.`,
+      });
     return null;
   }
 
@@ -989,19 +1064,30 @@ async function tryAutoCreateDirectory(
   const user = await getUserById(db, directory.user_id);
   if (!user || user.disabled) return null;
   if (!(await canCreateNewAlias(db, env, user))) {
-    await sendTransactionalEmail(env, {
-      to: user.email,
-      subject: `Alias ${address} cannot be created`,
-      text: `Alias ${address} cannot be created because you have reached the limit of aliases on your plan.`,
-    });
+    // send_cannot_create_directory_alias: suppressed for disabled /
+    // pending-delete users (user.can_send_or_receive()).
+    if (userCanSendOrReceive(user))
+      await sendTransactionalEmail(env, {
+        to: user.email,
+        subject: `Alias ${address} cannot be created`,
+        text: `Alias ${address} cannot be created because you have reached the limit of aliases on your plan.`,
+      });
     return null;
   }
   if (directory.disabled) {
-    await sendTransactionalEmail(env, {
-      to: user.email,
-      subject: `Alias ${address} cannot be created`,
-      text: `Alias ${address} cannot be created because the directory ${directoryName} is disabled.`,
-    });
+    // send_cannot_create_directory_alias_disabled: guarded by
+    // can_send_or_receive AND rate-controlled (MAX_ALERT_24H/day) so repeated
+    // probes to a disabled-directory address can't flood the user.
+    if (userCanSendOrReceive(user))
+      await sendAlertWithRateControl(
+        db,
+        env,
+        user.id,
+        ALERT_DIRECTORY_DISABLED_ALIAS_CREATION,
+        user.email,
+        `Alias ${address} cannot be created`,
+        `Alias ${address} cannot be created because the directory ${directoryName} is disabled.`,
+      );
     return null;
   }
 
@@ -1118,11 +1204,19 @@ async function getOrCreateContact(
   if (!isValidEmail(contactEmail)) {
     if (mailFrom && mailFrom !== "<>") contactEmail = mailFrom;
   }
-  return createContact(db, env, contactEmail, alias, aliasUser, {
-    name: contactName,
-    mailFrom,
-    allowEmptyEmail: true,
-  });
+  // contact_utils.create_contact catches CannotCreateContactForReverseAlias and
+  // returns None (-> handle_forward returns E504), rather than letting it become
+  // the E524 raised for reverse aliases in the To/Cc rewrite.
+  try {
+    return await createContact(db, env, contactEmail, alias, aliasUser, {
+      name: contactName,
+      mailFrom,
+      allowEmptyEmail: true,
+    });
+  } catch (e) {
+    if (e instanceof CannotCreateContactForReverseAlias) return null;
+    throw e;
+  }
 }
 
 interface CreateContactOpts {
@@ -1313,14 +1407,15 @@ async function handleReplyPhase(
   // Anti-spoofing: sender must be one of the alias's mailboxes (or an
   // authorized address of one), checked raw then canonicalized, with a
   // header-From fallback when the envelope/header domains match.
+  // Flask passes the raw decoded From header (display name included) to the
+  // header-From fallback. get_email_domain_part then reads a bogus domain out
+  // of a display-name form ("Alice <a@b.com>" -> "b.com>"), so only a bare From
+  // header ("a@b.com") can satisfy the same-domain check and match a mailbox.
   const fromHeader = getHeaderValue(message.headers, "From");
-  const headerFromAddress = fromHeader
-    ? (parseOneAddress(fromHeader)?.address ?? "")
-    : "";
   let mailbox = await getMailboxForReplyPhase(
     db,
     mailFrom,
-    headerFromAddress,
+    fromHeader ?? "",
     alias,
   );
   if (!mailbox) {
@@ -1328,7 +1423,7 @@ async function handleReplyPhase(
       mailbox = await getMailboxById(db, alias.mailbox_id);
     }
     if (!mailbox) {
-      await handleUnknownMailbox(env, mailFrom, user, alias);
+      await handleUnknownMailbox(db, env, mailFrom, user, alias);
       // 250-class status: drop silently to avoid backscatter.
       return accept(E214);
     }
@@ -1362,13 +1457,15 @@ async function handleReplyPhase(
   } catch (e) {
     if (e instanceof NonReverseAliasInReplyPhase) {
       await deleteEmailLogRow(db, emailLog.id);
-      await sendTransactionalEmail(env, {
-        to: mailbox.email,
-        subject: `Email sent to ${contact.website_email} contains non reverse-alias addresses`,
-        text:
-          "The email you sent to your reverse alias contains addresses that are not reverse aliases " +
-          "and has not been delivered to protect your real email address.",
-      });
+      // Flask only warns when the mailbox can_send_or_receive().
+      if (mailboxCanSendOrReceive(mailbox, user))
+        await sendTransactionalEmail(env, {
+          to: mailbox.email,
+          subject: `Email sent to ${contact.website_email} contains non reverse-alias addresses`,
+          text:
+            "The email you sent to your reverse alias contains addresses that are not reverse aliases " +
+            "and has not been delivered to protect your real email address.",
+        });
       return accept(E200);
     }
     throw e;
@@ -1404,13 +1501,18 @@ async function handleReplyPhase(
   try {
     await sendRawEmail(env, verpFrom, contact.website_email, rawOut);
 
-    // Notify the alias's other mailboxes about this outgoing email.
+    // Notify the alias's other mailboxes about this outgoing email. Each other
+    // mailbox is notified once here. Flask's per-transaction notified_mailboxes
+    // dedup (across multiple reverse-alias recipients of one SMTP transaction)
+    // has no analog: Cloudflare invokes the worker once per recipient, so there
+    // is no shared cross-recipient state to dedup against.
     for (const mb of await aliasVerifiedMailboxes(db, alias)) {
       if (mb.email === mailbox.email) continue;
       await notifyOtherMailbox(
         db,
         env,
         alias,
+        mailbox,
         hs,
         outBody,
         origTo,
@@ -1422,11 +1524,13 @@ async function handleReplyPhase(
   } catch (e) {
     console.error(`cannot send reply from ${alias.email}:`, e);
     await deleteEmailLogRow(db, emailLog.id);
-    await sendTransactionalEmail(env, {
-      to: mailbox.email,
-      subject: `Email cannot be sent to ${contact.website_email} from ${alias.email}`,
-      text: `The email from your alias ${alias.email} could not be delivered to ${contact.website_email}. You can retry sending the email.`,
-    });
+    // Flask only warns when the mailbox can_send_or_receive().
+    if (mailboxCanSendOrReceive(mailbox, user))
+      await sendTransactionalEmail(env, {
+        to: mailbox.email,
+        subject: `Email cannot be sent to ${contact.website_email} from ${alias.email}`,
+        text: `The email from your alias ${alias.email} could not be delivered to ${contact.website_email}. You can retry sending the email.`,
+      });
   }
   // 250 in both success and failure: the user is informed and can retry.
   return accept(E200);
@@ -1476,18 +1580,24 @@ async function matchAliasMailboxExact(
 }
 
 async function handleUnknownMailbox(
+  db: D1Database,
   env: Env,
   mailFrom: string,
   user: UserRow,
   alias: AliasRow,
 ): Promise<void> {
-  await sendTransactionalEmail(env, {
-    to: user.email,
-    subject: `Attempt to use your alias ${alias.email} from ${mailFrom}`,
-    text:
-      `${mailFrom} tried to send an email using your reverse alias of ${alias.email}. ` +
+  // Rate-controlled (MAX_ALERT_24H/day) so an attacker firing at a known
+  // reverse alias can't flood the owner's real mailbox with alert emails.
+  await sendAlertWithRateControl(
+    db,
+    env,
+    user.id,
+    ALERT_REVERSE_ALIAS_UNKNOWN_MAILBOX,
+    user.email,
+    `Attempt to use your alias ${alias.email} from ${mailFrom}`,
+    `${mailFrom} tried to send an email using your reverse alias of ${alias.email}. ` +
       "Only your mailboxes and their authorized addresses can send emails from a reverse alias.",
-  });
+  );
 }
 
 async function replaceHeaderWhenReply(
@@ -1502,8 +1612,14 @@ async function replaceHeaderWhenReply(
 
   const newAddrs: string[] = [];
   for (const part of splitAddressList(cleaned)) {
-    const parsed = parseOneAddress(part);
-    const addr = parsed ? parsed.address : part;
+    // Mirror email.utils.getaddresses: flatten RFC 2822 group syntax and skip
+    // members that yield no address (e.g. `undisclosed-recipients:;`) rather
+    // than treating the raw token as a non-reverse-alias and dropping the mail.
+    const token = stripGroupWrapping(part);
+    if (!token) continue;
+    const parsed = parseOneAddress(token);
+    const addr = parsed ? parsed.address : token;
+    if (!addr) continue;
     // no transformation when the alias itself is in the header (Reply-All)
     if (addr === alias.email) continue;
     const contact = await getContactByReplyEmail(db, addr);
@@ -1600,6 +1716,7 @@ async function notifyOtherMailbox(
   db: D1Database,
   env: EmailEnv,
   alias: AliasRow,
+  sendingMailbox: MailboxRow,
   hs: HeaderLine[],
   body: Uint8Array,
   origTo: string | null,
@@ -1613,13 +1730,24 @@ async function notifyOtherMailbox(
     .first<{ id: number }>();
   if (!tx) return;
   const notifHs = hs.map((h) => ({ ...h }));
+  // Prepend the notify_mailbox banner so the other mailbox owner sees which
+  // mailbox sent the reply and is warned to strip the section before replying.
+  const textBanner =
+    "**** Don't forget to remove this section if you reply to this email ****\n" +
+    `Email sent on behalf of alias ${alias.email} using mailbox ${sendingMailbox.email}`;
+  const notifBody = addBodyHeader(
+    notifHs,
+    body,
+    textBanner,
+    textBanner.replaceAll("\n", "<br>"),
+  );
   // From the alias so it's clear the email was sent on its behalf.
   setHeader(notifHs, "From", alias.email);
   if (origTo !== null) setHeader(notifHs, "To", origTo);
   else deleteHeader(notifHs, "To");
   if (origCc !== null) setHeader(notifHs, "Cc", origCc);
   else deleteHeader(notifHs, "Cc");
-  const raw = serializeMessage(notifHs, body);
+  const raw = serializeMessage(notifHs, notifBody);
   await sendRawEmail(
     env,
     await generateVerpEmail(env, VERP_TYPE_TRANSACTIONAL, tx.id, aliasDomain),
@@ -1724,20 +1852,29 @@ async function handleVerpInbound(
     .first<EmailLogRow>();
   if (!emailLog) return rejectWith(E512);
 
+  // NOTE (envelope deviation): production outbound mail is enveloped with the
+  // From-header address, not this VERP sender, so downstream bounces / OOO
+  // replies come back to the alias / reverse alias as ordinary inbound mail and
+  // are handled by the forward / reply phases. Only legacy VERP-addressed mail
+  // (e.g. migration) reaches here. The bounce side effects below still run for
+  // that case; the OOO rewrite-and-redeliver Flask does is intentionally NOT
+  // ported (it would re-enter another phase to no production benefit) — the
+  // message is dropped with E206 as before.
   if (verp.verpType === VERP_TYPE_BOUNCE_FORWARD) {
-    if (bounce) return handleBounceForwardPhase(db, emailLog);
+    if (bounce) {
+      // handle_bounce: reject bounces for a soft-deleted user untouched (E510).
+      const elUser = await getUserById(db, emailLog.user_id);
+      if (elUser && !userIsActiveRow(elUser)) return rejectWith(E510);
+      return handleBounceForwardPhase(db, env, emailLog);
+    }
     if (isOutOfOffice(message)) return accept(E206);
     return accept(E213); // VERPForward
   }
   if (verp.verpType === VERP_TYPE_BOUNCE_REPLY) {
     if (bounce) {
-      await db
-        .prepare(
-          "UPDATE email_log SET bounced = 1, updated_at = ?1 WHERE id = ?2",
-        )
-        .bind(nowStr(), emailLog.id)
-        .run();
-      return accept(E212);
+      const elUser = await getUserById(db, emailLog.user_id);
+      if (elUser && !userIsActiveRow(elUser)) return rejectWith(E510);
+      return handleBounceReplyPhase(db, env, emailLog);
     }
     if (isOutOfOffice(message)) return accept(E206);
     return accept(E213); // VERPReply
@@ -1745,26 +1882,121 @@ async function handleVerpInbound(
   return accept(E213);
 }
 
+/**
+ * handle_bounce_forward_phase (email_handler.py): a forwarded email bounced at
+ * the mailbox. Records the Bounce row + email_log.bounced/bounced_mailbox_id,
+ * then notifies the user (Notification row + rate-controlled ALERT_BOUNCE_EMAIL,
+ * max 10/day). RefusedEmail (S3) storage and the ALIAS_AUTOMATIC_DISABLE-gated
+ * auto-disable are the documented skips (the latter is off by default upstream).
+ */
 async function handleBounceForwardPhase(
   db: D1Database,
+  env: Env,
   emailLog: EmailLogRow,
 ): Promise<HandleResult> {
-  await db
-    .prepare(
-      `UPDATE email_log SET bounced = 1, bounced_mailbox_id = mailbox_id,
-         updated_at = ?1 WHERE id = ?2`,
-    )
-    .bind(nowStr(), emailLog.id)
-    .run();
-  const mailbox = emailLog.mailbox_id
+  const alias = emailLog.alias_id
+    ? await getAliasById(db, emailLog.alias_id)
+    : null;
+  // Flask falls back to the alias's primary mailbox when the log has none.
+  let mailbox = emailLog.mailbox_id
     ? await getMailboxById(db, emailLog.mailbox_id)
     : null;
+  if (!mailbox && alias) mailbox = await getMailboxById(db, alias.mailbox_id);
+
+  await db
+    .prepare(
+      "UPDATE email_log SET bounced = 1, bounced_mailbox_id = ?1, updated_at = ?2 WHERE id = ?3",
+    )
+    .bind(mailbox?.id ?? null, nowStr(), emailLog.id)
+    .run();
   if (mailbox)
     await db
       .prepare("INSERT INTO bounce (email) VALUES (?1)")
       .bind(mailbox.email)
       .run();
+
+  const contact = await getContactById(db, emailLog.contact_id);
+  if (alias && contact && mailbox) {
+    const user = await getUserById(db, alias.user_id);
+    if (user) {
+      const title = `Email from ${contact.website_email} to ${alias.email} cannot be delivered to ${mailbox.email}`;
+      await db
+        .prepare(
+          "INSERT INTO notification (user_id, title, message) VALUES (?1, ?2, ?3)",
+        )
+        .bind(user.id, title, title)
+        .run();
+      await sendAlertWithRateControl(
+        db,
+        env,
+        user.id,
+        ALERT_BOUNCE_EMAIL,
+        user.email,
+        `An email sent to ${alias.email} cannot be delivered to your mailbox`,
+        `An email sent to ${alias.email} from ${contact.website_email} cannot be delivered to your mailbox ${mailbox.email}. You can disable the alias or block the sender from your dashboard.`,
+        10,
+        1,
+      );
+    }
+  }
   return accept(E211);
+}
+
+/**
+ * handle_bounce_reply_phase (email_handler.py): a reply sent from an alias
+ * bounced at the contact. Records a Bounce row for the contact's real address +
+ * email_log.bounced/bounced_mailbox_id, then notifies the user (Notification row
+ * + ALERT_BOUNCE_EMAIL_REPLY_PHASE to the sending mailbox). RefusedEmail (S3) is
+ * the documented skip.
+ */
+async function handleBounceReplyPhase(
+  db: D1Database,
+  env: Env,
+  emailLog: EmailLogRow,
+): Promise<HandleResult> {
+  const contact = await getContactById(db, emailLog.contact_id);
+  const alias = emailLog.alias_id
+    ? await getAliasById(db, emailLog.alias_id)
+    : null;
+  let mailbox = emailLog.mailbox_id
+    ? await getMailboxById(db, emailLog.mailbox_id)
+    : null;
+  if (!mailbox && alias) mailbox = await getMailboxById(db, alias.mailbox_id);
+
+  if (contact)
+    await db
+      .prepare("INSERT INTO bounce (email) VALUES (?1)")
+      .bind(sanitizeEmail(contact.website_email, true))
+      .run();
+  await db
+    .prepare(
+      "UPDATE email_log SET bounced = 1, bounced_mailbox_id = ?1, updated_at = ?2 WHERE id = ?3",
+    )
+    .bind(mailbox?.id ?? null, nowStr(), emailLog.id)
+    .run();
+
+  if (alias && contact && mailbox) {
+    const user = await getUserById(db, alias.user_id);
+    if (user) {
+      const title = `Email cannot be sent to ${contact.website_email} from your alias ${alias.email}`;
+      await db
+        .prepare(
+          "INSERT INTO notification (user_id, title, message) VALUES (?1, ?2, ?3)",
+        )
+        .bind(user.id, title, title)
+        .run();
+      await sendAlertWithRateControl(
+        db,
+        env,
+        user.id,
+        ALERT_BOUNCE_EMAIL_REPLY_PHASE,
+        mailbox.email,
+        title,
+        `The email you sent from your alias ${alias.email} to ${contact.website_email} could not be delivered.`,
+      );
+    }
+  }
+  return accept(E212);
 }
 
 function isBounce(mailFrom: string, message: ForwardableEmailMessage): boolean {
@@ -1800,6 +2032,16 @@ function getContactByReplyEmail(
   return db
     .prepare("SELECT * FROM contact WHERE reply_email = ?1 LIMIT 1")
     .bind(replyEmail)
+    .first<ContactRow>();
+}
+
+function getContactById(
+  db: D1Database,
+  id: number,
+): Promise<ContactRow | null> {
+  return db
+    .prepare("SELECT * FROM contact WHERE id = ?1 LIMIT 1")
+    .bind(id)
     .first<ContactRow>();
 }
 
@@ -1933,7 +2175,7 @@ async function deleteEmailLogRow(db: D1Database, id: number): Promise<void> {
   await db.prepare("DELETE FROM email_log WHERE id = ?1").bind(id).run();
 }
 
-/** send_email_at_most_times: sent_alert-deduped transactional alert. */
+/** send_email_at_most_times: sent_alert-deduped transactional alert (once ever). */
 async function sendAlertAtMostOnce(
   db: D1Database,
   env: Env,
@@ -1959,6 +2201,40 @@ async function sendAlertAtMostOnce(
   await sendTransactionalEmail(env, { to: toEmail, subject, text });
 }
 
+/**
+ * send_email_with_rate_control (email_utils.py): send at most `maxNbAlert`
+ * alerts of `alertType` to `toEmail` over the last `nbDay` days, recording a
+ * sent_alert row for each one sent. Unlike sendAlertAtMostOnce this uses a
+ * rolling time window, so a recurring misconfiguration re-notifies the user.
+ */
+async function sendAlertWithRateControl(
+  db: D1Database,
+  env: Env,
+  userId: number,
+  alertType: string,
+  toEmail: string,
+  subject: string,
+  text: string,
+  maxNbAlert = MAX_ALERT_24H,
+  nbDay = 1,
+): Promise<void> {
+  const minDt = toStr(addDays(new Date(), -nbDay));
+  const row = await db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM sent_alert WHERE alert_type = ?1 AND to_email = ?2 AND created_at > ?3",
+    )
+    .bind(alertType, toEmail, minDt)
+    .first<{ n: number }>();
+  if ((row?.n ?? 0) >= maxNbAlert) return;
+  await db
+    .prepare(
+      "INSERT INTO sent_alert (user_id, to_email, alert_type) VALUES (?1, ?2, ?3)",
+    )
+    .bind(userId, toEmail, alertType)
+    .run();
+  await sendTransactionalEmail(env, { to: toEmail, subject, text });
+}
+
 function userIsActiveRow(user: UserRow, now: Date = new Date()): boolean {
   if (user.delete_on === null) return true;
   return toDate(user.delete_on).getTime() < now.getTime();
@@ -1968,6 +2244,14 @@ function userCanSendOrReceive(user: UserRow): boolean {
   if (user.disabled) return false;
   if (user.delete_on !== null) return false;
   return true;
+}
+
+/** Mailbox.can_send_or_receive (models.py): admin-disabled, disabled, or the
+ *  owning user unable to send/receive all suppress mail to the mailbox. */
+function mailboxCanSendOrReceive(mailbox: MailboxRow, user: UserRow): boolean {
+  if (mailbox.flags & MAILBOX_FLAG_ADMIN_DISABLED) return false;
+  if (mailbox.disabled) return false;
+  return userCanSendOrReceive(user);
 }
 
 // ========================= outbound raw email send ========================
@@ -2445,6 +2729,147 @@ function replaceInNestedPart(
   return concatBytes(part.subarray(0, bodyStart), newBody);
 }
 
+// ============================ body banners ================================
+// Port of app/email_utils.py `add_header(msg, text, html)`: prepend an
+// informational banner to the text/plain and text/html leaves of a message.
+// Used by the forward phase (invalid-sender / generic-subject notices) and the
+// reply phase (notify_mailbox "sent on behalf of" warning). Walks the same MIME
+// tree as replaceInMimeBody, decoding/re-encoding each text leaf per its CTE.
+// multipart/alternative and multipart/related add to every part; multipart/mixed
+// and multipart/signed add to the first part only; other types are unchanged.
+
+const TEXT_HEADER_SEPARATOR = "\n------------------------------\n";
+
+/** Prepend `textHeader`/`htmlHeader` banners to the message's text leaves. */
+export function addBodyHeader(
+  headers: HeaderLine[],
+  body: Uint8Array,
+  textHeader: string,
+  htmlHeader: string,
+): Uint8Array {
+  return addBannerToEntity(headers, body, textHeader, htmlHeader);
+}
+
+function addBannerToEntity(
+  headers: HeaderLine[],
+  body: Uint8Array,
+  textHeader: string,
+  htmlHeader: string,
+): Uint8Array {
+  const { type, boundary } = parseContentType(
+    getHeader(headers, "Content-Type"),
+  );
+  if (type === "text/plain")
+    return addBannerToTextLeaf(headers, body, textHeader, false);
+  if (type === "text/html")
+    return addBannerToTextLeaf(headers, body, htmlHeader, true);
+  if (type === "multipart/alternative" || type === "multipart/related") {
+    if (!boundary) return body;
+    return addBannerToMultipart(body, boundary, textHeader, htmlHeader, true);
+  }
+  if (type === "multipart/mixed" || type === "multipart/signed") {
+    if (!boundary) return body;
+    return addBannerToMultipart(body, boundary, textHeader, htmlHeader, false);
+  }
+  return body;
+}
+
+function htmlBannerWrap(htmlHeader: string, payload: string): string {
+  return (
+    `<table width="100%" style="width: 100%; -premailer-width: 100%; -premailer-cellpadding: 0;\n` +
+    `  -premailer-cellspacing: 0; margin: 0; padding: 0;">\n` +
+    `    <tr>\n` +
+    `        <td style="border-bottom:1px dashed #5675E2; padding: 10px 0px">${htmlHeader}</td>\n` +
+    `    </tr>\n` +
+    `    <tr>\n` +
+    `        <td>\n` +
+    `        ${payload}\n` +
+    `        </td>\n` +
+    `    </tr>\n` +
+    `</table>\n`
+  );
+}
+
+function addBannerToTextLeaf(
+  headers: HeaderLine[],
+  body: Uint8Array,
+  banner: string,
+  isHtml: boolean,
+): Uint8Array {
+  const enc = new TextEncoder();
+  const build = (decoded: Uint8Array): Uint8Array => {
+    if (isHtml)
+      return enc.encode(
+        htmlBannerWrap(banner, bytesToBinaryStringUtf8(decoded)),
+      );
+    return concatBytes(enc.encode(banner + TEXT_HEADER_SEPARATOR), decoded);
+  };
+
+  const cte = normalizeCte(getHeader(headers, "Content-Transfer-Encoding"));
+  if (cte === "quoted-printable") return qpEncode(build(qpDecode(body)));
+  if (cte === "base64")
+    return concatBytes(
+      base64Encode(build(base64Decode(body))),
+      trailingTerminator(body),
+    );
+  return build(body);
+}
+
+/** Decode already-transfer-decoded bytes as UTF-8 for text interpolation. */
+function bytesToBinaryStringUtf8(data: Uint8Array): string {
+  return new TextDecoder().decode(data);
+}
+
+function addBannerToMultipart(
+  body: Uint8Array,
+  boundary: string,
+  textHeader: string,
+  htmlHeader: string,
+  allParts: boolean,
+): Uint8Array {
+  const marker = new TextEncoder().encode(`--${boundary}`);
+  const delims = findBoundaryDelimiters(body, marker);
+  if (delims.length === 0) return body;
+
+  const pieces: Uint8Array[] = [body.subarray(0, delims[0].start)];
+  let firstDone = false;
+  for (let k = 0; k < delims.length; k++) {
+    const d = delims[k];
+    pieces.push(body.subarray(d.start, d.lineEnd));
+    if (d.closing) {
+      pieces.push(body.subarray(d.lineEnd));
+      break;
+    }
+    const contentEnd = delims[k + 1] ? delims[k + 1].start : body.length;
+    const part = body.subarray(d.lineEnd, contentEnd);
+    if (allParts || !firstDone) {
+      pieces.push(addBannerToNestedPart(part, textHeader, htmlHeader));
+    } else {
+      pieces.push(part);
+    }
+    firstDone = true;
+  }
+  return concatBytes(...pieces);
+}
+
+function addBannerToNestedPart(
+  part: Uint8Array,
+  textHeader: string,
+  htmlHeader: string,
+): Uint8Array {
+  const { headerText, bodyStart } = splitRawMessage(part);
+  const partHeaders = parseHeaderBlock(headerText);
+  const origBody = part.subarray(bodyStart);
+  const newBody = addBannerToEntity(
+    partHeaders,
+    origBody,
+    textHeader,
+    htmlHeader,
+  );
+  if (newBody === origBody) return part;
+  return concatBytes(part.subarray(0, bodyStart), newBody);
+}
+
 /** Quoted-printable decode (RFC 2045): =XX hex, =<CRLF>/=<LF> soft breaks. */
 function qpDecode(data: Uint8Array): Uint8Array {
   const out: number[] = [];
@@ -2672,6 +3097,30 @@ function splitAddressList(value: string): string[] {
   }
   parts.push(current);
   return parts.map((p) => p.trim()).filter(Boolean);
+}
+
+/**
+ * Flatten an RFC 2822 group entry the way email.utils.getaddresses does: drop a
+ * leading `phrase:` group label and the trailing `;` terminator, ignoring `:`
+ * and `;` inside quotes or angle brackets. `Group: ra+x@sl.co;` -> `ra+x@sl.co`,
+ * `undisclosed-recipients:;` -> "" (an empty member the caller then skips).
+ */
+function stripGroupWrapping(part: string): string {
+  let inQuotes = false;
+  let angle = 0;
+  let labelEnd = -1;
+  for (let i = 0; i < part.length; i++) {
+    const ch = part[i];
+    if (ch === '"') inQuotes = !inQuotes;
+    else if (!inQuotes && ch === "<") angle++;
+    else if (!inQuotes && ch === ">") angle = Math.max(0, angle - 1);
+    else if (!inQuotes && angle === 0 && ch === ":") {
+      labelEnd = i;
+      break;
+    }
+  }
+  const body = labelEnd === -1 ? part : part.slice(labelEnd + 1);
+  return body.replace(/;\s*$/, "").trim();
 }
 
 function parseOneAddress(part: string): ParsedAddress | null {

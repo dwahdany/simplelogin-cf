@@ -18,6 +18,7 @@ import {
   outboundEmails,
   replaceInMimeBody,
 } from "../src/email";
+import { toStr } from "../src/lib/dates";
 import type { Env } from "../src/lib/env";
 import { sentEmails } from "../src/lib/mailer";
 import type {
@@ -633,6 +634,108 @@ describe("forward phase", () => {
     expect(sends[0].to).toBe(user.email);
   });
 
+  it("rate-controls the directory-disabled cannot-create alert (FWD-8)", async () => {
+    const user = await createUser(env.DB);
+    const name = `disdir${uniq()}`;
+    await insert("directory", { user_id: user.id, name, disabled: 1 });
+    const aliasDomain = env.ALIAS_DOMAINS.split(",")[0].trim();
+    const address = `${name}+shop@${aliasDomain}`;
+    const msg = makeMessage({
+      from: "shop@ext.example",
+      to: address,
+      raw: buildRaw([
+        ["From", "shop@ext.example"],
+        ["To", address],
+      ]),
+    });
+    await deliver(msg);
+
+    expect(msg.rejectReason).toBe("550 SL E515 Email not exist");
+    expect(
+      sentEmails.some(
+        (e) =>
+          e.subject === `Alias ${address} cannot be created` &&
+          e.to === user.email,
+      ),
+    ).toBe(true);
+    // a sent_alert row is recorded so repeat probes are rate-limited.
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM sent_alert WHERE alert_type = ?1 AND to_email = ?2",
+        "alert_directory_disabled_alias_creation",
+        user.email,
+      ),
+    ).toBe(1);
+  });
+
+  it("suppresses the cannot-create alert for a pending-delete user (FWD-10)", async () => {
+    const future = toStr(new Date(Date.now() + 30 * 86400 * 1000));
+    const user = await createUser(env.DB, { delete_on: future });
+    const name = `disdir${uniq()}`;
+    await insert("directory", { user_id: user.id, name, disabled: 1 });
+    const aliasDomain = env.ALIAS_DOMAINS.split(",")[0].trim();
+    const address = `${name}+shop@${aliasDomain}`;
+    const msg = makeMessage({
+      from: "shop@ext.example",
+      to: address,
+      raw: buildRaw([
+        ["From", "shop@ext.example"],
+        ["To", address],
+      ]),
+    });
+    await deliver(msg);
+
+    // user.can_send_or_receive() is false -> no notification email at all.
+    expect(
+      sentEmails.some(
+        (e) => e.subject === `Alias ${address} cannot be created`,
+      ),
+    ).toBe(false);
+  });
+
+  it("re-notifies mailbox-is-alias after the 24h window (FWD-9/SF-07)", async () => {
+    const user = await createUser(env.DB);
+    const loopMailbox = await createMailbox(
+      env.DB,
+      user.id,
+      "loopwin@ext.example",
+    );
+    const alias = await createAlias(env.DB, user.id, loopMailbox.id);
+    await createAlias(env.DB, user.id, user.default_mailbox_id as number, {
+      email: "loopwin@ext.example",
+    });
+    // A stale alert (2 days ago) must NOT suppress a fresh one: the alert is
+    // rate-controlled per rolling day, not deduped once-ever.
+    await env.DB.prepare(
+      "INSERT INTO sent_alert (user_id, to_email, alert_type, created_at) VALUES (?1, ?2, 'mailbox_is_alias', ?3)",
+    )
+      .bind(user.id, user.email, toStr(new Date(Date.now() - 2 * 86400 * 1000)))
+      .run();
+    const msg = makeMessage({
+      from: "s@remote.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "s@remote.example"],
+        ["To", alias.email],
+      ]),
+    });
+    await deliver(msg);
+
+    expect(msg.rejectReason).toBe("550 SL E525 Alias loop");
+    expect(
+      sentEmails.some(
+        (e) => e.subject === "Your mailbox loopwin@ext.example is an alias",
+      ),
+    ).toBe(true);
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM sent_alert WHERE alert_type = ?1 AND to_email = ?2",
+        "mailbox_is_alias",
+        user.email,
+      ),
+    ).toBe(2);
+  });
+
   it("detects an email cycle from the alias's own mailbox", async () => {
     const { user, mailbox, alias } = await forwardSetup();
     const msg = makeMessage({
@@ -739,7 +842,10 @@ describe("forward phase", () => {
     expect(msg.rejectReason).toBe("550 SL E520 Unverified custom domain");
   });
 
-  it("rejects with E524 when the sender address is a reverse alias", async () => {
+  it("rejects with E504 when the From-header sender address is a reverse alias", async () => {
+    // FWD-2: get_or_create_contact -> create_contact catches
+    // CannotCreateContactForReverseAlias and returns None, so handle_forward
+    // rejects with E504 (not the E524 reserved for To/Cc rewriting).
     const { user: userA, alias: aliasA } = await forwardSetup();
     const reverse = `rvsender${uniq()}@sl.example.com`;
     await createContact(env.DB, userA.id, aliasA.id, {
@@ -758,7 +864,7 @@ describe("forward phase", () => {
     });
     await deliver(msg);
 
-    expect(msg.rejectReason).toBe("550 SL E524 Wrong use of reverse-alias");
+    expect(msg.rejectReason).toBe("550 SL E504 Account disabled");
     expect(msg.forwards).toHaveLength(0);
     expect(
       sentEmails.some(
@@ -768,6 +874,69 @@ describe("forward phase", () => {
           e.to === userA.email,
       ),
     ).toBe(true);
+  });
+
+  it("delivers mail whose Reply-To is a reverse alias, skipping that contact (FWD-1)", async () => {
+    // A Reply-To that is itself a reverse alias must be skipped (like Flask's
+    // create_contact returning None), NOT reject the whole message with E524.
+    const { user: userA, alias: aliasA } = await forwardSetup();
+    const reverse = `rvreplyto${uniq()}@sl.example.com`;
+    await createContact(env.DB, userA.id, aliasA.id, {
+      website_email: "real@remote.example",
+      reply_email: reverse,
+    });
+    const { alias } = await forwardSetup();
+    const { testEnv, sends } = envWithSendMock();
+
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "John Wick <john@wick.example>"],
+        ["To", alias.email],
+        ["Reply-To", `Boss <${reverse}>, real2@remote.example`],
+        ["Subject", "hi"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    // delivered (not rejected), and the reverse-alias reply-to was dropped.
+    expect(msg.rejectReason).toBeNull();
+    expect(sends).toHaveLength(1);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    const replyToOut = rawHeader(out, "Reply-To") ?? "";
+    expect(replyToOut).not.toContain(reverse);
+    // the other (valid) reply-to became a reverse-alias contact
+    expect(replyToOut).toContain("real2_at_remote_example_");
+  });
+
+  it("creates Reply-To contacts nameless (FWD-4/EM-07)", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["To", alias.email],
+        ["Reply-To", "Boss Person <boss@corp.example>"],
+        ["Subject", "s"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    const boss = await one<ContactRow>(
+      "SELECT * FROM contact WHERE alias_id = ?1 AND website_email = ?2",
+      alias.id,
+      "boss@corp.example",
+    );
+    expect(boss).not.toBeNull();
+    // Flask stores reply-to contacts nameless (re-parses the bare address).
+    expect(boss?.name).toBeNull();
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    const replyToOut = rawHeader(out, "Reply-To") ?? "";
+    expect(replyToOut).not.toContain("Boss Person");
+    expect(replyToOut).toContain("boss at corp.example");
   });
 
   it("silently drops an IgnoredEmail pair", async () => {
@@ -945,6 +1114,37 @@ describe("forward phase header rewriting", () => {
     expect(ccOut).not.toContain("bob@ext.example");
   });
 
+  it("clears an existing contact's name when the To header carries a bare address (FWD-3)", async () => {
+    const { user, alias } = await forwardSetup();
+    const named = await createContact(env.DB, user.id, alias.id, {
+      website_email: "friend@clear.example",
+      name: "Friend",
+      reply_email: `friendclear${uniq()}@sl.example.com`,
+    });
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["To", `${alias.email}, <friend@clear.example>`],
+        ["Subject", "s"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    const after = await one<ContactRow>(
+      "SELECT * FROM contact WHERE id = ?1",
+      named.id,
+    );
+    // bare address in the header clears the stored name (Flask assigns "").
+    expect(after?.name).toBeNull();
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    const toOut = rawHeader(out, "To") ?? "";
+    expect(toOut).toContain(`"friend at clear.example" <${named.reply_email}>`);
+    expect(toOut).not.toContain("Friend -");
+  });
+
   it("deletes the Cc header when no recipient survives", async () => {
     const { alias } = await forwardSetup();
     const { testEnv } = envWithSendMock();
@@ -1118,6 +1318,68 @@ describe("forward phase header rewriting", () => {
     const { out } = await forwardWithFrom("john@wick.example");
     expect(rawHeader(out, "Date")).toMatch(
       /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} -0000$/,
+    );
+  });
+
+  it("prepends the generic-subject banner with original sender/subject (FWD-6)", async () => {
+    const { user, mailbox, alias } = await forwardSetup();
+    await env.DB.prepare(
+      "UPDATE mailbox SET generic_subject = ?1 WHERE id = ?2",
+    )
+      .bind("A new email", mailbox.id)
+      .run();
+    void user;
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw(
+        [
+          ["From", "John Wick <john@wick.example>"],
+          ["To", alias.email],
+          ["Subject", "Secret subject"],
+          ["Content-Type", "text/plain"],
+        ],
+        "hello there\r\n",
+      ),
+    });
+    await deliver(msg, testEnv);
+
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    expect(rawHeader(out, "Subject")).toBe("A new email");
+    const body = bodyOf(out);
+    expect(body).toContain(
+      `Forwarded by SimpleLogin to ${alias.email} from "John Wick <john@wick.example>" with "Secret subject" as subject`,
+    );
+    expect(body).toContain("hello there");
+  });
+
+  it("prepends the invalid-sender banner for an unparseable From (FWD-7)", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "notanemail",
+      to: alias.email,
+      raw: buildRaw(
+        [
+          ["From", "notanemail"],
+          ["To", alias.email],
+          ["Subject", "s"],
+          ["Content-Type", "text/plain"],
+        ],
+        "hi\r\n",
+      ),
+    });
+    await deliver(msg, testEnv);
+
+    const contact = await one<ContactRow>(
+      "SELECT * FROM contact WHERE alias_id = ?1",
+      alias.id,
+    );
+    expect(contact?.invalid_email).toBe(1);
+    const body = bodyOf(outboundEmails[outboundEmails.length - 1].raw);
+    expect(body).toContain(
+      `Email sent to ${alias.email} from an invalid address and cannot be replied`,
     );
   });
 
@@ -1349,7 +1611,7 @@ describe("reply phase", () => {
   });
 
   it("notifies the alias's other mailboxes about the reply", async () => {
-    const { user, alias, contact } = await replySetup();
+    const { user, mailbox, alias, contact } = await replySetup();
     const second = await createMailbox(env.DB, user.id, "second@other.example");
     await insert("alias_mailbox", {
       alias_id: alias.id,
@@ -1381,6 +1643,13 @@ describe("reply phase", () => {
     expect(notif.raw).toContain(`From: ${alias.email}`);
     // the original To (the reverse alias) is restored for easy reply
     expect(notif.raw).toContain(`To: ${contact.reply_email}`);
+    // reply-1: the notification carries the "sent on behalf of" warning banner.
+    expect(notif.raw).toContain(
+      "**** Don't forget to remove this section if you reply to this email ****",
+    );
+    expect(notif.raw).toContain(
+      `Email sent on behalf of alias ${alias.email} using mailbox ${mailbox.email}`,
+    );
   });
 
   it("rejects an unknown legacy reverse alias with E502", async () => {
@@ -1395,6 +1664,148 @@ describe("reply phase", () => {
     });
     await deliver(msg);
     expect(msg.rejectReason).toBe("550 SL E502 Email not exist");
+  });
+
+  it("delivers a reply whose To wraps the reverse alias in group syntax (reply-3)", async () => {
+    const { user, contact } = await replySetup();
+    const { testEnv, sends } = envWithSendMock();
+    const msg = makeMessage({
+      from: user.email,
+      to: contact.reply_email,
+      raw: buildRaw([
+        ["From", user.email],
+        ["To", `Recipients: ${contact.reply_email};`],
+        ["Cc", "undisclosed-recipients:;"],
+        ["Subject", "grouped"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    // Flask's getaddresses flattens the group and skips the empty Cc member, so
+    // the reply is delivered (not dropped as a non-reverse-alias).
+    expect(msg.rejectReason).toBeNull();
+    expect(sends.map((s) => s.to)).toEqual(["friend@remote.example"]);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    expect(rawHeader(out, "To")).toBe("Friend <friend@remote.example>");
+    expect(rawHeader(out, "Cc")).toBeNull();
+  });
+
+  it("rejects a display-name From on the same domain as the envelope (reply-4)", async () => {
+    // Flask compares the raw From header, so a display-name form yields a bogus
+    // domain and fails the same-domain fallback -> unknown mailbox (E214).
+    const user = await createUser(env.DB);
+    const mailbox = await createMailbox(
+      env.DB,
+      user.id,
+      `box${uniq()}@svc.example`,
+      { verified: 1 },
+    );
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO public_domain (domain) VALUES ('sl.example.com')",
+    ).run();
+    const n = uniq();
+    const alias = await createAlias(env.DB, user.id, mailbox.id, {
+      email: `ali${n}@sl.example.com`,
+    });
+    const contact = await createContact(env.DB, user.id, alias.id, {
+      website_email: "friend@remote.example",
+      name: "Friend",
+      reply_email: `rvr${n}@sl.example.com`,
+    });
+    const { testEnv, sends } = envWithSendMock();
+
+    const spoofed = makeMessage({
+      from: `bounce@svc.example`,
+      to: contact.reply_email,
+      raw: buildRaw([
+        ["From", `Agent <${mailbox.email}>`],
+        ["To", contact.reply_email],
+        ["Subject", "display-name spoof"],
+      ]),
+    });
+    await deliver(spoofed, testEnv);
+    expect(spoofed.rejectReason).toBeNull(); // E214 is 250-class
+    expect(sends.map((s) => s.to)).toEqual([user.email]); // only the alert
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM email_log WHERE contact_id = ?1",
+        contact.id,
+      ),
+    ).toBe(0);
+
+    // control: the bare From on the same domain IS accepted (delivered).
+    const bare = makeMessage({
+      from: `bounce@svc.example`,
+      to: contact.reply_email,
+      raw: buildRaw([
+        ["From", mailbox.email],
+        ["To", contact.reply_email],
+        ["Subject", "bare from"],
+      ]),
+    });
+    await deliver(bare, testEnv);
+    expect(sends.map((s) => s.to)).toContain("friend@remote.example");
+  });
+
+  it("rate-limits the unknown-mailbox alert (reply-2)", async () => {
+    const { user, alias, contact } = await replySetup();
+    const { testEnv } = envWithSendMock();
+    for (let i = 0; i < 5; i++) {
+      const msg = makeMessage({
+        from: "attacker@evil.example",
+        to: contact.reply_email,
+        raw: buildRaw([
+          ["From", "attacker@evil.example"],
+          ["To", contact.reply_email],
+          ["Subject", `spoof ${i}`],
+        ]),
+      });
+      await deliver(msg, testEnv);
+    }
+    const subject = `Attempt to use your alias ${alias.email} from attacker@evil.example`;
+    // MAX_ALERT_24H = 4: at most 4 alerts sent, and 4 sent_alert rows recorded.
+    expect(sentEmails.filter((e) => e.subject === subject)).toHaveLength(4);
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM sent_alert WHERE alert_type = ?1 AND to_email = ?2",
+        "reverse_alias_unknown_mailbox",
+        user.email,
+      ),
+    ).toBe(4);
+  });
+
+  it("does not warn a disabled mailbox on a non reverse-alias reply (reply-6)", async () => {
+    const { user, contact } = await replySetup();
+    // The sending mailbox is verified but disabled.
+    await env.DB.prepare("UPDATE mailbox SET disabled = 1 WHERE user_id = ?1")
+      .bind(user.id)
+      .run();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: user.email,
+      to: contact.reply_email,
+      raw: buildRaw([
+        ["From", user.email],
+        ["To", `${contact.reply_email}, outsider@ext.example`],
+        ["Subject", "leaky"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    // no warning email (mailbox.can_send_or_receive() is false), log deleted.
+    expect(
+      sentEmails.some((e) =>
+        e.subject.startsWith(
+          `Email sent to ${contact.website_email} contains non reverse-alias`,
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM email_log WHERE contact_id = ?1",
+        contact.id,
+      ),
+    ).toBe(0);
   });
 
   it("swallows out-of-office replies sent to a reverse alias", async () => {
@@ -1688,6 +2099,118 @@ describe("VERP bounces", () => {
         mailbox.email,
       ),
     ).toBe(1);
+    // SF-01: the user is notified (Notification row + rate-controlled email).
+    const title = `Email from ${contact.website_email} to ${alias.email} cannot be delivered to ${mailbox.email}`;
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM notification WHERE user_id = ?1 AND title = ?2",
+        user.id,
+        title,
+      ),
+    ).toBe(1);
+    expect(
+      sentEmails.some(
+        (e) =>
+          e.subject ===
+            `An email sent to ${alias.email} cannot be delivered to your mailbox` &&
+          e.to === user.email,
+      ),
+    ).toBe(true);
+  });
+
+  it("records bounce side effects on a reply-phase bounce (SF-02)", async () => {
+    const { user, mailbox, alias } = await forwardSetup();
+    const contact = await createContact(env.DB, user.id, alias.id, {
+      website_email: "friend@remote.example",
+    });
+    const emailLog = await createEmailLog(env.DB, user.id, contact.id, {
+      mailbox_id: mailbox.id,
+      is_reply: 1,
+    });
+
+    const verpAddress = await generateVerpEmail(env, 1, emailLog.id);
+    const msg = makeMessage({
+      from: "<>",
+      to: verpAddress,
+      raw: buildRaw(
+        [
+          ["From", "MAILER-DAEMON@remote.example"],
+          ["To", verpAddress],
+          [
+            "Content-Type",
+            'multipart/report; report-type=delivery-status; boundary="b1"',
+          ],
+        ],
+        "--b1\r\ndelivery failed\r\n--b1--\r\n",
+      ),
+    });
+    await deliver(msg);
+
+    expect(msg.rejectReason).toBeNull();
+    const after = await one<EmailLogRow>(
+      "SELECT * FROM email_log WHERE id = ?1",
+      emailLog.id,
+    );
+    expect(after?.bounced).toBe(1);
+    expect(after?.bounced_mailbox_id).toBe(mailbox.id);
+    // Bounce row is for the contact's real address, not the mailbox.
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM bounce WHERE email = ?1",
+        "friend@remote.example",
+      ),
+    ).toBe(1);
+    const title = `Email cannot be sent to ${contact.website_email} from your alias ${alias.email}`;
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM notification WHERE user_id = ?1 AND title = ?2",
+        user.id,
+        title,
+      ),
+    ).toBe(1);
+    // reply-phase alert goes to the sending mailbox, not the user address.
+    expect(
+      sentEmails.some((e) => e.subject === title && e.to === mailbox.email),
+    ).toBe(true);
+  });
+
+  it("rejects a bounce for a soft-deleted user with E510 (SF-06)", async () => {
+    const future = toStr(new Date(Date.now() + 30 * 86400 * 1000));
+    const { user, mailbox, alias } = await forwardSetup({ delete_on: future });
+    const contact = await createContact(env.DB, user.id, alias.id);
+    const emailLog = await createEmailLog(env.DB, user.id, contact.id, {
+      mailbox_id: mailbox.id,
+    });
+
+    const verpAddress = await generateVerpEmail(env, 0, emailLog.id);
+    const msg = makeMessage({
+      from: "<>",
+      to: verpAddress,
+      raw: buildRaw(
+        [
+          ["From", "MAILER-DAEMON@remote.example"],
+          ["To", verpAddress],
+          ["Content-Type", "multipart/report; report-type=delivery-status"],
+        ],
+        "delivery failed\r\n",
+      ),
+    });
+    await deliver(msg);
+
+    expect(msg.rejectReason).toBe("550 SL E510 so such user");
+    const after = await one<EmailLogRow>(
+      "SELECT * FROM email_log WHERE id = ?1",
+      emailLog.id,
+    );
+    // no DB mutation for a soft-deleted account.
+    expect(after?.bounced).toBe(0);
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM bounce WHERE email = ?1",
+        mailbox.email,
+      ),
+    ).toBe(0);
+    void alias;
   });
 
   it("rejects a bounce for a missing email log with E512", async () => {

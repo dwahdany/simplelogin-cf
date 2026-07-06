@@ -22,9 +22,13 @@ const MAX_CAPTURED = 200;
 /** Sent messages, oldest first. Tests may truncate it between cases. */
 export const sentEmails: OutgoingEmail[] = [];
 
-function buildMime(from: string, msg: OutgoingEmail): string {
+export function buildMime(
+  from: string,
+  fromHeader: string,
+  msg: OutgoingEmail,
+): string {
   const headers = [
-    `From: ${from}`,
+    `From: ${fromHeader}`,
     `To: ${msg.to}`,
     `Subject: ${msg.subject}`,
     `Message-ID: <${crypto.randomUUID()}@${from.split("@")[1]}>`,
@@ -78,10 +82,13 @@ export async function sendTransactionalEmail(
     return;
   }
 
+  // Flask config.NOREPLY: display-name form in the From header; the binding
+  // envelope sender must be the bare address (it requires envelope==From addr).
   const from = `no-reply@${env.EMAIL_DOMAIN}`;
+  const fromHeader = `"SimpleLogin (noreply)" <${from}>`;
   try {
     const { EmailMessage } = await import("cloudflare:email");
-    const raw = new TextEncoder().encode(buildMime(from, msg));
+    const raw = new TextEncoder().encode(buildMime(from, fromHeader, msg));
     const signed = await dkimSignOutbound(env, from, raw);
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
