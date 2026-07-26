@@ -9,6 +9,11 @@
  * Usage:  CLOUDFLARE_API_TOKEN=... node scripts/provision-domain.mjs \
  *             --zone mail.example.com [--worker simplelogin] [--dmarc]
  *
+ * Server-side port: the same steps run from the dashboard's "Auto-configure
+ * on Cloudflare" button (src/lib/cfapi.ts + the cf-provision branch in
+ * src/web/mailbox-domain-pages.ts) when the CF_API_TOKEN secret is set —
+ * see docs/DOMAINS.md §3 for its guards and token-scoping requirements.
+ *
  * Requires Node 22+ (global fetch, util.parseArgs). No dependencies.
  * Idempotent: every step checks current state before writing and skips
  * cleanly on re-runs; it REFUSES to overwrite a live catch-all rule that

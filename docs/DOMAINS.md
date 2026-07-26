@@ -150,6 +150,42 @@ pointing at `simplelogin` (per-zone — a new zone needs its own), and — for
 `FORWARD_MODE=rewrite` — Email Sending onboarding for the user's domain too,
 otherwise forwards for aliases on it fail DMARC at strict receivers.
 
+### One-click provisioning from the dashboard (optional)
+
+When the operator stores a Cloudflare API token as the `CF_API_TOKEN`
+secret (`npx wrangler secret put CF_API_TOKEN`), the DNS page
+(`/dashboard/domains/<id>/dns`) grows an **"Auto-configure on Cloudflare"**
+button — a server-side port of `provision-domain.mjs` (`src/lib/cfapi.ts` +
+the cf-provision branch in `src/web/mailbox-domain-pages.ts`). One click
+runs zone lookup → Email Routing → catch-all-to-worker → ownership TXT +
+DMARC, then re-runs the page's ownership/MX/SPF/DMARC checks in-process.
+Unset (or `""`) disables the feature: the button is hidden and the POST
+form-name is ignored. `CF_WORKER_NAME` overrides the catch-all target
+worker (default `simplelogin`).
+
+Security model — the button plants the ownership TXT with the *operator's*
+token, i.e. clicking it "proves" ownership of any name the token can edit,
+for whichever user added the domain:
+
+- The token MUST be a scoped API token (Zone:Read, DNS:Edit, Email Routing
+  Rules:Edit) and should additionally be **zone-scoped to only the zones
+  intended for user custom domains** wherever possible.
+- The server refuses domains that overlap the deployment's own mail
+  domains (`EMAIL_DOMAIN`, `FIRST_ALIAS_DOMAIN`, `ALIAS_DOMAINS`,
+  `PREMIUM_ALIAS_DOMAINS`, every `public_domain` row) **and** any domain
+  whose resolved zone hosts one of them (sibling hostnames like
+  `foo.example.com` next to `mail.example.com`) — token zone-scoping
+  cannot cover that case, because the token must be able to edit the very
+  zone hosting `EMAIL_DOMAIN`.
+- Non-destructive: it refuses (never overwrites) a catch-all rule with a
+  foreign destination — even a disabled one — and refuses to enable Email
+  Routing on a name that already carries non-Cloudflare MX records.
+- Rate-limited per user (3/minute; 20/hour) — each click spends up to ~9
+  authenticated calls of the account-wide Cloudflare API quota.
+- What it does NOT do (reported in the flash as the remaining manual
+  steps): Email Sending onboarding (§1.4, dashboard-only) and
+  destination-address verification (§1.6).
+
 ## 4. FORWARD_MODE: passthrough vs rewrite
 
 Set in `wrangler.jsonc` (`FORWARD_MODE`), pinned to `rewrite` in tests. See

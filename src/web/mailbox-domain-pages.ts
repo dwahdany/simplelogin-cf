@@ -31,6 +31,17 @@
 
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import {
+  CatchAllConflictError,
+  CfApiError,
+  type CfCatchAllRule,
+  CfClient,
+  catchAllConflict,
+  ensureCatchAllToWorker,
+  ensureEmailRouting,
+  ensureTxtRecord,
+  ForeignMxError,
+} from "../lib/cfapi";
 import { randomString, sanitizeEmail, tokenUrlsafe } from "../lib/crypto";
 import { addDays, nowStr, toDate, toStr } from "../lib/dates";
 import type { Env } from "../lib/env";
@@ -56,6 +67,7 @@ import {
   makeField,
   validateCsrfToken,
 } from "../lib/web/forms";
+import { webLimiter } from "../lib/web/limiter";
 import {
   buildCurrentUser,
   type CurrentUserCtx,
@@ -795,6 +807,34 @@ async function getCnameRecord(name: string): Promise<string | null> {
   let data = answers[0].data;
   if (data.endsWith(".")) data = data.slice(0, -1);
   return data;
+}
+
+/**
+ * DNS client used by the custom-domain DNS checks (route 7 check-ownership /
+ * check-mx / check-spf / check-dkim / check-dmarc and the cf-provision
+ * re-verification), with the same test-seam pattern as setMailboxDnsClient
+ * below. Production resolves over DoH; tests substitute an in-memory view.
+ */
+export interface DomainDnsClient {
+  /** TXT character-strings at `domain`, unquoted/joined; [] on failure. */
+  getTxtRecords(domain: string): Promise<string[]>;
+  /** MX records as {priority: [target-with-trailing-dot, ...]}. */
+  getMxDomains(domain: string): Promise<Map<number, string[]>>;
+  /** CNAME target without the trailing dot, or null. */
+  getCnameRecord(name: string): Promise<string | null>;
+}
+
+const dohDomainDnsClient: DomainDnsClient = {
+  getTxtRecords,
+  getMxDomains,
+  getCnameRecord,
+};
+
+let domainDnsClient: DomainDnsClient = dohDomainDnsClient;
+
+/** Test seam (tests run in the same isolate as SELF). `null` restores DoH. */
+export function setDomainDnsClient(client: DomainDnsClient | null): void {
+  domainDnsClient = client ?? dohDomainDnsClient;
 }
 
 export interface ExpectedMx {
@@ -1789,6 +1829,389 @@ function domainCtx(cd: CustomDomainRow) {
 }
 
 // ===========================================================================
+// One-click Cloudflare provisioning ("Auto-configure on Cloudflare"): the
+// dashboard-side port of scripts/provision-domain.mjs, run from route 7's
+// cf-provision form via src/lib/cfapi.ts.
+// ===========================================================================
+
+/**
+ * Feature gate: only a stored scoped API token (wrangler secret
+ * CF_API_TOKEN) enables the action; "" counts as unset like the other
+ * presence-based vars (src/lib/env.ts). When gated off, the button is not
+ * rendered and the POST branch behaves as an unknown form-name.
+ */
+function cfProvisionAvailable(envx: EnvX): boolean {
+  return (envx.CF_API_TOKEN ?? "") !== "";
+}
+
+/**
+ * SECURITY guards. The provision action plants the ownership TXT record with
+ * the OPERATOR's API token and then runs the ownership check against it —
+ * i.e. clicking the button "proves" domain ownership for any zone that
+ * token can edit. A non-operator dashboard user who adds a custom domain
+ * whose zone lives in the operator's account (most plausibly the
+ * deployment's own zones) could hijack its mail that way. Registration is
+ * closed on this deployment, but the code must not assume that forever —
+ * and CF_API_TOKEN should additionally be zone-scoped to only the zones the
+ * operator intends for SimpleLogin. Two layers:
+ *
+ * 1. cfProvisionCollision (string-level, before any API call): refuse when
+ *    the domain equals, is a subdomain of, or is a PARENT of any deployment
+ *    mail domain (a parent's zone contains the deployment domain, and
+ *    custom_domain rows for parents of verified domains are otherwise
+ *    creatable).
+ * 2. cfProvisionZoneCollision (zone-level, after findZone): refuse when the
+ *    RESOLVED ZONE contains (or is) a deployment mail domain. This is what
+ *    blocks SIBLING hostnames — e.g. EMAIL_DOMAIN mail.example.com lives
+ *    in zone example.com, and foo.example.com passes the string guard while
+ *    findZone still lands in the operator's own zone. Token zone-scoping
+ *    cannot cover this case: the token must be able to edit the very zone
+ *    hosting EMAIL_DOMAIN.
+ *
+ * The deployment set covers EMAIL_DOMAIN, FIRST_ALIAS_DOMAIN, ALIAS_DOMAINS,
+ * PREMIUM_ALIAS_DOMAINS AND every `public_domain` row (public domains — the
+ * source of SL subdomains — are valid alias domains even when not mirrored
+ * into ALIAS_DOMAINS; see src/email.ts isValidAliasAddressDomain).
+ */
+async function deploymentMailDomains(
+  db: D1Database,
+  envx: EnvX,
+): Promise<string[]> {
+  const rows = await db
+    .prepare("SELECT domain FROM public_domain")
+    .all<{ domain: string }>();
+  const out: string[] = [];
+  for (const raw of [
+    envx.EMAIL_DOMAIN,
+    envx.FIRST_ALIAS_DOMAIN,
+    ...(envx.ALIAS_DOMAINS ?? "").split(","),
+    ...(envx.PREMIUM_ALIAS_DOMAINS ?? "").split(","),
+    ...rows.results.map((r) => r.domain),
+  ]) {
+    const p = (raw ?? "").trim().toLowerCase().replace(/\.$/, "");
+    if (p && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+/** Layer 1: the domain string overlaps a deployment domain (see above). */
+function cfProvisionCollision(
+  deployment: string[],
+  domain: string,
+): string | null {
+  const d = domain.toLowerCase().replace(/\.$/, "");
+  for (const p of deployment) {
+    if (d === p || d.endsWith(`.${p}`) || p.endsWith(`.${d}`)) return p;
+  }
+  return null;
+}
+
+/** Layer 2: the resolved zone hosts a deployment domain (see above). */
+function cfProvisionZoneCollision(
+  deployment: string[],
+  zoneName: string,
+): string | null {
+  const z = zoneName.toLowerCase().replace(/\.$/, "");
+  for (const p of deployment) {
+    if (p === z || p.endsWith(`.${z}`)) return p;
+  }
+  return null;
+}
+
+/**
+ * POST cf-provision: perform scripts/provision-domain.mjs server-side (zone
+ * lookup -> read-only conflict preflight -> Email Routing -> catch-all ->
+ * ownership TXT -> DMARC), then re-run the page's ownership/MX/SPF/DMARC
+ * checks in-process, persisting the flags exactly like the manual check
+ * buttons (success only — a failed re-check never clears a flag). Every
+ * step is check-before-write (safe to re-click), every refusal condition
+ * (foreign catch-all, foreign MX, deployment-zone collision) is evaluated
+ * BEFORE the first write, and the final flash reports done/skipped per step
+ * plus the two manual leftovers: Email Sending onboarding (no public write
+ * API as of 2026-07-26) and destination-address verification
+ * (docs/DOMAINS.md §1.4/§1.6).
+ *
+ * Flashes never include zone names/ids or raw Cloudflare API error text
+ * (request paths contain zone ids; error bodies contain token-scope
+ * details) — full errors go to console.error for the operator.
+ */
+async function handleCfProvision(c: C, cd: CustomDomainRow): Promise<Response> {
+  const db = c.env.DB;
+  const envx = c.env as EnvX;
+  const back = () =>
+    c.redirect(
+      urlFor("dashboard.domain_detail_dns", { custom_domain_id: cd.id }),
+      302,
+    );
+
+  const deployment = await deploymentMailDomains(db, envx);
+  const collision = cfProvisionCollision(deployment, cd.domain);
+  if (collision) {
+    await flash(
+      c,
+      `Auto-configuration is not available for ${cd.domain}: it overlaps ` +
+        `with this SimpleLogin deployment's own domain ${collision}. ` +
+        "Please set up the DNS records manually.",
+      "error",
+    );
+    return back();
+  }
+
+  const client = new CfClient(envx.CF_API_TOKEN ?? "");
+  const worker = envx.CF_WORKER_NAME || "simplelogin";
+  const done: string[] = [];
+
+  try {
+    // 1. zone lookup (exact name, then walking up parent labels)
+    const zone = await client.findZone(cd.domain);
+    if (!zone) {
+      await flash(
+        c,
+        `No zone for ${cd.domain} was found in the operator's Cloudflare ` +
+          "account. Add the domain to your Cloudflare account first " +
+          "(Account Home > Add a domain), then retry",
+        "error",
+      );
+      return back();
+    }
+    // 2. zone-boundary guard: the resolved zone must not host any of this
+    // deployment's own mail domains — otherwise clicking the button would
+    // let a user plant records (and self-verify a sibling hostname) inside
+    // the operator's own zone. See cfProvisionZoneCollision above.
+    if (cfProvisionZoneCollision(deployment, zone.name)) {
+      await flash(
+        c,
+        `Auto-configuration is not available for ${cd.domain}: its zone ` +
+          "hosts this SimpleLogin deployment's own domains. Please set up " +
+          "the DNS records manually.",
+        "error",
+      );
+      return back();
+    }
+    done.push("zone found");
+
+    // 3. read-only preflight + writes, refusing on any foreign live mail
+    // configuration BEFORE the first write: the apex Email Routing enable
+    // creates + locks the MX/SPF set, which must never happen to a zone
+    // whose mail currently goes elsewhere (and a refusal after it would
+    // leave the zone half-configured).
+    try {
+      // catch-all first (the GET may legitimately fail on a zone where
+      // routing was never enabled — then ensureCatchAllToWorker re-reads it
+      // after the enable, when the endpoint is guaranteed to exist).
+      let preRule: CfCatchAllRule | null | undefined;
+      try {
+        preRule = await client.getCatchAll(zone.id);
+      } catch (e) {
+        if (!(e instanceof CfApiError)) throw e;
+        preRule = undefined;
+      }
+      if (preRule !== undefined) {
+        const conflict = catchAllConflict(preRule, worker);
+        if (conflict) throw new CatchAllConflictError(zone.name, conflict);
+      }
+
+      // Email Routing: enable on the apex, or register the subdomain.
+      // Refuses (before writing) when the name already has foreign MX.
+      const routing = await ensureEmailRouting(client, zone, cd.domain);
+      done.push(
+        routing === "already"
+          ? "Email Routing already enabled"
+          : "Email Routing enabled (MX + SPF records created)",
+      );
+
+      // catch-all -> worker (re-checks the conflict on the same rule)
+      const catchAll = await ensureCatchAllToWorker(
+        client,
+        zone,
+        worker,
+        preRule,
+      );
+      done.push(
+        catchAll === "already"
+          ? `catch-all already routes to worker ${worker}`
+          : `catch-all now routes to worker ${worker}`,
+      );
+    } catch (e) {
+      if (e instanceof ForeignMxError) {
+        await flash(
+          c,
+          `Refusing to enable Email Routing for ${cd.domain}: it already ` +
+            "has MX records pointing somewhere else, and adding " +
+            "Cloudflare's next to them would break the existing mail " +
+            "setup. Remove the old MX records first, then retry",
+          "error",
+        );
+        return back();
+      }
+      if (!(e instanceof CatchAllConflictError)) throw e;
+      await flash(
+        c,
+        `Refusing to change the catch-all rule of ${cd.domain}'s zone: it ` +
+          "routes (or is configured to route) mail somewhere else, and the " +
+          "catch-all is zone-wide — overwriting it could reroute or drop " +
+          "the zone's other mail. Review it in the Cloudflare dashboard " +
+          "(Email Routing > Routing rules) and retry",
+        "error",
+      );
+      return back();
+    }
+
+    // 4. ownership TXT — plants the EXACT record the page displays and the
+    // check-ownership branch expects (sl-verification=<token>)
+    if (cd.ownership_verified) {
+      done.push("ownership TXT skipped (already verified)");
+    } else {
+      const ownership = await ensureTxtRecord(
+        client,
+        zone.id,
+        cd.domain,
+        `sl-verification=${cd.ownership_txt_token}`,
+        { comment: "SimpleLogin ownership verification (auto-configure)" },
+      );
+      done.push(
+        ownership === "already"
+          ? "ownership TXT already present"
+          : "ownership TXT created",
+      );
+    }
+
+    // 5. DMARC, create-if-absent (an existing _dmarc record — e.g. from
+    // Email Sending onboarding — is never modified)
+    const dmarc = await ensureTxtRecord(
+      client,
+      zone.id,
+      `_dmarc.${cd.domain}`,
+      DMARC_RECORD,
+      { skipIfAnyAtName: true, comment: "SimpleLogin (auto-configure)" },
+    );
+    done.push(
+      dmarc === "already"
+        ? "DMARC record already present"
+        : "DMARC record created",
+    );
+  } catch (e) {
+    if (!(e instanceof CfApiError)) throw e;
+    // Full detail (request path with zone id, raw CF error body) is for the
+    // operator's logs only; users get the CF error messages without paths,
+    // plus what already succeeded — completed steps are persisted at
+    // Cloudflare and every step is safe to re-run.
+    console.error(`cf-provision failed for ${cd.domain}: ${e.message}`);
+    const reason =
+      e.errors
+        .map((x) => x.message)
+        .filter(Boolean)
+        .join("; ") || "request failed";
+    await flash(
+      c,
+      `Cloudflare API error while configuring ${cd.domain}: ${reason}.` +
+        (done.length > 0
+          ? ` Steps completed before the error: ${done.join("; ")}.`
+          : "") +
+        " Every step is safe to retry — click the button again once the " +
+        "problem is resolved, or contact the operator",
+      "error",
+    );
+    return back();
+  }
+
+  // 6. re-run the page's ownership/MX/SPF/DMARC checks in-process,
+  // persisting the flags exactly like the manual check buttons — but ONLY
+  // on success: the manual buttons' failure paths clear the flag, which
+  // here would clobber flags on mere DNS lag. (DKIM is not re-checked: the
+  // provisioning steps do not create the DKIM CNAMEs.)
+  if (cd.ownership_verified) {
+    done.push("ownership already verified");
+  } else {
+    const txt = await domainDnsClient.getTxtRecords(cd.domain);
+    if (txt.includes(`sl-verification=${cd.ownership_txt_token}`)) {
+      await db
+        .prepare(
+          "UPDATE custom_domain SET ownership_verified = 1, updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(nowStr(), cd.id)
+        .run();
+      done.push("ownership verified");
+    } else {
+      done.push(
+        "ownership not verified yet (DNS may need a moment — use the Verify button below)",
+      );
+    }
+  }
+  if (cd.verified) {
+    done.push("MX already verified");
+  } else {
+    const found = await domainDnsClient.getMxDomains(cd.domain);
+    if (isMxHostSetEquivalent(found, expectedMxRecords(envx))) {
+      await db
+        .prepare(
+          "UPDATE custom_domain SET verified = 1, updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(nowStr(), cd.id)
+        .run();
+      done.push("MX verified — the domain can start receiving emails");
+    } else {
+      done.push(
+        "MX not verified yet (DNS may need a moment — use the Verify button below)",
+      );
+    }
+  }
+  if (cd.spf_verified) {
+    done.push("SPF already verified");
+  } else {
+    // same parse as the check-spf branch (Email Routing creates the record)
+    const txt = await domainDnsClient.getTxtRecords(cd.domain);
+    const includes = new Set<string>();
+    for (const r of txt) {
+      if (!r.startsWith("v=spf1")) continue;
+      for (const part of r.split(/\s+/)) {
+        if (part.startsWith("include:")) includes.add(part.slice(8));
+      }
+    }
+    if (includes.has(SPF_INCLUDE_DOMAIN)) {
+      await db
+        .prepare(
+          "UPDATE custom_domain SET spf_verified = 1, updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(nowStr(), cd.id)
+        .run();
+      done.push("SPF verified");
+    } else {
+      done.push("SPF not verified yet (DNS may need a moment)");
+    }
+  }
+  if (cd.dmarc_verified) {
+    done.push("DMARC already verified");
+  } else {
+    const txt = await domainDnsClient.getTxtRecords(`_dmarc.${cd.domain}`);
+    if (txt.includes(DMARC_RECORD)) {
+      await db
+        .prepare(
+          "UPDATE custom_domain SET dmarc_verified = 1, updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(nowStr(), cd.id)
+        .run();
+      done.push("DMARC verified");
+    } else {
+      done.push("DMARC not verified yet (DNS may need a moment)");
+    }
+  }
+
+  await flash(
+    c,
+    `Auto-configuration for ${cd.domain}: ${done.join("; ")}. Manual steps ` +
+      "remaining: the operator must onboard the domain onto Email Sending " +
+      "in the Cloudflare dashboard (Compute > Email Service > Email " +
+      "Sending > Onboard Domain — needed for replies sent from this " +
+      "domain's aliases) and verify each mailbox this domain forwards to " +
+      "as an Email Routing destination address (Cloudflare only delivers " +
+      "forwarded mail to verified destinations)",
+    "success",
+  );
+  return back();
+}
+
+// ===========================================================================
 // Route 7: GET|POST /domains/:id/dns
 // ===========================================================================
 
@@ -1844,6 +2267,9 @@ async function renderDnsPage(
         recommended: `${prefix}.${envx.EMAIL_DOMAIN}`,
       })),
       dmarc_record: DMARC_RECORD,
+      // SL subdomains live on a deployment public domain (already fully
+      // provisioned + verified at creation) — never offer provisioning.
+      cf_provision_available: cfProvisionAvailable(envx) && !cd.is_sl_subdomain,
       ...state,
     },
   );
@@ -1884,7 +2310,7 @@ webMailboxDomainPagesRoutes.on(
 
       if (formName === "check-ownership") {
         const expected = `sl-verification=${cd.ownership_txt_token}`;
-        const txt = await getTxtRecords(cd.domain);
+        const txt = await domainDnsClient.getTxtRecords(cd.domain);
         if (txt.includes(expected)) {
           await db
             .prepare(
@@ -1909,7 +2335,7 @@ webMailboxDomainPagesRoutes.on(
         state.ownership_ok = false;
         state.ownership_errors = txt;
       } else if (formName === "check-mx") {
-        const found = await getMxDomains(cd.domain);
+        const found = await domainDnsClient.getMxDomains(cd.domain);
         if (isMxHostSetEquivalent(found, expectedMxRecords(envx))) {
           await db
             .prepare(
@@ -1933,7 +2359,7 @@ webMailboxDomainPagesRoutes.on(
           .sort((a, b) => a[0] - b[0])
           .flatMap(([prio, targets]) => targets.map((t) => `${prio} ${t}`));
       } else if (formName === "check-spf") {
-        const txt = await getTxtRecords(cd.domain);
+        const txt = await domainDnsClient.getTxtRecords(cd.domain);
         const includes = new Set<string>();
         for (const r of txt) {
           if (!r.startsWith("v=spf1")) continue;
@@ -1978,7 +2404,7 @@ webMailboxDomainPagesRoutes.on(
         for (const prefix of DKIM_PREFIXES) {
           const host = `${prefix}.${cd.domain}`;
           const expected = `${prefix}.${envx.EMAIL_DOMAIN}`;
-          const cname = await getCnameRecord(host);
+          const cname = await domainDnsClient.getCnameRecord(host);
           if (cname !== expected) {
             errors.push({
               custom_record: host,
@@ -2027,7 +2453,7 @@ webMailboxDomainPagesRoutes.on(
         state.dkim_ok = false;
         state.dkim_errors = errors;
       } else if (formName === "check-dmarc") {
-        const txt = await getTxtRecords(`_dmarc.${cd.domain}`);
+        const txt = await domainDnsClient.getTxtRecords(`_dmarc.${cd.domain}`);
         if (txt.includes(DMARC_RECORD)) {
           await db
             .prepare(
@@ -2051,6 +2477,32 @@ webMailboxDomainPagesRoutes.on(
         await flash(c, "DMARC: The TXT record is not correctly set", "warning");
         state.dmarc_ok = false;
         state.dmarc_errors = txt;
+      } else if (
+        formName === "cf-provision" &&
+        cfProvisionAvailable(envx) &&
+        !cd.is_sl_subdomain
+      ) {
+        // Feature-gated: without CF_API_TOKEN (or for SL-subdomain rows,
+        // which are born verified on a deployment public domain) this
+        // form-name is unknown and falls through to the GET render like the
+        // other unknown form-names.
+        // Rate-limited: each click spends up to ~9 authenticated Cloudflare
+        // API calls of the operator's account-wide quota (1200 req/5min) —
+        // same webLimiter idiom as web_alias_export in alias-pages.ts.
+        const limiter = await webLimiter(
+          c,
+          "web_cf_provision",
+          "3/minute;20/hour",
+        );
+        if (limiter.exceeded) {
+          return renderErrorPage(
+            c,
+            429,
+            await buildCurrentUser(c, c.get("webUser")),
+          );
+        }
+        await limiter.deduct();
+        return handleCfProvision(c, cd);
       }
     }
     return renderDnsPage(c, cd, state);

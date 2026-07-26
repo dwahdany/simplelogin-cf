@@ -5,6 +5,36 @@
     <h1 class="h2">{{ custom_domain.domain }}</h1>
     <div>Please follow the steps below to set up your domain.</div>
     <div class="small-text mb-5">DNS changes could take up to 24 hours to update.</div>
+    {# One-click provisioning (deviation from upstream): server-side port of
+       scripts/provision-domain.mjs, only rendered when the operator stored a
+       scoped CF_API_TOKEN — see the cf-provision branch in
+       src/web/mailbox-domain-pages.ts. #}
+    {% if cf_provision_available %}
+      <div id="cf-provision-form" class="alert alert-primary">
+        <div class="font-weight-bold">Auto-configure on Cloudflare</div>
+        <div class="mb-2">
+          This instance can set up the Cloudflare side for you: find the
+          domain's zone in the operator's Cloudflare account, enable Email
+          Routing, point the <em>zone-wide</em> catch-all route at this
+          worker, create the ownership TXT and DMARC records, then re-run
+          the ownership, MX, SPF and DMARC checks below. Safe to click again
+          at any time — steps already done are skipped, and it refuses
+          (rather than modifies) any existing mail setup that points
+          somewhere else: foreign MX records, or a catch-all rule with
+          another destination (even a disabled one). Two manual steps remain
+          afterwards, both for the operator: Email Sending onboarding in the
+          Cloudflare dashboard, needed for replies sent <em>from</em> this
+          domain's aliases, and verifying your mailboxes as Email Routing
+          destination addresses — Cloudflare only delivers forwarded mail to
+          verified destinations.
+        </div>
+        <form method="post" action="#cf-provision-form">
+          {{ csrf_form.csrf_token }}
+          <input type="hidden" name="form-name" value="cf-provision">
+          <button type="submit" class="btn btn-primary">Auto-configure on Cloudflare</button>
+        </form>
+      </div>
+    {% endif %}
     {% if not custom_domain.ownership_verified %}
       <div id="ownership-form">
         <div class="font-weight-bold">

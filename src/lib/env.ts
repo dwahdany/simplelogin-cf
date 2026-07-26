@@ -27,6 +27,16 @@ export interface Env {
    * "" counts as unset (same test-config reason as DISABLE_REGISTRATION).
    */
   EMAIL_SERVERS_WITH_PRIORITY?: string;
+  /**
+   * Scoped Cloudflare API token (Zone:Read, DNS:Edit, Email Routing
+   * Rules:Edit) enabling one-click domain provisioning from the dashboard.
+   * Set via `wrangler secret put CF_API_TOKEN`; unset (or "") disables the
+   * feature: the button is hidden and the POST form-name is ignored (falls
+   * through to the page render like an unknown form-name).
+   */
+  CF_API_TOKEN?: string;
+  /** Worker name the provisioned catch-all routes to; default "simplelogin". */
+  CF_WORKER_NAME?: string;
   /** Max subdomains per user (Flask config.MAX_NB_SUBDOMAIN, default 5). */
   MAX_NB_SUBDOMAIN?: string;
   /** Max directories per user (Flask config.MAX_NB_DIRECTORY, default 50). */

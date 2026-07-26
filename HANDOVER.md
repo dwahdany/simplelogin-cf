@@ -190,6 +190,11 @@ Cloudflare DKIM instead of Postfix; `ts_vector` search → LIKE approximation.
   onboarding, which has no public write API), `scripts/backup-d1.sh`,
   `scripts/seed-public-domain.sql`, `docs/DOMAINS.md` (full add-a-domain
   runbook), `test/cors.test.ts` (browser-extension CORS contract).
+  The provisioning script also has a one-click dashboard port ("Auto-
+  configure on Cloudflare" on the custom-domain DNS page), enabled by the
+  `CF_API_TOKEN` secret — `src/lib/cfapi.ts` + the cf-provision branch in
+  `src/web/mailbox-domain-pages.ts`; guards, rate limit and token-scoping
+  requirements in `docs/DOMAINS.md` §3.
 - **Test-env note**: wrangler vars merge into the vitest miniflare env; for
   presence-based flags `""` now means "unset" (`DISABLE_REGISTRATION`,
   `EMAIL_SERVERS_WITH_PRIORITY` are pinned to `""` in vitest.config.ts).
