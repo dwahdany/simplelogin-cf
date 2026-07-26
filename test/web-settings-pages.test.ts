@@ -12,9 +12,14 @@ import { hmac } from "@noble/hashes/hmac.js";
 import { sha3_224 } from "@noble/hashes/sha3.js";
 import { Secret, TOTP } from "otpauth";
 import { beforeEach, describe, expect, it } from "vitest";
+import { outboundEmails } from "../src/email";
 import { hashPassword } from "../src/lib/crypto";
 import { sentEmails } from "../src/lib/mailer";
 import type { UserRow } from "../src/lib/rows";
+import {
+  encodeUnsubscribeSubject,
+  UnsubscribeAction,
+} from "../src/lib/unsubscribe";
 import {
   createAlias,
   createApiKey,
@@ -1418,17 +1423,261 @@ describe("unsubscribe + block_contact", () => {
     expect(res.status).toBe(302);
     expect(await flashes(cookie)).toEqual([]);
   });
+});
 
-  it("encoded unsubscribe flashes Invalid unsubscribe request (deferred)", async () => {
+// --------------------------------------------------------------------------
+// 17. GET /dashboard/unsubscribe/encoded/<encoded_request>
+// --------------------------------------------------------------------------
+
+describe("GET /dashboard/unsubscribe/encoded/<payload>", () => {
+  /** UNSUBSCRIBE_SECRET under the vitest env (FLASK_SECRET + "unsub"). */
+  const UNSUB_SECRET = "test-flask-secretunsub";
+
+  it("flashes Invalid unsubscribe request on garbage or a bad signature", async () => {
     const user = await createUser(env.DB);
     const cookie = await webSession(user);
-    const res = await get("/dashboard/unsubscribe/encoded/whatever", cookie);
+    const signedWithWrongSecret = encodeUnsubscribeSubject(
+      "other-secretunsub",
+      UnsubscribeAction.DisableAlias,
+      1,
+    );
+    for (const payload of ["whatever", signedWithWrongSecret]) {
+      const res = await get(
+        `/dashboard/unsubscribe/encoded/${payload}`,
+        cookie,
+      );
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/dashboard/");
+      expect((await flashes(cookie)).pop()).toEqual({
+        category: "error",
+        message: "Invalid unsubscribe request",
+      });
+    }
+  });
+
+  it("DisableAlias disables the alias and emails its mailboxes", async () => {
+    const user = await createUser(env.DB);
+    const alias = await createAlias(
+      env.DB,
+      user.id,
+      user.default_mailbox_id as number,
+    );
+    const cookie = await webSession(user);
+    const payload = encodeUnsubscribeSubject(
+      UNSUB_SECRET,
+      UnsubscribeAction.DisableAlias,
+      alias.id,
+    );
+    const res = await get(`/dashboard/unsubscribe/encoded/${payload}`, cookie);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(
+      `/dashboard/?highlight_alias_id=${alias.id}`,
+    );
+    expect((await flashes(cookie)).pop()).toEqual({
+      category: "success",
+      message: `Alias ${alias.email} has been blocked`,
+    });
+    const fresh = await env.DB.prepare(
+      "SELECT enabled FROM alias WHERE id = ?1",
+    )
+      .bind(alias.id)
+      .first<{ enabled: number }>();
+    expect(fresh?.enabled).toBe(0);
+    // change_alias_status(message="Set enabled=False via unsubscribe header")
+    const audit = await env.DB.prepare(
+      "SELECT action, message FROM alias_audit_log WHERE alias_id = ?1",
+    )
+      .bind(alias.id)
+      .first<{ action: string; message: string }>();
+    expect(audit?.action).toBe("change_status");
+    expect(audit?.message).toBe(
+      "Set alias status to False. Set enabled=False via unsubscribe header",
+    );
+    // one email per verified mailbox (fixture: the default mailbox).
+    const sent = sentEmails[sentEmails.length - 1];
+    expect(sent?.to).toBe(user.email);
+    expect(sent?.subject).toBe(
+      `Alias ${alias.email} has been disabled successfully`,
+    );
+    expect(sent?.text).toContain(
+      `${env.URL}/dashboard/?highlight_alias_id=${alias.id}`,
+    );
+  });
+
+  it("DisableAlias rejects an alias belonging to another user", async () => {
+    const owner = await createUser(env.DB);
+    const alias = await createAlias(
+      env.DB,
+      owner.id,
+      owner.default_mailbox_id as number,
+    );
+    const user = await createUser(env.DB);
+    const cookie = await webSession(user);
+    const payload = encodeUnsubscribeSubject(
+      UNSUB_SECRET,
+      UnsubscribeAction.DisableAlias,
+      alias.id,
+    );
+    const res = await get(`/dashboard/unsubscribe/encoded/${payload}`, cookie);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/");
+    expect((await flashes(cookie)).pop()?.message).toBe(
+      "Invalid unsubscribe request",
+    );
+    const fresh = await env.DB.prepare(
+      "SELECT enabled FROM alias WHERE id = ?1",
+    )
+      .bind(alias.id)
+      .first<{ enabled: number }>();
+    expect(fresh?.enabled).toBe(1);
+  });
+
+  it("DisableContact blocks the contact and emails the mailboxes", async () => {
+    const user = await createUser(env.DB);
+    const alias = await createAlias(
+      env.DB,
+      user.id,
+      user.default_mailbox_id as number,
+    );
+    const contact = await createContact(env.DB, user.id, alias.id);
+    const cookie = await webSession(user);
+    const payload = encodeUnsubscribeSubject(
+      UNSUB_SECRET,
+      UnsubscribeAction.DisableContact,
+      contact.id,
+    );
+    const res = await get(`/dashboard/unsubscribe/encoded/${payload}`, cookie);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(
+      `/dashboard/alias_contact_manager/${alias.id}?highlight_contact_id=${contact.id}`,
+    );
+    expect((await flashes(cookie)).pop()).toEqual({
+      category: "success",
+      message: `Emails sent from ${contact.website_email} are now blocked`,
+    });
+    const fresh = await env.DB.prepare(
+      "SELECT block_forward FROM contact WHERE id = ?1",
+    )
+      .bind(contact.id)
+      .first<{ block_forward: number }>();
+    expect(fresh?.block_forward).toBe(1);
+    const audit = await env.DB.prepare(
+      "SELECT action, message FROM alias_audit_log WHERE alias_id = ?1",
+    )
+      .bind(alias.id)
+      .first<{ action: string; message: string }>();
+    expect(audit?.action).toBe("update_contact");
+    const sent = sentEmails[sentEmails.length - 1];
+    expect(sent?.to).toBe(user.email);
+    expect(sent?.subject).toBe(
+      `Emails from ${contact.website_email} to ${alias.email} are now blocked`,
+    );
+  });
+
+  it("UnsubscribeNewsletter clears notification for the current user only", async () => {
+    const user = await createUser(env.DB, { notification: 1 });
+    const cookie = await webSession(user);
+    const payload = encodeUnsubscribeSubject(
+      UNSUB_SECRET,
+      UnsubscribeAction.UnsubscribeNewsletter,
+      user.id,
+    );
+    const res = await get(`/dashboard/unsubscribe/encoded/${payload}`, cookie);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/dashboard/");
     expect((await flashes(cookie)).pop()).toEqual({
-      category: "error",
-      message: "Invalid unsubscribe request",
+      category: "success",
+      message: "You've unsubscribed from the newsletter",
     });
+    expect((await userRow(user.id))?.notification).toBe(0);
+    const sent = sentEmails[sentEmails.length - 1];
+    expect(sent?.to).toBe(user.email);
+    expect(sent?.subject).toBe(
+      "You have been unsubscribed from SimpleLogin newsletter",
+    );
+
+    // another user's id in a validly-signed payload => E511 => invalid flash.
+    const other = await createUser(env.DB, { notification: 1 });
+    const foreign = encodeUnsubscribeSubject(
+      UNSUB_SECRET,
+      UnsubscribeAction.UnsubscribeNewsletter,
+      other.id,
+    );
+    const res2 = await get(`/dashboard/unsubscribe/encoded/${foreign}`, cookie);
+    expect(res2.status).toBe(302);
+    expect((await flashes(cookie)).pop()?.message).toBe(
+      "Invalid unsubscribe request",
+    );
+    expect((await userRow(other.id))?.notification).toBe(1);
+  });
+
+  it("OriginalUnsubscribeMailto re-sends the original unsubscribe mail", async () => {
+    const user = await createUser(env.DB);
+    const alias = await createAlias(
+      env.DB,
+      user.id,
+      user.default_mailbox_id as number,
+    );
+    const cookie = await webSession(user);
+    outboundEmails.length = 0;
+    // The same payload the email worker signs into a forwarded mailto-only
+    // List-Unsubscribe header (see test/email.test.ts).
+    const payload = encodeUnsubscribeSubject(
+      UNSUB_SECRET,
+      UnsubscribeAction.OriginalUnsubscribeMailto,
+      {
+        aliasId: alias.id,
+        recipient: "unsub@list.example.com",
+        subject: "stop",
+      },
+    );
+    const res = await get(`/dashboard/unsubscribe/encoded/${payload}`, cookie);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/");
+    expect((await flashes(cookie)).pop()).toEqual({
+      category: "success",
+      message: "The original unsubscribe request has been forwarded",
+    });
+    // sent from the alias to the original list address, original subject.
+    const out = outboundEmails[outboundEmails.length - 1];
+    expect(out?.to).toBe("unsub@list.example.com");
+    expect(out?.bindingFrom).toBe(alias.email);
+    expect(out?.raw).toContain(`From: ${alias.email}\r\n`);
+    expect(out?.raw).toContain("Subject: stop\r\n");
+    expect(out?.raw).toContain("To: unsub@list.example.com\r\n");
+    // TransactionalEmail.create(email=to_email)
+    const trans = await env.DB.prepare(
+      "SELECT id FROM transactional_email WHERE email = ?1",
+    )
+      .bind("unsub@list.example.com")
+      .first<{ id: number }>();
+    expect(trans).not.toBeNull();
+    expect(out?.raw).toContain(
+      `X-SimpleLogin-Transactional-ID: ${trans?.id}\r\n`,
+    );
+  });
+
+  it("OriginalUnsubscribeMailto rejects a foreign alias id", async () => {
+    const owner = await createUser(env.DB);
+    const alias = await createAlias(
+      env.DB,
+      owner.id,
+      owner.default_mailbox_id as number,
+    );
+    const user = await createUser(env.DB);
+    const cookie = await webSession(user);
+    outboundEmails.length = 0;
+    const payload = encodeUnsubscribeSubject(
+      UNSUB_SECRET,
+      UnsubscribeAction.OriginalUnsubscribeMailto,
+      { aliasId: alias.id, recipient: "unsub@list.example.com", subject: "" },
+    );
+    const res = await get(`/dashboard/unsubscribe/encoded/${payload}`, cookie);
+    expect(res.status).toBe(302);
+    expect((await flashes(cookie)).pop()?.message).toBe(
+      "Invalid unsubscribe request",
+    );
+    expect(outboundEmails.length).toBe(0);
   });
 });
 

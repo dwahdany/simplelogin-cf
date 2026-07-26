@@ -12,13 +12,21 @@
  * - parallel_limiter.lock is a no-op (Flask behavior without Redis).
  * - DNS checks go through DNS-over-HTTPS (cloudflare-dns.com); any lookup
  *   error behaves as "no records", like Flask swallowing dnspython errors.
- * - PGP key import is DEFERRED (no GPG on Workers): `form-name=pgp action=save`
- *   flashes the exact PGPException message and stores nothing.
+ * - PGP key import runs on openpgp.js instead of gnupg (src/lib/pgp.ts):
+ *   same load-and-test-encrypt semantics and UPPERCASE hex fingerprint as
+ *   Flask's load_public_key_and_check, same flashes.
  * - Mailbox.is_proton() uses only the static domain list (no MX lookup).
  * - S3 uploads/presigned URLs are replaced by KV objects (`file:<path>`)
  *   served from GET /dashboard/files/<path> with an ownership check.
  * - Legacy itsdangerous-signed links (mailbox_verify / confirm_change without
  *   `code`) are rejected with the documented "Invalid link" flashes.
+ * - Custom-domain DNS verification is adapted to this deployment's mail
+ *   platform (Cloudflare Email Routing inbound / Email Sending outbound):
+ *   the MX check compares host SETS ignoring priorities (see
+ *   isMxHostSetEquivalent), the expected SPF include is Cloudflare's
+ *   _spf.mx.cloudflare.net instead of Flask's {EMAIL_DOMAIN} (see
+ *   SPF_INCLUDE_DOMAIN), and DKIM verifies on the primary dkim._domainkey
+ *   CNAME alone (see the check-dkim branch). Rationale at each site.
  */
 
 import type { Context, MiddlewareHandler } from "hono";
@@ -32,6 +40,7 @@ import {
   getMailboxById,
   userIsPremium,
 } from "../lib/models";
+import { loadPublicKeyAndCheck, PGPException } from "../lib/pgp";
 import type {
   AliasRow,
   CustomDomainRow,
@@ -72,12 +81,43 @@ type C = Context<WebEnv>;
 const FLAG_ADMIN_DISABLED = 1; // Mailbox.FLAG_ADMIN_DISABLED
 const MAX_ACTIVATION_TRIES = 3;
 const MAX_MAILBOXES_PER_DOMAIN = 20;
-const MAX_NB_SUBDOMAIN = 5;
-const MAX_NB_DIRECTORY = 50;
 const ALIAS_TRASH_DAYS = 30;
 const DELETE_IMMEDIATELY = 1; // UserAliasDeleteAction.DeleteImmediately
 const REASON_DIRECTORY_DELETED = 3; // AliasDeleteReason.DirectoryDeleted
 const DMARC_RECORD = "v=DMARC1; p=quarantine; pct=100; adkim=s; aspf=s";
+
+/**
+ * Expected SPF include for custom domains. DELIBERATE DEVIATION from Flask
+ * (custom_domain_validation.py get_expected_spf_domain L113-121: the include
+ * is config.EMAIL_DOMAIN, i.e. simplelogin.co on the original deployment):
+ * on this deployment outbound alias mail is sent through Cloudflare Email
+ * Sending, so the SPF include that actually authorizes the sending servers
+ * is Cloudflare's, not the worker's EMAIL_DOMAIN (whose zone publishes the
+ * same include itself). The check-spf failure flash (Flask domain_detail.py
+ * L103 names config.EMAIL_DOMAIN) names this domain for the same reason.
+ */
+const SPF_INCLUDE_DOMAIN = "_spf.mx.cloudflare.net";
+
+// Flask config.py L142-143 hardcodes MAX_NB_DIRECTORY = 50 and
+// MAX_NB_SUBDOMAIN = 5; this port reads env vars of the same name
+// (src/lib/env.ts) with the Flask values as defaults (unset/"" or a
+// non-numeric value counts as unset).
+const DEFAULT_MAX_NB_SUBDOMAIN = 5;
+const DEFAULT_MAX_NB_DIRECTORY = 50;
+
+function envInt(raw: string | undefined, fallback: number): number {
+  const n = Number.parseInt(raw ?? "", 10);
+  return Number.isNaN(n) ? fallback : n;
+}
+
+function maxNbSubdomain(env: EnvX): number {
+  return envInt(env.MAX_NB_SUBDOMAIN, DEFAULT_MAX_NB_SUBDOMAIN);
+}
+
+function maxNbDirectory(env: EnvX): number {
+  return envInt(env.MAX_NB_DIRECTORY, DEFAULT_MAX_NB_DIRECTORY);
+}
+
 const PROTON_EMAIL_DOMAINS = [
   "proton.me",
   "protonmail.com",
@@ -315,11 +355,11 @@ async function buildPageUser(c: C, user: UserRow): Promise<CurrentUserCtx> {
     include_sender_in_reverse_alias: !!user.include_sender_in_reverse_alias,
     subdomain_quota: Math.min(
       user.subdomain_quota,
-      MAX_NB_SUBDOMAIN - (subCount?.n ?? 0),
+      maxNbSubdomain(c.env as EnvX) - (subCount?.n ?? 0),
     ),
     directory_quota: Math.min(
       user.directory_quota,
-      MAX_NB_DIRECTORY - (dirCount?.n ?? 0),
+      maxNbDirectory(c.env as EnvX) - (dirCount?.n ?? 0),
     ),
   } as CurrentUserCtx;
 }
@@ -757,14 +797,28 @@ async function getCnameRecord(name: string): Promise<string | null> {
   return data;
 }
 
-interface ExpectedMx {
+export interface ExpectedMx {
   priority: number;
   recommended: string;
   allowed: string[];
 }
 
-/** config.EMAIL_SERVERS_WITH_PRIORITY, e.g. "10 mx1.sl.example.com., 20 mx2...". */
-function expectedMxRecords(env: EnvX): ExpectedMx[] {
+/**
+ * config.EMAIL_SERVERS_WITH_PRIORITY -> [(priority, host), ...] (config.py
+ * L184-186). Flask reads a Python literal via literal_eval, e.g.
+ * `[(10, "mx1.simplelogin.co."), (20, "mx2.simplelogin.co.")]`; this port
+ * keeps the same semantics with a TS-friendly spelling: comma-separated
+ * "<priority> <host>" pairs. Production value on this deployment (Cloudflare
+ * Email Routing's hosts):
+ * "10 route1.mx.cloudflare.net.,20 route2.mx.cloudflare.net.,30 route3.mx.cloudflare.net."
+ * A trailing dot is appended when missing. "" counts as unset (src/lib/env.ts)
+ * and keeps the fallback mx1/mx2.{EMAIL_DOMAIN} pair (Flask has no fallback —
+ * the var is mandatory there). Exported for unit tests.
+ */
+export function expectedMxRecords(env: {
+  EMAIL_DOMAIN: string;
+  EMAIL_SERVERS_WITH_PRIORITY?: string;
+}): ExpectedMx[] {
   const raw = env.EMAIL_SERVERS_WITH_PRIORITY;
   const records: ExpectedMx[] = [];
   if (raw) {
@@ -797,18 +851,42 @@ function expectedMxRecords(env: EnvX): ExpectedMx[] {
   return records.sort((a, b) => a.priority - b.priority);
 }
 
-/** dns_utils.is_mx_equivalent: positional match over ascending priorities. */
-function isMxEquivalent(
-  found: Map<number, string[]>,
-  expected: ExpectedMx[],
+/**
+ * MX verification passes when the domain's actual MX HOST SET equals the
+ * expected host set — hosts compared case-insensitively with a normalized
+ * trailing dot — IGNORING priorities and record order.
+ *
+ * DELIBERATE DEVIATION from Flask's is_mx_equivalent
+ * (custom_domain_validation.py L28-52), which requires the found priority
+ * COUNT to equal the expected record count and, walking found priorities in
+ * ascending order, every host at position i to be allowed by the i-th
+ * expected record: Cloudflare Email Routing creates the
+ * route1/2/3.mx.cloudflare.net records itself with per-zone priorities the
+ * operator can neither predict nor configure, so the positional check could
+ * never accept a correctly-onboarded zone. Host-set equality keeps the
+ * strictness that matters (no missing hosts, no extra/leftover MX hosts that
+ * could siphon mail) while tolerating Cloudflare-assigned priorities.
+ * Pure function, exported so tests can unit-test it without DoH.
+ */
+export function isMxHostSetEquivalent(
+  mxDomains: Map<number, string[]>,
+  expectedMxDomains: ExpectedMx[],
 ): boolean {
-  const prios = [...found.keys()].sort((a, b) => a - b);
-  if (prios.length !== expected.length) return false;
-  for (let i = 0; i < prios.length; i++) {
-    const targets = found.get(prios[i]) ?? [];
-    for (const t of targets) {
-      if (!expected[i].allowed.includes(t)) return false;
-    }
+  const normalize = (host: string) => {
+    const h = host.trim().toLowerCase();
+    return h.endsWith(".") ? h : `${h}.`;
+  };
+  const found = new Set<string>();
+  for (const targets of mxDomains.values()) {
+    for (const target of targets) found.add(normalize(target));
+  }
+  const expected = new Set<string>();
+  for (const record of expectedMxDomains) {
+    for (const target of record.allowed) expected.add(normalize(target));
+  }
+  if (found.size !== expected.size) return false;
+  for (const host of found) {
+    if (!expected.has(host)) return false;
   }
   return true;
 }
@@ -1382,14 +1460,40 @@ webMailboxDomainPagesRoutes.on(
             );
             return c.redirect(detailUrl, 302);
           }
-          // DEFERRED (no GPG on Workers): behave like PGPException — nothing
-          // stored, error flash, fall through to render.
+          // mailbox_detail.py L164-181: validate with a test encryption, then
+          // store key + fingerprint. On PGPException Flask flashes and falls
+          // through to render — WITHOUT rolling back the in-session
+          // `mailbox.pgp_public_key = <submitted>` assignment (L164), so the
+          // rendered textarea shows the rejected key (never committed).
+          const submitted = field(fd, "pgp");
+          let fingerprint: string;
+          try {
+            fingerprint = await loadPublicKeyAndCheck(submitted ?? "");
+          } catch (e) {
+            if (!(e instanceof PGPException)) throw e;
+            await flash(
+              c,
+              "Cannot add the public key, please verify it",
+              "error",
+            );
+            return renderMailboxDetail(c, {
+              ...mailbox,
+              pgp_public_key: submitted,
+            });
+          }
+          await db
+            .prepare(
+              `UPDATE mailbox SET pgp_public_key = ?1, pgp_finger_print = ?2,
+               updated_at = ?3 WHERE id = ?4`,
+            )
+            .bind(submitted, fingerprint, nowStr(), mailbox.id)
+            .run();
           await flash(
             c,
-            "Cannot add the public key, please verify it",
-            "error",
+            "Your PGP public key is saved successfully",
+            "success",
           );
-          return renderMailboxDetail(c, mailbox);
+          return c.redirect(detailUrl, 302);
         }
         if (action === "remove") {
           await db
@@ -1734,7 +1838,7 @@ async function renderDnsPage(
         recommended: `sl-verification=${cd.ownership_txt_token ?? ""}`,
       },
       expected_mx_records: mx,
-      spf_record: `v=spf1 include:${envx.EMAIL_DOMAIN} ~all`,
+      spf_record: `v=spf1 include:${SPF_INCLUDE_DOMAIN} ~all`,
       dkim_records: DKIM_PREFIXES.map((prefix) => ({
         domain: prefix,
         recommended: `${prefix}.${envx.EMAIL_DOMAIN}`,
@@ -1806,7 +1910,7 @@ webMailboxDomainPagesRoutes.on(
         state.ownership_errors = txt;
       } else if (formName === "check-mx") {
         const found = await getMxDomains(cd.domain);
-        if (isMxEquivalent(found, expectedMxRecords(envx))) {
+        if (isMxHostSetEquivalent(found, expectedMxRecords(envx))) {
           await db
             .prepare(
               "UPDATE custom_domain SET verified = 1, updated_at = ?1 WHERE id = ?2",
@@ -1837,7 +1941,8 @@ webMailboxDomainPagesRoutes.on(
             if (part.startsWith("include:")) includes.add(part.slice(8));
           }
         }
-        if (includes.has(envx.EMAIL_DOMAIN)) {
+        // Cloudflare's include, not Flask's EMAIL_DOMAIN — see SPF_INCLUDE_DOMAIN.
+        if (includes.has(SPF_INCLUDE_DOMAIN)) {
           await db
             .prepare(
               "UPDATE custom_domain SET spf_verified = 1, updated_at = ?1 WHERE id = ?2",
@@ -1859,7 +1964,7 @@ webMailboxDomainPagesRoutes.on(
         cd = { ...cd, spf_verified: 0 };
         await flash(
           c,
-          `SPF: ${envx.EMAIL_DOMAIN} is not included in your SPF record.`,
+          `SPF: ${SPF_INCLUDE_DOMAIN} is not included in your SPF record.`,
           "warning",
         );
         state.spf_ok = false;
@@ -1894,11 +1999,19 @@ webMailboxDomainPagesRoutes.on(
             302,
           );
         }
-        // legacy grace: keep dkim_verified while dkim._domainkey is still correct
-        const mainStillOk = !errors.some(
+        // DELIBERATE DEVIATION from Flask (custom_domain_validation.py
+        // L170-192: a NEW verification needs all three CNAMEs; only domains
+        // that are already dkim_verified keep the flag when just
+        // dkim._domainkey is still correct — the "legacy grace"): this worker
+        // only DKIM-signs with the single EMAIL_DOMAIN key, and custom-domain
+        // DKIM actually comes from Cloudflare Email Sending onboarding, so
+        // dkim02/dkim03 are pure legacy here. The primary record alone
+        // verifies (first time too), while missing dkim02/03 records are
+        // still reported below like Flask's grace path does.
+        const mainOk = !errors.some(
           (e) => e.custom_record === `dkim._domainkey.${cd.domain}`,
         );
-        const newVerified = cd.dkim_verified && mainStillOk ? 1 : 0;
+        const newVerified = mainOk ? 1 : 0;
         await db
           .prepare(
             "UPDATE custom_domain SET dkim_verified = ?1, updated_at = ?2 WHERE id = ?3",
@@ -2576,9 +2689,10 @@ webMailboxDomainPagesRoutes.on(
           )
           .bind(user.id)
           .first<{ n: number }>();
+        const maxSubdomains = maxNbSubdomain(c.env as EnvX);
         const quota = Math.min(
           user.subdomain_quota,
-          MAX_NB_SUBDOMAIN - (subCount?.n ?? 0),
+          maxSubdomains - (subCount?.n ?? 0),
         );
         const failRedirect = async (msg: string) => {
           await flash(c, msg, "error");
@@ -2586,7 +2700,7 @@ webMailboxDomainPagesRoutes.on(
         };
         if (quota <= 0) {
           return failRedirect(
-            `You can't create more than ${MAX_NB_SUBDOMAIN} subdomains`,
+            `You can't create more than ${maxSubdomains} subdomains`,
           );
         }
         const subdomain = subdomainRaw.toLowerCase().trim();
@@ -2984,14 +3098,15 @@ webMailboxDomainPagesRoutes.on(
           .prepare("SELECT COUNT(*) AS n FROM directory WHERE user_id = ?1")
           .bind(user.id)
           .first<{ n: number }>();
+        const maxDirectories = maxNbDirectory(c.env as EnvX);
         const quota = Math.min(
           user.directory_quota,
-          MAX_NB_DIRECTORY - (dirCount?.n ?? 0),
+          maxDirectories - (dirCount?.n ?? 0),
         );
         if (quota <= 0) {
           await flash(
             c,
-            `You cannot have more than ${MAX_NB_DIRECTORY} directories`,
+            `You cannot have more than ${maxDirectories} directories`,
             "warning",
           );
           return c.redirect(dirUrl, 302);

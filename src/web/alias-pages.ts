@@ -57,6 +57,7 @@ import {
   makeField,
   validateCsrfToken,
 } from "../lib/web/forms";
+import { webLimiter } from "../lib/web/limiter";
 import {
   buildCurrentUser,
   type FlashCategory,
@@ -1798,6 +1799,11 @@ webAliasPagesRoutes.get(
   requireWebLogin,
   requireWebSudo,
   async (c) => {
+    // Flask: @limiter.limit("2/minute") (specs/web/02-alias-pages.md §export)
+    const limiter = await webLimiter(c, "web_alias_export", "2/minute");
+    if (limiter.exceeded) return renderErrorPage(c, 429);
+    await limiter.deduct();
+
     const user = c.get("webUser");
     const db = c.env.DB;
 

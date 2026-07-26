@@ -11,12 +11,39 @@
  * - reply-phase delivery rebuilds the MIME header section from the raw
  *   message (header whitelist, From = alias, To/Cc = contact addresses,
  *   SL Message-ID) and sends through the SEND_EMAIL binding with a VERP
- *   envelope sender. Every outbound send is also recorded in the exported
- *   `outboundEmails` array so tests can assert on the raw content.
+ *   envelope sender. Under test (TEST_MIGRATIONS binding present) every
+ *   outbound send is also recorded in the exported `outboundEmails` array so
+ *   tests can assert on the raw content; in production nothing is captured.
+ *
+ * Deliberate deviations from Flask (each documented at its site):
+ * - the per-minute flood limit (app/email/rate_limit.py) accepts-and-drops
+ *   with a blocked EmailLog instead of rejecting E522 — rejects are permanent
+ *   on this platform (no tempfail), so rejecting would bounce legit bursts;
+ * - rewrite-mode forwards stamp an X-SimpleLogin-Loop-Count header and inbound
+ *   mail whose count exceeds MAX_LOOP_COUNT is accepted-and-dropped with a
+ *   blocked EmailLog (defense-in-depth; Flask relies on other loop signals);
+ * - inbound DSN detection (no direct Flask equivalent — Flask receives its
+ *   bounces on signed VERP envelopes): because outbound mail is enveloped
+ *   with its From address, downstream bounces come back to the reverse alias
+ *   (forward phase) or the alias (reply phase) as ordinary inbound mail.
+ *   dispatch() detects them (null/mailer-daemon sender + delivery-status
+ *   report) before the null-sender E206 drop, attributes them through the
+ *   embedded X-SimpleLogin-EmailLog-ID header (Message-ID lookup as a
+ *   fallback) and runs the Flask handle_bounce side effects; unattributable
+ *   DSNs fall through to the pre-existing paths (see handleInboundDsn);
+ * - notify-other-mailbox copies swap the reply's X-SimpleLogin-EmailLog-ID
+ *   for an X-SimpleLogin-Transactional-ID so their bounces are recorded like
+ *   Flask's transactional VERP bounces instead of flagging the reply;
+ * - transient-send retry (no Flask equivalent — Flask hands transient SMTP
+ *   failures to the Postfix queue): a send_email binding failure on a fully
+ *   built forward/reply stashes the message in KV ("retry:<uuid>", 7-day TTL)
+ *   and enqueues the 'retry-email' job with growing backoff instead of
+ *   turning into a permanent SMTP reject at the sender's MTA (see
+ *   scheduleEmailRetry / src/jobs/handlers/retry-email.ts).
  */
 
 import { canonicalizeEmail, randomString, sanitizeEmail } from "./lib/crypto";
-import { addDays, nowStr, toDate, toStr } from "./lib/dates";
+import { addDays, addMinutes, nowStr, toDate, toStr } from "./lib/dates";
 import { dkimSignOutbound } from "./lib/dkim";
 import type { Env } from "./lib/env";
 import { sendTransactionalEmail } from "./lib/mailer";
@@ -27,7 +54,9 @@ import {
   getCustomDomainById,
   getMailboxById,
   getUserById,
+  userIsPremium,
 } from "./lib/models";
+import { encryptMessage, PGPException } from "./lib/pgp";
 import type {
   AliasRow,
   ContactRow,
@@ -38,6 +67,11 @@ import type {
   PublicDomainRow,
   UserRow,
 } from "./lib/rows";
+import {
+  encodeUnsubscribeUrl,
+  UnsubscribeAction,
+  unsubscribeSecret,
+} from "./lib/unsubscribe";
 
 // ---- SMTP statuses (app/email/status.py, verbatim) ----
 const E200 = "250 Message accepted for delivery";
@@ -63,6 +97,9 @@ const E515 = "550 SL E515 Email not exist";
 const E516 = "550 SL E516 invalid mailbox";
 const E518 = "550 SL E518 Disabled mailbox";
 const E520 = "550 SL E520 Unverified custom domain";
+const E522 =
+  "550 SL E522 The user you are trying to contact is receiving mail " +
+  "at a rate that prevents additional messages from being delivered.";
 const E524 = "550 SL E524 Wrong use of reverse-alias";
 const E525 = "550 SL E525 Alias loop";
 const E526 = "550 SL E526 Too many recipients";
@@ -76,6 +113,28 @@ const VERP_MESSAGE_LIFETIME = 5 * 86400;
 const MAX_EMAIL_FORWARD_RECIPIENTS = 30;
 const CONTACT_MAX_NAME_LENGTH = 512;
 const MAILBOX_FLAG_ADMIN_DISABLED = 1;
+
+// Per-minute flood limit (app/config.py): nb max of activity (forward/reply)
+// an alias / a mailbox can have during 1 min.
+const MAX_ACTIVITY_DURING_MINUTE_PER_ALIAS = 10;
+const MAX_ACTIVITY_DURING_MINUTE_PER_MAILBOX = 15;
+
+// Loop hardening (deviation, no Flask equivalent): rewrite-mode outbound
+// forwards stamp this header; inbound mail whose value exceeds MAX_LOOP_COUNT
+// is accepted-and-dropped with a blocked EmailLog (see handleForwardPhase).
+const LOOP_COUNT_HEADER = "X-SimpleLogin-Loop-Count";
+const MAX_LOOP_COUNT = 5;
+
+// SL_EMAIL_LOG_ID (app/email/headers.py): stamped on every outbound forward /
+// reply. Under the envelope model it is also how an inbound DSN is attributed
+// back to its email log (see handleInboundDsn).
+const EMAIL_LOG_HEADER = "X-SimpleLogin-EmailLog-ID";
+// Deviation (no Flask equivalent): notify-other-mailbox copies carry the
+// transactional_email id instead of the reply's email-log id, so a bounced
+// notification records a Bounce row on the notified mailbox — the same
+// outcome as Flask's transactional VERP envelope — instead of marking the
+// successfully delivered reply as bounced.
+const TRANSACTIONAL_ID_HEADER = "X-SimpleLogin-Transactional-ID";
 
 const VERP_TYPE_BOUNCE_FORWARD = 0;
 const VERP_TYPE_BOUNCE_REPLY = 1;
@@ -138,7 +197,12 @@ export interface OutboundEmail {
   raw: string;
 }
 
-/** Every reply-phase / notification outbound send, oldest first (test seam). */
+/**
+ * Every reply-phase / notification outbound send, oldest first. Test seam
+ * ONLY: sendRawEmail pushes here only when the env carries the vitest-provided
+ * TEST_MIGRATIONS binding — in production retaining up to 200 full raw
+ * messages would pin users' mail in isolate memory indefinitely.
+ */
 export const outboundEmails: OutboundEmail[] = [];
 const MAX_OUTBOUND_CAPTURED = 200;
 
@@ -191,17 +255,29 @@ async function dispatch(
 
   const reverse = await isReverseAlias(db, env, rcptTo);
 
+  // Inbound DSN (bounce) detection MUST run before the null-sender E206 drop
+  // below: under the envelope model (§0 of HANDOVER, file-top block) a
+  // forward-phase bounce arrives as a null-sender DSN addressed to the
+  // reverse alias, which E206 would black-hole. An unattributable DSN falls
+  // through to the pre-existing handling (E206 drop here / ordinary
+  // forward-phase delivery of the report) — documented deviation.
+  const dsn = await handleInboundDsn(message, env, mailFrom, rcptTo, reverse);
+  if (dsn.result) return dsn.result;
+  // The detector may have consumed the single-use raw stream; when it did,
+  // fall through with a replayed copy.
+  const inbound = dsn.message ?? message;
+
   // Out-of-office auto-reply to a reverse alias with a null sender.
   if (isNullSender(mailFrom) && reverse) return accept(E206);
 
   // noreply address.
   if (getNoReplies(env).includes(rcptTo)) {
-    await sendNoReplyResponse(db, env, mailFrom, message);
+    await sendNoReplyResponse(db, env, mailFrom, inbound);
     return accept(E200);
   }
 
-  if (reverse) return handleReplyPhase(message, env, mailFrom, rcptTo);
-  return handleForwardPhase(message, env, mailFrom, rcptTo);
+  if (reverse) return handleReplyPhase(inbound, env, mailFrom, rcptTo);
+  return handleForwardPhase(inbound, env, mailFrom, rcptTo);
 }
 
 function isNullSender(mailFrom: string): boolean {
@@ -209,7 +285,20 @@ function isNullSender(mailFrom: string): boolean {
 }
 
 function getNoReplies(env: Env): string[] {
-  return [`noreply@${env.EMAIL_DOMAIN}`];
+  // Flask NOREPLIES defaults to [NOREPLY_EMAIL] = ["noreply@EMAIL_DOMAIN"]
+  // (app/config.py NOREPLY). The dashed "no-reply@" spelling is ALSO accepted
+  // inbound (deviation, defensive): earlier builds of this port sent
+  // transactional mail from no-reply@, so replies to that address must keep
+  // being swallowed here instead of bouncing with E515.
+  return [`noreply@${env.EMAIL_DOMAIN}`, `no-reply@${env.EMAIL_DOMAIN}`];
+}
+
+/** Value of the X-SimpleLogin-Loop-Count header; 0 when absent or invalid. */
+function getLoopCount(headers: Headers): number {
+  const value = getHeaderValue(headers, LOOP_COUNT_HEADER);
+  if (!value) return 0;
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
 /** is_reverse_alias (email_utils.py): DB lookup first, legacy prefixes after. */
@@ -327,6 +416,39 @@ async function handleForwardPhase(
     user,
   );
   if (!contact) return rejectWith(E504);
+
+  // Loop hardening (deviation, defense-in-depth — Flask relies on other
+  // signals: the own-mailbox cycle check above and the mailbox-is-alias
+  // break below): rewrite-mode forwards stamp X-SimpleLogin-Loop-Count on
+  // the outbound copy (forwardToMailbox step 9), so an inbound value above
+  // MAX_LOOP_COUNT means the message has re-entered this worker too many
+  // times (e.g. the mailbox auto-forwards back into another alias). Accept
+  // and drop with a blocked EmailLog: rejects are permanent here (no
+  // tempfail) and the drop stays visible in the alias activity.
+  if (getLoopCount(message.headers) > MAX_LOOP_COUNT) {
+    await createEmailLogRow(db, {
+      userId: contact.user_id,
+      contactId: contact.id,
+      aliasId: contact.alias_id,
+      blocked: 1,
+    });
+    return accept(E209);
+  }
+
+  // Per-minute flood limit (rate_limited_forward_phase, app/email/
+  // rate_limit.py). Flask rejects with E522; here the message is accepted
+  // and dropped with a blocked EmailLog instead (deviation — no tempfail on
+  // this platform, an E522 reject would permanently bounce legit bursts).
+  if (await rateLimitedForAliasOrMailbox(db, alias)) {
+    if (await shouldIgnoreBounce(db, mailFrom)) return accept(E207);
+    await createEmailLogRow(db, {
+      userId: contact.user_id,
+      contactId: contact.id,
+      aliasId: contact.alias_id,
+      blocked: 1,
+    });
+    return accept(E522);
+  }
 
   // Reply-To contacts (step 2.5): a reverse-alias contact is created for each
   // Reply-To address; they are collected so the Reply-To header can be
@@ -505,7 +627,7 @@ async function forwardToMailbox(
   if (!buffered) {
     const xHeaders = new Headers();
     xHeaders.set("X-SimpleLogin-Type", "Forward");
-    xHeaders.set("X-SimpleLogin-EmailLog-ID", String(emailLog.id));
+    xHeaders.set(EMAIL_LOG_HEADER, String(emailLog.id));
     if (user.include_header_email_header) {
       xHeaders.set("X-SimpleLogin-Envelope-From", mailFrom);
       xHeaders.set(
@@ -556,12 +678,40 @@ async function forwardToMailbox(
     );
   }
 
-  // Step 8 (PGP) is a body rewrite skipped like the reply phase. Step 4
-  // (SpamAssassin) is config-gated off.
+  // Step 8: PGP (email_handler.py L884-899). Encrypt when the mailbox has PGP
+  // enabled (Mailbox.pgp_enabled(): pgp_finger_print set AND not disable_pgp),
+  // the user is premium and the alias doesn't opt out. Flask encrypts HERE —
+  // before the reverse-alias From/To/Cc rewrites and List-Unsubscribe (steps
+  // 9-16) — but prepare_pgp_message moves every non-MIME header onto the
+  // OUTER multipart/encrypted envelope, so those later rewrites apply to the
+  // outer message; only the MIME headers + body get encrypted. Mutating `hs`
+  // in place here reproduces that exactly.
+  if (
+    mailbox.pgp_finger_print &&
+    !mailbox.disable_pgp &&
+    !alias.disable_pgp &&
+    (await userIsPremium(db, user))
+  ) {
+    try {
+      outBody = await preparePgpMessage(
+        hs,
+        outBody,
+        mailbox.pgp_public_key ?? "",
+      );
+    } catch (e) {
+      if (!(e instanceof PGPException)) throw e;
+      // Failure banner (email_handler.py L891-899): deliver unencrypted with
+      // the notice prepended (add_header's html defaults to the text).
+      console.warn(`cannot encrypt message for mailbox ${mailbox.email}:`, e);
+      const banner = `PGP encryption fails with ${mailbox.email}'s PGP key`;
+      outBody = addBodyHeader(hs, outBody, banner, banner);
+    }
+  }
+  // Step 4 (SpamAssassin) is config-gated off.
 
   // Step 9: X-SimpleLogin-* headers (added after the whitelist so they stay).
   setHeader(hs, "X-SimpleLogin-Type", "Forward");
-  setHeader(hs, "X-SimpleLogin-EmailLog-ID", String(emailLog.id));
+  setHeader(hs, EMAIL_LOG_HEADER, String(emailLog.id));
   if (user.include_header_email_header) {
     setHeader(hs, "X-SimpleLogin-Envelope-From", mailFrom);
     setHeader(
@@ -573,6 +723,11 @@ async function forwardToMailbox(
     );
   }
   setHeader(hs, "X-SimpleLogin-Envelope-To", alias.email);
+  // Loop hardening (deviation): count the passes through this worker. The
+  // forward whitelist dropped any inbound copy of the header, so re-stamp
+  // with the incremented value; handleForwardPhase drops inbound mail whose
+  // count exceeds MAX_LOOP_COUNT.
+  setHeader(hs, LOOP_COUNT_HEADER, String(getLoopCount(message.headers) + 1));
   if (!getHeader(hs, "Date"))
     setHeader(hs, "Date", formatDateRfc2822(new Date()));
 
@@ -628,6 +783,23 @@ async function forwardToMailbox(
     await sendRawEmail(env, verpFrom, mailbox.email, rawOut);
   } catch (e) {
     console.error(`cannot forward to ${mailbox.email}:`, e);
+    // Every policy check has passed and the message is fully built, so a
+    // throw from sendRawEmail is a transport failure at the binding. Stash
+    // the built message and hand it to the 'retry-email' job instead of
+    // rejecting (deviation — Flask lets the Postfix queue absorb transient
+    // SMTP failures; a reject here is PERMANENT at the sender's MTA). The
+    // EmailLog above stays as the record of the pending forward. Only when
+    // even scheduling fails does the pre-retry E407 behavior remain.
+    if (
+      await scheduleEmailRetry(env, {
+        emailLogId: emailLog.id,
+        phase: "forward",
+        envelopeFrom: verpFrom,
+        to: mailbox.email,
+        raw: rawOut,
+      })
+    )
+      return { success: true, status: E200 };
     if (await shouldIgnoreBounce(db, mailFrom))
       return { success: true, status: E207 };
     await deleteEmailLogRow(db, emailLog.id);
@@ -803,14 +975,14 @@ async function replaceSlMessageIdByOriginal(
 
 /**
  * UnsubscribeGenerator.add_header_to_message (app/handler/unsubscribe_generator.py).
- * The mailto UNSUBSCRIBER address is not configured on this port, so
- * DisableAlias/BlockContact use the https unsubscribe link (encode_url), and
- * the PreserveOriginal path proxies only http(s) methods of the original
- * List-Unsubscribe. mailto-only originals are dropped: Flask emits a signed
- * `/dashboard/unsubscribe/encoded?data=...` link, but that payload is signed
- * with itsdangerous+SHA3-224 and the web decoder for it is a deferred blocker
- * (settings-pages.ts B7); WebCrypto has no SHA3, so a link this worker produced
- * could not be verified. FWD-5 stays blocked on those shared components.
+ * The mailto UNSUBSCRIBER address is not configured on this port (deviation —
+ * mailto unsubscribe would need a dedicated inbound handler), so every link is
+ * the https/web form: DisableAlias/BlockContact use encode_url, and the
+ * PreserveOriginal path proxies http(s) methods of the original
+ * List-Unsubscribe as-is while a mailto-ONLY original is replaced by a signed
+ * `/dashboard/unsubscribe/encoded/<payload>` link (FWD-5; the web route
+ * re-sends the original unsubscribe mail on the user's click). The
+ * force_web / USERS_WITH_HTTP_UNSUBSCRIBE knob is moot without UNSUBSCRIBER.
  */
 function addUnsubscribeHeaders(
   env: Env,
@@ -820,7 +992,7 @@ function addUnsubscribeHeaders(
   hs: HeaderLine[],
 ): void {
   const behaviour = user.unsub_behaviour;
-  const proxied = calculateOriginalUnsubHeaders(hs);
+  const proxied = calculateOriginalUnsubHeaders(env, alias, hs);
 
   // __preserve_original_headers: stash the sender's originals + X-SL-Proxy-*.
   const origLu = getHeader(hs, "List-Unsubscribe");
@@ -868,29 +1040,138 @@ function addUnsubscribeHeaders(
 }
 
 /**
- * _calculate_header_with_original_behaviour: keep only the http(s) unsubscribe
- * methods of the original List-Unsubscribe (dropping mailto methods so the real
- * mailbox is never leaked). Returns the proxied header dict, or {} to drop.
+ * _calculate_header_with_original_behaviour (unsubscribe_generator.py L33-106):
+ * when the original List-Unsubscribe carries http(s) methods, forward only
+ * those (mailto methods are dropped so the real mailbox never leaks); a
+ * mailto-ONLY header is proxied through a signed
+ * /dashboard/unsubscribe/encoded/ link encoding (alias, recipient, subject)
+ * so the web route can re-send the original unsubscribe mail (FWD-5). Returns
+ * the proxied header dict, or {} to drop both headers.
+ * Flask's `url_data.path == config.UNSUBSCRIBER` short-circuit (L69-78) is
+ * not ported — UNSUBSCRIBER is never configured here (see
+ * addUnsubscribeHeaders); with it unset the Python comparison never matches.
  */
 function calculateOriginalUnsubHeaders(
+  env: Env,
+  alias: AliasRow,
   hs: HeaderLine[],
 ): Record<string, string> {
   const value = getHeader(hs, "List-Unsubscribe");
   if (!value) return {};
+  let mailtoUnsub: { recipient: string; subject: string } | null = null;
   const otherUnsubs: string[] = [];
   for (const rawMethod of value.split(",")) {
     const start = rawMethod.indexOf("<");
     const end = rawMethod.lastIndexOf(">");
     if (start === -1 || end === -1 || start >= end) continue;
     const method = rawMethod.slice(start + 1, end);
-    // mailto methods are dropped (would leak the mailbox / need a signed link).
-    if (!method.toLowerCase().startsWith("mailto:")) otherUnsubs.push(method);
+    const parsed = urlparseLite(method);
+    if (!parsed) continue; // urlparse ValueError -> method ignored (L65-67)
+    if (parsed.scheme === "mailto") {
+      // Flask reassigns mailto_unsubs each iteration: the LAST mailto wins.
+      mailtoUnsub = {
+        recipient: parsed.path,
+        subject: parseQsFirst(parsed.query, "subject"),
+      };
+    } else {
+      // Anything not mailto-schemed (https, http, even scheme-less garbage)
+      // lands in the click-method bucket, exactly like Flask's else branch.
+      otherUnsubs.push(method);
+    }
   }
-  if (otherUnsubs.length === 0) return {};
+  // If there are non-mailto unsubscribe methods, use those in the header.
+  if (otherUnsubs.length > 0) {
+    return {
+      "List-Unsubscribe": otherUnsubs.map((m) => `<${m}>`).join(", "),
+      "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    };
+  }
+  if (!mailtoUnsub) return {};
+  const link = encodeUnsubscribeUrl(
+    env.URL,
+    unsubscribeSecret(env),
+    UnsubscribeAction.OriginalUnsubscribeMailto,
+    {
+      aliasId: alias.id,
+      recipient: mailtoUnsub.recipient,
+      subject: mailtoUnsub.subject,
+    },
+  );
+  // The link is always the web form here (UNSUBSCRIBER unset => via_email is
+  // False), so the One-Click POST header is added like Flask L103-105.
   return {
-    "List-Unsubscribe": otherUnsubs.map((m) => `<${m}>`).join(", "),
+    "List-Unsubscribe": `<${link}>`,
     "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
   };
+}
+
+/**
+ * urllib.parse.urlparse subset for unsubscribe methods: scheme (lowercased),
+ * path and query. Mirrors urlsplit's framing — scheme prefix must start with
+ * an ASCII letter and use only [A-Za-z0-9+.-] (else scheme stays "" and the
+ * whole method is the path, i.e. a non-mailto method); an authority follows
+ * "//" and runs to the first "/?#"; the fragment splits before the query.
+ * Returns null where urlparse raises ValueError (unbalanced [] brackets in
+ * the authority), which Flask catches and skips.
+ */
+function urlparseLite(
+  method: string,
+): { scheme: string; path: string; query: string } | null {
+  let rest = method;
+  let scheme = "";
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*):([\s\S]*)$/.exec(rest);
+  if (m) {
+    scheme = m[1].toLowerCase();
+    rest = m[2];
+  }
+  if (rest.startsWith("//")) {
+    let delim = rest.length;
+    for (const c of ["/", "?", "#"]) {
+      const idx = rest.indexOf(c, 2);
+      if (idx !== -1 && idx < delim) delim = idx;
+    }
+    const netloc = rest.slice(2, delim);
+    if (netloc.includes("[") !== netloc.includes("]")) return null;
+    rest = rest.slice(delim);
+  }
+  const hash = rest.indexOf("#");
+  if (hash !== -1) rest = rest.slice(0, hash);
+  const qm = rest.indexOf("?");
+  let query = "";
+  if (qm !== -1) {
+    query = rest.slice(qm + 1);
+    rest = rest.slice(0, qm);
+  }
+  return { scheme, path: rest, query };
+}
+
+/** parse_qs(query).get(name, [""])[0]: first NON-BLANK value of the param
+ *  (keep_blank_values=False drops empty ones), unquote_plus-decoded. */
+function parseQsFirst(query: string, name: string): string {
+  for (const pair of query.split("&")) {
+    const eq = pair.indexOf("=");
+    if (eq === -1) continue; // pairs without "=" are skipped entirely
+    if (unquotePlus(pair.slice(0, eq)) !== name) continue;
+    const v = pair.slice(eq + 1);
+    if (!v) continue;
+    return unquotePlus(v);
+  }
+  return "";
+}
+
+/** urllib.parse.unquote_plus with errors="replace" — never throws: "+" is a
+ *  space, runs of %XX bytes decode as UTF-8 with U+FFFD replacement, and
+ *  malformed % sequences pass through verbatim (unlike decodeURIComponent). */
+function unquotePlus(s: string): string {
+  return s.replaceAll("+", " ").replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
+    const bytes = new Uint8Array(run.length / 3);
+    for (let i = 0; i < bytes.length; i++)
+      bytes[i] = Number.parseInt(run.slice(i * 3 + 1, i * 3 + 3), 16);
+    // ignoreBOM keeps a decoded U+FEFF like Python's bytes.decode does.
+    return new TextDecoder("utf-8", { fatal: false, ignoreBOM: true }).decode(
+      bytes,
+    );
+  });
 }
 
 async function handleEmailSentToOurself(
@@ -1393,6 +1674,23 @@ async function handleReplyPhase(
 
   const alias = await getAliasById(db, contact.alias_id);
   if (!alias) return rejectWith(E502);
+
+  // Per-minute flood limit (rate_limited_reply_phase, app/email/rate_limit
+  // .py) — same accept-and-drop deviation as the forward phase (no tempfail
+  // on this platform). is_reply on the blocked log so the drop shows up as
+  // reply activity.
+  if (await rateLimitedForAliasOrMailbox(db, alias)) {
+    if (await shouldIgnoreBounce(db, mailFrom)) return accept(E207);
+    await createEmailLogRow(db, {
+      userId: contact.user_id,
+      contactId: contact.id,
+      aliasId: contact.alias_id,
+      isReply: 1,
+      blocked: 1,
+    });
+    return accept(E522);
+  }
+
   if (alias.custom_domain_id !== null) {
     const cd = await getCustomDomainById(db, alias.custom_domain_id);
     if (cd && !cd.verified) return rejectWith(E520);
@@ -1489,7 +1787,7 @@ async function handleReplyPhase(
   if (!getHeader(hs, "Date"))
     setHeader(hs, "Date", formatDateRfc2822(new Date()));
   setHeader(hs, "X-SimpleLogin-Type", "Reply");
-  setHeader(hs, "X-SimpleLogin-EmailLog-ID", String(emailLog.id));
+  setHeader(hs, EMAIL_LOG_HEADER, String(emailLog.id));
 
   const rawOut = serializeMessage(hs, outBody);
   const verpFrom = await generateVerpEmail(
@@ -1500,14 +1798,48 @@ async function handleReplyPhase(
   );
   try {
     await sendRawEmail(env, verpFrom, contact.website_email, rawOut);
+  } catch (e) {
+    console.error(`cannot send reply from ${alias.email}:`, e);
+    // Transient-send retry (deviation, see forwardToMailbox): keep the
+    // EmailLog and let the 'retry-email' job re-drive the fully-built reply.
+    // The mailbox is warned right away only when even scheduling fails (the
+    // pre-retry behavior); otherwise the bounce-path alert fires after the
+    // final retry attempt (src/jobs/handlers/retry-email.ts).
+    const scheduled = await scheduleEmailRetry(env, {
+      emailLogId: emailLog.id,
+      phase: "reply",
+      envelopeFrom: verpFrom,
+      to: contact.website_email,
+      raw: rawOut,
+    });
+    if (!scheduled) {
+      await deleteEmailLogRow(db, emailLog.id);
+      // Flask only warns when the mailbox can_send_or_receive().
+      if (mailboxCanSendOrReceive(mailbox, user))
+        await sendTransactionalEmail(env, {
+          to: mailbox.email,
+          subject: `Email cannot be sent to ${contact.website_email} from ${alias.email}`,
+          text: `The email from your alias ${alias.email} could not be delivered to ${contact.website_email}. You can retry sending the email.`,
+        });
+    }
+    // 250 in failure too: the send is queued for retry (or the user was
+    // told) — the sender must not additionally receive an MTA bounce.
+    return accept(E200);
+  }
 
-    // Notify the alias's other mailboxes about this outgoing email. Each other
-    // mailbox is notified once here. Flask's per-transaction notified_mailboxes
-    // dedup (across multiple reverse-alias recipients of one SMTP transaction)
-    // has no analog: Cloudflare invokes the worker once per recipient, so there
-    // is no shared cross-recipient state to dedup against.
-    for (const mb of await aliasVerifiedMailboxes(db, alias)) {
-      if (mb.email === mailbox.email) continue;
+  // Notify the alias's other mailboxes about this outgoing email. Each other
+  // mailbox is notified once here. Flask's per-transaction notified_mailboxes
+  // dedup (across multiple reverse-alias recipients of one SMTP transaction)
+  // has no analog: Cloudflare invokes the worker once per recipient, so there
+  // is no shared cross-recipient state to dedup against. The loop sits after
+  // the send try/catch so a notification error can never re-trigger the
+  // send-failure handling (retry/EmailLog delete) of a DELIVERED reply.
+  for (const mb of await aliasVerifiedMailboxes(db, alias)) {
+    if (mb.email === mailbox.email) continue;
+    // Each notification send is isolated: a failure must not look like the
+    // reply itself could not be sent. Notification copies are best-effort
+    // and deliberately NOT retried (documented scope of the retry job).
+    try {
       await notifyOtherMailbox(
         db,
         env,
@@ -1520,19 +1852,10 @@ async function handleReplyPhase(
         mb,
         aliasDomain,
       );
+    } catch (e) {
+      console.error(`cannot notify mailbox ${mb.email}:`, e);
     }
-  } catch (e) {
-    console.error(`cannot send reply from ${alias.email}:`, e);
-    await deleteEmailLogRow(db, emailLog.id);
-    // Flask only warns when the mailbox can_send_or_receive().
-    if (mailboxCanSendOrReceive(mailbox, user))
-      await sendTransactionalEmail(env, {
-        to: mailbox.email,
-        subject: `Email cannot be sent to ${contact.website_email} from ${alias.email}`,
-        text: `The email from your alias ${alias.email} could not be delivered to ${contact.website_email}. You can retry sending the email.`,
-      });
   }
-  // 250 in both success and failure: the user is informed and can retry.
   return accept(E200);
 }
 
@@ -1730,6 +2053,13 @@ async function notifyOtherMailbox(
     .first<{ id: number }>();
   if (!tx) return;
   const notifHs = hs.map((h) => ({ ...h }));
+  // The reply's X-SimpleLogin-EmailLog-ID must not survive on this copy: if
+  // the notification bounces, handleInboundDsn would attribute the DSN to the
+  // reply's email log and flag the (delivered) reply as bounced. Stamp the
+  // transactional_email id instead — its bounce then records a Bounce row on
+  // the notified mailbox, like Flask's transactional VERP envelope does.
+  deleteHeader(notifHs, EMAIL_LOG_HEADER);
+  setHeader(notifHs, TRANSACTIONAL_ID_HEADER, String(tx.id));
   // Prepend the notify_mailbox banner so the other mailbox owner sees which
   // mailbox sent the reply and is warned to strip the section before replying.
   const textBanner =
@@ -1888,8 +2218,10 @@ async function handleVerpInbound(
  * then notifies the user (Notification row + rate-controlled ALERT_BOUNCE_EMAIL,
  * max 10/day). RefusedEmail (S3) storage and the ALIAS_AUTOMATIC_DISABLE-gated
  * auto-disable are the documented skips (the latter is off by default upstream).
+ * Exported for the 'retry-email' job: exhausting the retry backoff runs the
+ * same side effects a Postfix queue-lifetime bounce triggers through VERP.
  */
-async function handleBounceForwardPhase(
+export async function handleBounceForwardPhase(
   db: D1Database,
   env: Env,
   emailLog: EmailLogRow,
@@ -1947,9 +2279,10 @@ async function handleBounceForwardPhase(
  * bounced at the contact. Records a Bounce row for the contact's real address +
  * email_log.bounced/bounced_mailbox_id, then notifies the user (Notification row
  * + ALERT_BOUNCE_EMAIL_REPLY_PHASE to the sending mailbox). RefusedEmail (S3) is
- * the documented skip.
+ * the documented skip. Exported for the 'retry-email' job (see the forward
+ * phase handler above).
  */
-async function handleBounceReplyPhase(
+export async function handleBounceReplyPhase(
   db: D1Database,
   env: Env,
   emailLog: EmailLogRow,
@@ -2013,6 +2346,300 @@ function isOutOfOffice(message: ForwardableEmailMessage): boolean {
   return auto.startsWith("auto-replied") || auto.startsWith("auto-generated");
 }
 
+// ================= inbound DSN detection (envelope model) =================
+// Deviation with no direct Flask equivalent (file-top block, HANDOVER §0):
+// Flask receives bounces on signed VERP addresses, but the send_email binding
+// requires envelope == From, so downstream DSNs come back to the reverse
+// alias (forward phase) or the alias (reply phase) as ordinary inbound mail
+// with a null or mailer-daemon sender. Without this, a forward-phase bounce
+// is black-holed by the null-sender E206 drop (mail loss). Detection is
+// deliberately broader than Flask's is_bounce() (envelope=="<>" plus
+// Content-Type multipart/report): real MTAs also bounce from mailer-daemon@
+// with a non-empty envelope, and the report-type / message/delivery-status
+// checks keep plain multipart/report mail (e.g. arf feedback) out.
+// Attribution reads the X-SimpleLogin-EmailLog-ID header this worker stamps
+// on every outbound forward/reply out of the DSN's embedded original message
+// (message/rfc822 or text/rfc822-headers part), falling back to a Message-ID
+// lookup. Both are accepted only when the resolved email log's outbound
+// sender (contact.reply_email for forwards, alias.email for replies) is the
+// DSN's recipient, so a forged report cannot flag other users' mail as
+// bounced. Unattributable DSNs fall through to the pre-existing behavior.
+
+interface DsnMimePart {
+  type: string;
+  headers: HeaderLine[];
+  body: Uint8Array;
+}
+
+interface DsnOutcome {
+  /** Set when the message was recognized AND attributed (or E510-rejected). */
+  result: HandleResult | null;
+  /** Set when message.raw was consumed: a replayable copy for fall-through. */
+  message: ForwardableEmailMessage | null;
+}
+
+const DSN_NO_OUTCOME: DsnOutcome = { result: null, message: null };
+
+/**
+ * Detect and attribute an inbound DSN. Returns
+ * - `{result}` when the message is a DSN for something this worker sent (the
+ *   Flask handle_bounce side effects have run),
+ * - `{message}` when the raw stream was consumed but the mail must keep
+ *   flowing through the normal phases (not a DSN, or unattributable),
+ * - DSN_NO_OUTCOME when the message was not touched at all.
+ */
+async function handleInboundDsn(
+  message: ForwardableEmailMessage,
+  env: EmailEnv,
+  mailFrom: string,
+  rcptTo: string,
+  rcptIsReverseAlias: boolean,
+): Promise<DsnOutcome> {
+  const db = env.DB;
+  if (!isDsnCandidateSender(mailFrom)) return DSN_NO_OUTCOME;
+  // Only mail addressed to a reverse alias or an existing alias can bounce
+  // something this worker sent (envelope == From on all outbound phase mail).
+  // Everything else keeps its raw stream untouched. Auto-creatable catch-all
+  // aliases are deliberately NOT considered: outbound mail is always sent
+  // from an already-existing alias / reverse alias.
+  if (!rcptIsReverseAlias && !(await getAliasByEmail(db, rcptTo)))
+    return DSN_NO_OUTCOME;
+
+  const reportByHeader = contentTypeIsDeliveryReport(
+    getHeaderValue(message.headers, "Content-Type"),
+  );
+
+  // Reading the raw consumes the single-use stream: every return from here
+  // on hands back a replayed copy so fall-through phases can re-read it.
+  const bytes = await readAll(message.raw);
+  const replayed = replayableMessage(message, bytes);
+  const { headerText, body } = splitRawMessage(bytes);
+  const parts: DsnMimePart[] = [];
+  collectDsnMimeParts(parseHeaderBlock(headerText), body, parts, 0);
+
+  const isDsn =
+    reportByHeader || parts.some((p) => p.type === "message/delivery-status");
+  if (!isDsn) return { result: null, message: replayed };
+
+  const blocks = dsnEmbeddedHeaderBlocks(parts);
+
+  // Bounced notify-other-mailbox copy: only a Bounce row on the notified
+  // address, then E205 — handle_transactional_bounce (email_handler.py)
+  // parity (E205 even when the transactional row no longer exists).
+  for (const hs of blocks) {
+    const txValue = getHeader(hs, TRANSACTIONAL_ID_HEADER);
+    if (!txValue) continue;
+    const txId = Number.parseInt(txValue, 10);
+    if (!Number.isInteger(txId) || txId <= 0) continue;
+    const tx = await db
+      .prepare("SELECT email FROM transactional_email WHERE id = ?1")
+      .bind(txId)
+      .first<{ email: string }>();
+    if (tx)
+      await db
+        .prepare("INSERT INTO bounce (email) VALUES (?1)")
+        .bind(tx.email)
+        .run();
+    return { result: accept(E205), message: replayed };
+  }
+
+  const emailLog = await resolveDsnEmailLog(db, blocks, rcptTo);
+  // Unattributable: fall through to the pre-existing behavior (E206 drop on
+  // a reverse alias, ordinary forward-phase delivery of the report on an
+  // alias) — see the call site in dispatch().
+  if (!emailLog) return { result: null, message: replayed };
+
+  // handle_bounce: bounces for a soft-deleted user are rejected untouched.
+  const elUser = await getUserById(db, emailLog.user_id);
+  if (elUser && !userIsActiveRow(elUser))
+    return { result: rejectWith(E510), message: replayed };
+
+  const result = emailLog.is_reply
+    ? await handleBounceReplyPhase(db, env, emailLog)
+    : await handleBounceForwardPhase(db, env, emailLog);
+  return { result, message: replayed };
+}
+
+/** DSN candidate sender: null/empty envelope or a mailer-daemon mailbox. */
+function isDsnCandidateSender(mailFrom: string): boolean {
+  if (isNullSender(mailFrom)) return true;
+  return localPart(mailFrom).toLowerCase() === "mailer-daemon";
+}
+
+/** Content-Type is multipart/report with report-type=delivery-status (RFC 3464). */
+function contentTypeIsDeliveryReport(value: string | null): boolean {
+  if (!value) return false;
+  if (parseContentType(value).type !== "multipart/report") return false;
+  return /;\s*report-type\s*=\s*"?delivery-status"?/i.test(value);
+}
+
+/** Transfer-decode a MIME part body per its Content-Transfer-Encoding. */
+function transferDecodeBody(
+  headers: HeaderLine[],
+  body: Uint8Array,
+): Uint8Array {
+  const cte = normalizeCte(getHeader(headers, "Content-Transfer-Encoding"));
+  if (cte === "quoted-printable") return qpDecode(body);
+  if (cte === "base64") return base64Decode(body);
+  return body;
+}
+
+/**
+ * Flatten the MIME tree of a message into a part list (the message itself
+ * first, then each nested part in document order). message/rfc822 parts are
+ * recursed into so the embedded original message contributes its own header
+ * block. Parsing is defensive: malformed structures just yield fewer parts.
+ */
+function collectDsnMimeParts(
+  headers: HeaderLine[],
+  body: Uint8Array,
+  out: DsnMimePart[],
+  depth: number,
+): void {
+  const { type, boundary } = parseContentType(
+    getHeader(headers, "Content-Type"),
+  );
+  out.push({ type, headers, body });
+  if (depth >= 5) return; // defensive: no legitimate DSN nests deeper
+  if (type.startsWith("multipart/")) {
+    if (!boundary) return;
+    const marker = new TextEncoder().encode(`--${boundary}`);
+    const delims = findBoundaryDelimiters(body, marker);
+    for (let k = 0; k < delims.length; k++) {
+      const d = delims[k];
+      if (d.closing) break;
+      const end = delims[k + 1] ? delims[k + 1].start : body.length;
+      const partBytes = body.subarray(d.lineEnd, end);
+      const { headerText, bodyStart } = splitRawMessage(partBytes);
+      collectDsnMimeParts(
+        parseHeaderBlock(headerText),
+        partBytes.subarray(bodyStart),
+        out,
+        depth + 1,
+      );
+    }
+    return;
+  }
+  if (type === "message/rfc822") {
+    const decoded = transferDecodeBody(headers, body);
+    const { headerText, bodyStart } = splitRawMessage(decoded);
+    collectDsnMimeParts(
+      parseHeaderBlock(headerText),
+      decoded.subarray(bodyStart),
+      out,
+      depth + 1,
+    );
+  }
+}
+
+/**
+ * Candidate header blocks of the original outbound message embedded in a
+ * DSN: every nested part's own header block (message/rfc822 originals
+ * surface here through collectDsnMimeParts) plus parsed text/rfc822-headers
+ * bodies. The DSN's own top-level headers (parts[0]) are excluded — only
+ * material a real report embeds can attribute a bounce.
+ */
+function dsnEmbeddedHeaderBlocks(parts: DsnMimePart[]): HeaderLine[][] {
+  const blocks: HeaderLine[][] = [];
+  for (let i = 1; i < parts.length; i++) {
+    blocks.push(parts[i].headers);
+    if (parts[i].type === "text/rfc822-headers") {
+      const decoded = transferDecodeBody(parts[i].headers, parts[i].body);
+      blocks.push(parseHeaderBlock(new TextDecoder().decode(decoded)));
+    }
+  }
+  return blocks;
+}
+
+async function resolveDsnEmailLog(
+  db: D1Database,
+  blocks: HeaderLine[][],
+  rcptTo: string,
+): Promise<EmailLogRow | null> {
+  // Primary: the X-SimpleLogin-EmailLog-ID stamped on every outbound send
+  // (both message.forward X-headers and the rebuild/reply paths carry it).
+  for (const hs of blocks) {
+    const value = getHeader(hs, EMAIL_LOG_HEADER);
+    if (!value) continue;
+    const id = Number.parseInt(value, 10);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    const el = await db
+      .prepare("SELECT * FROM email_log WHERE id = ?1")
+      .bind(id)
+      .first<EmailLogRow>();
+    if (el && (await dsnEmailLogMatchesRecipient(db, el, rcptTo))) return el;
+  }
+  // Fallback: the outbound Message-ID — the forward phase keeps the sender's
+  // original id (stored as email_log.message_id, truncated to 250 chars on
+  // insert), the reply phase rewrites it to the SL id (email_log
+  // .sl_message_id). Scoped to logs whose outbound sender is this DSN's
+  // recipient; the latest match wins (an alias with several mailboxes writes
+  // one log per mailbox for the same Message-ID).
+  for (const hs of blocks) {
+    const mid = getHeader(hs, "Message-ID");
+    if (!mid) continue;
+    const el = await db
+      .prepare(
+        `SELECT el.* FROM email_log el
+         LEFT JOIN contact c ON el.contact_id = c.id
+         LEFT JOIN alias a ON el.alias_id = a.id
+         WHERE (el.sl_message_id = ?1 OR el.message_id = ?2)
+           AND ((el.is_reply = 0 AND c.reply_email = ?3)
+             OR (el.is_reply = 1 AND a.email = ?3))
+         ORDER BY el.id DESC LIMIT 1`,
+      )
+      .bind(mid, mid.slice(0, 250), rcptTo)
+      .first<EmailLogRow>();
+    if (el) return el;
+  }
+  return null;
+}
+
+/** The email log's outbound sender must be the DSN's recipient: the forward
+ *  phase sends From the contact's reverse alias, the reply phase From the
+ *  alias, and the envelope always equals From — so a real DSN comes back to
+ *  exactly that address. */
+async function dsnEmailLogMatchesRecipient(
+  db: D1Database,
+  emailLog: EmailLogRow,
+  rcptTo: string,
+): Promise<boolean> {
+  if (emailLog.is_reply) {
+    const alias = emailLog.alias_id
+      ? await getAliasById(db, emailLog.alias_id)
+      : null;
+    return alias?.email === rcptTo;
+  }
+  const contact = await getContactById(db, emailLog.contact_id);
+  return contact?.reply_email === rcptTo;
+}
+
+/** A ForwardableEmailMessage clone whose raw stream replays `bytes` (each
+ *  access yields a fresh stream); everything else delegates to the original. */
+function replayableMessage(
+  message: ForwardableEmailMessage,
+  bytes: Uint8Array,
+): ForwardableEmailMessage {
+  return {
+    from: message.from,
+    to: message.to,
+    headers: message.headers,
+    rawSize: bytes.length,
+    get raw(): ReadableStream<Uint8Array> {
+      return new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      });
+    },
+    setReject: (reason: string) => message.setReject(reason),
+    forward: (rcptTo: string, headers?: Headers) =>
+      message.forward(rcptTo, headers),
+    reply: (m: EmailMessage) => message.reply(m),
+  };
+}
+
 // =============================== DB helpers ===============================
 
 function getAliasByEmail(
@@ -2067,6 +2694,63 @@ async function shouldIgnoreBounce(
     .bind(mailFrom)
     .first();
   return row !== null;
+}
+
+// ------------- per-minute flood limit (app/email/rate_limit.py) -----------
+// The check logic (1-minute window, strict `>` comparison, per-alias and
+// per-primary-mailbox counters) is a faithful port. Two documented deviations:
+// upstream `rate_limited()` is short-circuited off ("todo: re-enable rate
+// limiting") while this port enables it, and the E522 SMTP reject is replaced
+// by accept-and-drop with a blocked EmailLog at the call sites.
+
+/** rate_limited_for_alias: nb of EmailLog on the alias in the last minute. */
+async function rateLimitedForAlias(
+  db: D1Database,
+  alias: AliasRow,
+): Promise<boolean> {
+  const minTime = toStr(addMinutes(new Date(), -1));
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM email_log el
+       JOIN contact c ON el.contact_id = c.id
+       WHERE c.alias_id = ?1 AND el.created_at > ?2`,
+    )
+    .bind(alias.id, minTime)
+    .first<{ n: number }>();
+  return (row?.n ?? 0) > MAX_ACTIVITY_DURING_MINUTE_PER_ALIAS;
+}
+
+/** rate_limited_for_mailbox: nb of EmailLog in the last minute across all
+ *  aliases sharing this alias's primary mailbox. */
+async function rateLimitedForMailbox(
+  db: D1Database,
+  alias: AliasRow,
+): Promise<boolean> {
+  const minTime = toStr(addMinutes(new Date(), -1));
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM email_log el
+       JOIN contact c ON el.contact_id = c.id
+       JOIN alias a ON c.alias_id = a.id
+       WHERE a.mailbox_id = ?1 AND el.created_at > ?2`,
+    )
+    .bind(alias.mailbox_id, minTime)
+    .first<{ n: number }>();
+  return (row?.n ?? 0) > MAX_ACTIVITY_DURING_MINUTE_PER_MAILBOX;
+}
+
+/**
+ * rate_limited_forward_phase / rate_limited_reply_phase both reduce to this
+ * once the alias is resolved. (For a just-auto-created alias Flask runs only
+ * the mailbox check; the alias check is vacuously false there — a fresh alias
+ * has no EmailLog — so applying both is equivalent.)
+ */
+async function rateLimitedForAliasOrMailbox(
+  db: D1Database,
+  alias: AliasRow,
+): Promise<boolean> {
+  if (await rateLimitedForAlias(db, alias)) return true;
+  return rateLimitedForMailbox(db, alias);
 }
 
 async function isValidAliasAddressDomain(
@@ -2235,7 +2919,11 @@ async function sendAlertWithRateControl(
   await sendTransactionalEmail(env, { to: toEmail, subject, text });
 }
 
-function userIsActiveRow(user: UserRow, now: Date = new Date()): boolean {
+/** User.is_active() (models.py); exported for the 'retry-email' job. */
+export function userIsActiveRow(
+  user: UserRow,
+  now: Date = new Date(),
+): boolean {
   if (user.delete_on === null) return true;
   return toDate(user.delete_on).getTime() < now.getTime();
 }
@@ -2254,9 +2942,103 @@ function mailboxCanSendOrReceive(mailbox: MailboxRow, user: UserRow): boolean {
   return userCanSendOrReceive(user);
 }
 
+// ==================== transient-send retry (deviation) ====================
+// No Flask equivalent: Flask hands a transient SMTP failure to the Postfix
+// queue, which retries on its own backoff for days and emits a bounce DSN
+// when it gives up. This platform has no MTA queue, and setReject is a
+// PERMANENT failure at the sender's MTA — mail that would have gone through
+// a minute later would bounce. So a binding failure on a fully-built
+// forward/reply stashes the message in KV and enqueues the 'retry-email' job
+// (src/jobs/handlers/retry-email.ts), which re-sends through sendRawEmail
+// and manages its own backoff/attempt bookkeeping with the constants below.
+// Scope: binding/transport failures only — the scheduling call sites wrap
+// nothing but sendRawEmail, after every policy check has passed and the
+// outbound message is fully built; policy rejects are unaffected.
+
+export const RETRY_EMAIL_JOB_NAME = "retry-email";
+/** Max send attempts by the job (the failed inline delivery not counted). */
+export const RETRY_EMAIL_MAX_ATTEMPTS = 5;
+/**
+ * Minutes before attempt N (1-indexed): 5m/30m/2h/12h/24h — Postfix-queue
+ * flavored growth, ~38.5h from the initial failure to the final attempt.
+ */
+export const RETRY_EMAIL_BACKOFF_MINS = [5, 30, 120, 720, 1440];
+const RETRY_KV_PREFIX = "retry:";
+/** Stash lifetime: comfortably outlives the last scheduled attempt. */
+const RETRY_KV_TTL_SECS = 7 * 86400;
+
+export interface RetryEmailPayload {
+  /** KV key ("retry:<uuid>") holding the built raw outbound message. */
+  kv_key: string;
+  /** EmailLog recording the delivery this retry belongs to. */
+  email_log_id: number;
+  /** Metadata only — the handler trusts email_log.is_reply, not this. */
+  phase: "forward" | "reply";
+  /** 1-based number of the attempt this job row will perform. */
+  attempt: number;
+  /** Flask-parity VERP envelope (sendRawEmail re-derives the binding From). */
+  envelope_from: string;
+  to: string;
+}
+
+/** INSERT the 'retry-email' job row, due `delayMins` from now. */
+export async function enqueueRetryEmailJob(
+  db: D1Database,
+  payload: RetryEmailPayload,
+  delayMins: number,
+): Promise<void> {
+  await db
+    .prepare("INSERT INTO job (name, payload, run_at) VALUES (?1, ?2, ?3)")
+    .bind(
+      RETRY_EMAIL_JOB_NAME,
+      JSON.stringify(payload),
+      toStr(addMinutes(new Date(), delayMins)),
+    )
+    .run();
+}
+
+/**
+ * Stash the built message in KV and enqueue the first retry attempt. Returns
+ * false (after logging) when the stash/enqueue itself failed, so the call
+ * site can fall back to the pre-retry failure behavior.
+ */
+async function scheduleEmailRetry(
+  env: Env,
+  args: {
+    emailLogId: number;
+    phase: "forward" | "reply";
+    envelopeFrom: string;
+    to: string;
+    raw: Uint8Array;
+  },
+): Promise<boolean> {
+  try {
+    const kvKey = `${RETRY_KV_PREFIX}${crypto.randomUUID()}`;
+    await env.KV.put(kvKey, args.raw, { expirationTtl: RETRY_KV_TTL_SECS });
+    await enqueueRetryEmailJob(
+      env.DB,
+      {
+        kv_key: kvKey,
+        email_log_id: args.emailLogId,
+        phase: args.phase,
+        attempt: 1,
+        envelope_from: args.envelopeFrom,
+        to: args.to,
+      },
+      RETRY_EMAIL_BACKOFF_MINS[0],
+    );
+    return true;
+  } catch (e) {
+    console.error(`cannot schedule email retry to ${args.to}:`, e);
+    return false;
+  }
+}
+
 // ========================= outbound raw email send ========================
 
-async function sendRawEmail(
+/** Exported for the 'retry-email' job, which replays a KV-stashed message
+ *  through this same path (re-signing and re-capturing like the first try). */
+export async function sendRawEmail(
   env: Env,
   envelopeFrom: string,
   to: string,
@@ -2278,13 +3060,19 @@ async function sendRawEmail(
   // domains must not carry our signature.
   raw = await dkimSignOutbound(env, bindingFrom, raw);
 
-  outboundEmails.push({
-    envelopeFrom,
-    bindingFrom,
-    to,
-    raw: new TextDecoder().decode(raw),
-  });
-  if (outboundEmails.length > MAX_OUTBOUND_CAPTURED) outboundEmails.shift();
+  // Capture for tests only: vitest.config.ts provides the TEST_MIGRATIONS
+  // binding to the test worker, so its presence is the "running under vitest"
+  // signal. In production nothing is captured — retaining up to 200 full raw
+  // messages would pin users' mail in isolate memory.
+  if ((env as { TEST_MIGRATIONS?: unknown }).TEST_MIGRATIONS !== undefined) {
+    outboundEmails.push({
+      envelopeFrom,
+      bindingFrom,
+      to,
+      raw: new TextDecoder().decode(raw),
+    });
+    if (outboundEmails.length > MAX_OUTBOUND_CAPTURED) outboundEmails.shift();
+  }
 
   if (!env.SEND_EMAIL) {
     console.log(`[email] (unbound) MAIL FROM=${envelopeFrom} RCPT TO=${to}`);
@@ -2444,6 +3232,88 @@ function getHeaderValue(headers: Headers, name: string): string | null {
   if (value === null) return null;
   // sanitize_header: strip, \n -> " ", drop \r
   return value.trim().replaceAll("\n", " ").replaceAll("\r", "");
+}
+
+// ================================ PGP/MIME ================================
+// Port of email_handler.py prepare_pgp_message (L382-459): wrap the built
+// message into an RFC 3156 multipart/encrypted envelope. Every non-MIME
+// header stays on the OUTER envelope (Flask copies them across L395-398, so
+// the later From/To/Cc/List-Unsubscribe rewrites keep applying to the outer
+// message); the MIME headers + body form the inner message that gets
+// encrypted. sign_msg (forward phase passes can_sign=True, L888) is skipped:
+// PGP_SENDER_PRIVATE_KEY is not configured on this deployment and Flask only
+// signs when it is set (L426).
+
+/** headers.MIME_HEADERS (app/email/headers.py L50-57), lowercased. */
+const PGP_MIME_HEADERS = [
+  "mime-version",
+  "content-type",
+  "content-disposition",
+  "content-transfer-encoding",
+];
+
+/**
+ * Mutates `hs` into the outer multipart/encrypted header set and returns the
+ * new outer body. Throws PGPException when the key cannot encrypt — the
+ * caller delivers unencrypted with Flask's failure banner.
+ */
+async function preparePgpMessage(
+  hs: HeaderLine[],
+  body: Uint8Array,
+  publicKey: string,
+): Promise<Uint8Array> {
+  // Inner message (L400-417): MIME headers only, with Flask's fallbacks for
+  // a missing Content-Type / Mime-Version.
+  const inner = hs
+    .filter((h) => PGP_MIME_HEADERS.includes(h.name.toLowerCase()))
+    .map((h) => ({ ...h }));
+  if (!getHeader(inner, "Content-Type"))
+    inner.push({ name: "Content-Type", value: "text/plain" });
+  if (!getHeader(inner, "Mime-Version"))
+    inner.push({ name: "Mime-Version", value: "1.0" });
+  const armored = await encryptMessage(
+    publicKey,
+    serializeMessage(inner, body),
+  );
+
+  // Outer envelope: the MIME headers moved inside; multipart/encrypted takes
+  // their place. (Flask's header-copy loop appends the kept headers in
+  // reversed order after the Content-Type — header ORDER is not significant
+  // and is kept stable here.)
+  for (const name of PGP_MIME_HEADERS) deleteHeader(hs, name);
+  const boundary = pgpBoundary();
+  hs.push({
+    name: "Content-Type",
+    value: `multipart/encrypted; protocol="application/pgp-encrypted"; boundary="${boundary}"`,
+  });
+  hs.push({ name: "MIME-Version", value: "1.0" });
+
+  // Part 1: the RFC 3156 control part (L419-423); part 2: the encrypted
+  // payload as inline encrypted.asc (L430-452). Same part headers as
+  // Python's MIMEApplication with encode_7or8bit.
+  const text =
+    `--${boundary}\r\n` +
+    "Content-Type: application/pgp-encrypted\r\n" +
+    "MIME-Version: 1.0\r\n" +
+    "Content-Transfer-Encoding: 7bit\r\n" +
+    "\r\n" +
+    "Version: 1\r\n" +
+    `--${boundary}\r\n` +
+    'Content-Type: application/octet-stream; name="encrypted.asc"\r\n' +
+    "MIME-Version: 1.0\r\n" +
+    "Content-Transfer-Encoding: 7bit\r\n" +
+    'Content-Disposition: inline; filename="encrypted.asc"\r\n' +
+    "\r\n" +
+    `${armored.replace(/\r?\n/g, "\r\n").trimEnd()}\r\n` +
+    `--${boundary}--\r\n`;
+  return new TextEncoder().encode(text);
+}
+
+/** Python email.generator._make_boundary shape: 15 '=' + 19 digits + '=='. */
+function pgpBoundary(): string {
+  const bytes = new Uint8Array(19);
+  crypto.getRandomValues(bytes);
+  return `===============${Array.from(bytes, (b) => b % 10).join("")}==`;
 }
 
 // ================= reverse-alias body replacement =========================

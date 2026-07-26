@@ -18,7 +18,7 @@
  *   14 GET|POST /notifications                 login
  *   15 GET|POST /unsubscribe/<int:alias_id>    login (RFC 8058 One-Click exempt)
  *   16 GET|POST /block_contact/<int:contact_id> login
- *   17 GET      /unsubscribe/encoded/<payload> login — SHA3 signer deferred
+ *   17 GET      /unsubscribe/encoded/<payload> login (GET with side effects)
  *   18 GET|POST /alias_trash                   login
  * (/internal/exit-sudo-mode is owned by src/web/infra.ts.)
  */
@@ -28,10 +28,15 @@ import { sha3_224 } from "@noble/hashes/sha3.js";
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { Secret, TOTP } from "otpauth";
+// Outbound raw-mail seam shared with the email worker (route 17's
+// OriginalUnsubscribeMailto re-send); email.ts never imports web modules,
+// so no cycle.
+import { generateVerpEmail, sendRawEmail } from "../email";
 import {
   canonicalizeEmail,
   checkPassword,
   randomString,
+  sanitizeEmail,
   tokenUrlsafe,
 } from "../lib/crypto";
 import { addHours, nowStr, toDate, toStr } from "../lib/dates";
@@ -56,11 +61,18 @@ import type {
   AliasRow,
   ApiKeyRow,
   ContactRow,
+  MailboxRow,
   NotificationRow,
   PublicDomainRow,
   UserRow,
 } from "../lib/rows";
 import { saveSession } from "../lib/session";
+import {
+  decodeUnsubscribeSubject,
+  UnsubscribeAction,
+  type UnsubscribeOriginalData,
+  unsubscribeSecret,
+} from "../lib/unsubscribe";
 import {
   csrfTokenField,
   generateCsrfToken,
@@ -1766,6 +1778,219 @@ webSettingsPagesRoutes.on(["GET", "POST"], "/notifications", async (c) => {
 // ---------------------------------------------------------------------------
 // 17. GET /unsubscribe/encoded/<encoded_request> — must precede route 15
 // ---------------------------------------------------------------------------
+// UnsubscribeHandler.handle_unsubscribe_from_request (unsubscribe_handler.py
+// L68-89) + the dashboard.encoded_unsubscribe view (views/unsubscribe.py
+// L98-135). The web variant of each action helper passes no requesting
+// mailbox, so the _check_email_is_authorized_for_alias branch is dead here.
+// Any non-E202 outcome (bad signature, unknown id, foreign owner, disabled
+// user) collapses to None for the view => "Invalid unsubscribe request".
+
+/** Alias.mailboxes property: primary + extra, verified only, email-sorted
+ *  (local copy of the email-worker helper; this module may not touch lib). */
+async function aliasVerifiedMailboxes(
+  db: D1Database,
+  alias: AliasRow,
+): Promise<MailboxRow[]> {
+  const primary = await db
+    .prepare("SELECT * FROM mailbox WHERE id = ?1")
+    .bind(alias.mailbox_id)
+    .first<MailboxRow>();
+  const extra = await db
+    .prepare(
+      `SELECT m.* FROM mailbox m
+       JOIN alias_mailbox am ON am.mailbox_id = m.id
+       WHERE am.alias_id = ?1 ORDER BY am.id`,
+    )
+    .bind(alias.id)
+    .all<MailboxRow>();
+  const list: MailboxRow[] = [];
+  if (primary) list.push(primary);
+  for (const m of extra.results)
+    if (!list.some((x) => x.id === m.id)) list.push(m);
+  return list
+    .filter((m) => m.verified)
+    .sort((a, b) => (a.email < b.email ? -1 : a.email > b.email ? 1 : 0));
+}
+
+/** Mailbox.can_send_or_receive (models.py L3012-3017); the owning user of an
+ *  alias's mailboxes is always alias.user in this schema. */
+function mailboxCanSendOrReceive(mailbox: MailboxRow, user: UserRow): boolean {
+  const FLAG_ADMIN_DISABLED = 1;
+  if (mailbox.flags & FLAG_ADMIN_DISABLED) return false;
+  if (mailbox.disabled) return false;
+  return canSendOrReceive(user);
+}
+
+/** UnsubscribeHandler._disable_alias (L91-130): returns the alias on E202,
+ *  null otherwise (E508). */
+async function unsubDisableAlias(
+  c: Ctx,
+  user: UserRow,
+  aliasId: number,
+): Promise<AliasRow | null> {
+  const db = c.env.DB;
+  const alias = await db
+    .prepare("SELECT * FROM alias WHERE id = ?1")
+    .bind(aliasId)
+    .first<AliasRow>();
+  if (!alias || alias.user_id !== user.id) return null;
+  // change_alias_status(alias, enabled=False,
+  //   message="Set enabled=False via unsubscribe header")
+  await db
+    .prepare("UPDATE alias SET enabled = 0, updated_at = ?1 WHERE id = ?2")
+    .bind(nowStr(), alias.id)
+    .run();
+  await emitAliasAuditLog(
+    db,
+    alias,
+    "change_status",
+    "Set alias status to False. Set enabled=False via unsubscribe header",
+  );
+  const enableAliasUrl = `${c.env.URL}/dashboard/?highlight_alias_id=${alias.id}`;
+  for (const mb of await aliasVerifiedMailboxes(db, alias)) {
+    if (!mailboxCanSendOrReceive(mb, user)) continue;
+    await sendTransactionalEmail(c.env, {
+      to: mb.email,
+      subject: `Alias ${alias.email} has been disabled successfully`,
+      // transactional/unsubscribe-disable-alias.txt content block (text-only
+      // with the base-template footer omitted, like every transactional send
+      // in this port). The curly quote is verbatim from the template.
+      text: `Hi\n\nYour alias ${alias.email} has been disabled successfully.\n\nIt has been disabled thanks to the "One-click unsubscribe” provided by your mailbox service.\n\nWhen you click on this button on a forwarded email, the alias will be disabled automatically.\n\nIf this is a mistake, you can re-enable the alias on the dashboard via\n\n${enableAliasUrl}\n\nPlease let us know if you have any question.\n`,
+    });
+  }
+  return alias;
+}
+
+/** UnsubscribeHandler._disable_contact (L132-168): returns the contact on
+ *  E202, null otherwise (E508). */
+async function unsubDisableContact(
+  c: Ctx,
+  user: UserRow,
+  contactId: number,
+): Promise<ContactRow | null> {
+  const db = c.env.DB;
+  const contact = await db
+    .prepare("SELECT * FROM contact WHERE id = ?1")
+    .bind(contactId)
+    .first<ContactRow>();
+  if (!contact || contact.user_id !== user.id) return null;
+  const alias = await db
+    .prepare("SELECT * FROM alias WHERE id = ?1")
+    .bind(contact.alias_id)
+    .first<AliasRow>();
+  if (!alias) return null; // contact.alias FK — never null in practice
+  if (!contact.block_forward) {
+    // contact_toggle_block (contact_utils.py L149-157)
+    await db
+      .prepare(
+        "UPDATE contact SET block_forward = 1, updated_at = ?1 WHERE id = ?2",
+      )
+      .bind(nowStr(), contact.id)
+      .run();
+    await emitAliasAuditLog(
+      db,
+      alias,
+      "update_contact",
+      `Set contact state ${contact.id} ${contact.website_email} -> ${contact.website_email} to blocked True`,
+    );
+  }
+  const unblockContactUrl = `${c.env.URL}/dashboard/alias_contact_manager/${alias.id}?highlight_contact_id=${contact.id}`;
+  for (const mb of await aliasVerifiedMailboxes(db, alias)) {
+    if (!mailboxCanSendOrReceive(mb, user)) continue;
+    await sendTransactionalEmail(c.env, {
+      to: mb.email,
+      subject: `Emails from ${contact.website_email} to ${alias.email} are now blocked`,
+      // transactional/unsubscribe-block-contact.txt.jinja2 content block
+      text: `Hi\n\n${contact.website_email} can no longer send emails to ${alias.email}\n\n${contact.website_email} is blocked thanks to the "One-click unsubscribe" provided by your mailbox service.\n\nWhen you click on this button on a forwarded email, the sender will be automatically blocked.\n\nIf this is a mistake, you can unblock ${contact.website_email} on\n\n${unblockContactUrl}\n\nPlease let us know if you have any question.\n`,
+    });
+  }
+  return contact;
+}
+
+/** UnsubscribeHandler._unsubscribe_user_from_newsletter (L170-198): E202? */
+async function unsubNewsletter(
+  c: Ctx,
+  requestUser: UserRow,
+  userId: number,
+): Promise<boolean> {
+  const db = c.env.DB;
+  const user = await db
+    .prepare("SELECT * FROM users WHERE id = ?1")
+    .bind(userId)
+    .first<UserRow>();
+  if (!user) return false; // E510
+  if (user.id !== requestUser.id) return false; // E511
+  await updateUser(db, user.id, { notification: 0 });
+  if (canSendOrReceive(user)) {
+    await sendTransactionalEmail(c.env, {
+      to: user.email,
+      subject: "You have been unsubscribed from SimpleLogin newsletter",
+      // transactional/unsubscribe-newsletter.txt content block
+      text: "You have been unsubscribed from SimpleLogin newsletter.\n",
+    });
+  }
+  return true;
+}
+
+/**
+ * UnsubscribeHandler._unsubscribe_original_behaviour (L228-261): re-send the
+ * original mailto unsubscribe request as an empty text/plain mail from the
+ * alias to the list address. Returns whether it ended E202.
+ * Envelope deviation (HANDOVER §0): Flask envelopes this with a transactional
+ * VERP address; the send binding requires envelope == From, so sendRawEmail
+ * sends as alias.email and the message carries the transactional_email id in
+ * X-SimpleLogin-Transactional-ID — a downstream bounce then attributes to
+ * the TransactionalEmail row like Flask's VERP bounce would (same convention
+ * as the email worker's notify-other-mailbox copies).
+ */
+async function unsubOriginalMailto(
+  c: Ctx,
+  user: UserRow,
+  data: UnsubscribeOriginalData,
+): Promise<boolean> {
+  const db = c.env.DB;
+  const alias = await db
+    .prepare("SELECT * FROM alias WHERE id = ?1")
+    .bind(data.aliasId)
+    .first<AliasRow>();
+  if (!alias) return false; // E508
+  if (alias.user_id !== user.id) return false; // E509
+  if (!canSendOrReceive(user)) return false; // E509 (alias.user == user here)
+  const emailDomain = alias.email.split("@")[1];
+  const toEmail = sanitizeEmail(data.recipient);
+  const transaction = await db
+    .prepare("INSERT INTO transactional_email (email) VALUES (?1) RETURNING *")
+    .bind(toEmail)
+    .first<{ id: number }>();
+  // EmailMessage build, header for header (unsubscribe_handler.py L240-248).
+  const headers = [
+    `To: ${toEmail}`,
+    `Subject: ${data.subject}`,
+    `From: ${alias.email}`,
+    `Message-ID: <${crypto.randomUUID()}@${emailDomain}>`, // make_msgid(domain)
+    `Date: ${new Date().toUTCString()}`,
+    "Content-Type: text/plain",
+    "MIME-Version: 1.0",
+  ];
+  if (transaction)
+    headers.push(`X-SimpleLogin-Transactional-ID: ${transaction.id}`);
+  const raw = new TextEncoder().encode(`${headers.join("\r\n")}\r\n\r\n`);
+  // add_dkim_signature happens inside sendRawEmail; the Flask-parity VERP
+  // envelope is logged/parsed only (see the deviation note above).
+  const envelopeFrom = await generateVerpEmail(
+    c.env,
+    2, // VerpType.transactional
+    transaction?.id ?? 0,
+    emailDomain,
+  );
+  try {
+    await sendRawEmail(c.env, envelopeFrom, toEmail, raw);
+  } catch (e) {
+    // sl_sendmail(..., ignore_smtp_error=True): failure is logged, still E202.
+    console.error(`cannot send original unsubscribe to ${toEmail}:`, e);
+  }
+  return true;
+}
 
 webSettingsPagesRoutes.use(
   "/unsubscribe/encoded/:encoded_request",
@@ -1774,11 +1999,68 @@ webSettingsPagesRoutes.use(
 webSettingsPagesRoutes.get(
   "/unsubscribe/encoded/:encoded_request",
   async (c) => {
-    // BLOCKER B7: the payload signature is itsdangerous+SHA3-224 — deferred.
-    // Flashing "Invalid unsubscribe request" matches the current Flask
-    // behavior for web-generated links (encoder URL bug, spec §17 gotcha).
-    await flash(c, "Invalid unsubscribe request", "error");
-    return c.redirect(urlFor("dashboard.index"), 302);
+    const user = c.get("webUser");
+    const unsub = decodeUnsubscribeSubject(
+      unsubscribeSecret(c.env),
+      c.req.param("encoded_request"),
+    );
+    const invalid = async () => {
+      await flash(c, "Invalid unsubscribe request", "error");
+      return c.redirect(urlFor("dashboard.index"), 302);
+    };
+    if (!unsub) return invalid();
+    switch (unsub.action) {
+      case UnsubscribeAction.DisableAlias: {
+        const alias = await unsubDisableAlias(c, user, unsub.data as number);
+        if (!alias) return invalid();
+        await flash(c, `Alias ${alias.email} has been blocked`, "success");
+        return c.redirect(
+          urlFor("dashboard.index", { highlight_alias_id: alias.id }),
+          302,
+        );
+      }
+      case UnsubscribeAction.DisableContact: {
+        const contact = await unsubDisableContact(
+          c,
+          user,
+          unsub.data as number,
+        );
+        if (!contact) return invalid();
+        await flash(
+          c,
+          `Emails sent from ${contact.website_email} are now blocked`,
+          "success",
+        );
+        return c.redirect(
+          urlFor("dashboard.alias_contact_manager", {
+            alias_id: contact.alias_id,
+            highlight_contact_id: contact.id,
+          }),
+          302,
+        );
+      }
+      case UnsubscribeAction.UnsubscribeNewsletter: {
+        if (!(await unsubNewsletter(c, user, unsub.data as number)))
+          return invalid();
+        await flash(c, "You've unsubscribed from the newsletter", "success");
+        return c.redirect(urlFor("dashboard.index"), 302);
+      }
+      default: {
+        // UnsubscribeAction.OriginalUnsubscribeMailto
+        const ok = await unsubOriginalMailto(
+          c,
+          user,
+          unsub.data as UnsubscribeOriginalData,
+        );
+        if (!ok) return invalid();
+        await flash(
+          c,
+          "The original unsubscribe request has been forwarded",
+          "success",
+        );
+        return c.redirect(urlFor("dashboard.index"), 302);
+      }
+    }
   },
 );
 

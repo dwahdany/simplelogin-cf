@@ -82,9 +82,12 @@ export async function sendTransactionalEmail(
     return;
   }
 
-  // Flask config.NOREPLY: display-name form in the From header; the binding
-  // envelope sender must be the bare address (it requires envelope==From addr).
-  const from = `no-reply@${env.EMAIL_DOMAIN}`;
+  // Flask config.NOREPLY default: '"SimpleLogin (noreply)" <noreply@DOMAIN>'
+  // — display-name form in the From header; the binding envelope sender must
+  // be the bare address (it requires envelope==From addr). NOTE the spelling:
+  // "noreply" with no dash, matching getNoReplies() in src/email.ts so replies
+  // to transactional mail are swallowed there instead of bouncing with E515.
+  const from = `noreply@${env.EMAIL_DOMAIN}`;
   const fromHeader = `"SimpleLogin (noreply)" <${from}>`;
   try {
     const { EmailMessage } = await import("cloudflare:email");

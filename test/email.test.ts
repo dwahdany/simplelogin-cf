@@ -28,6 +28,10 @@ import type {
   MailboxRow,
 } from "../src/lib/rows";
 import {
+  encodeUnsubscribeSubject,
+  UnsubscribeAction,
+} from "../src/lib/unsubscribe";
+import {
   createAlias,
   createContact,
   createEmailLog,
@@ -1251,7 +1255,7 @@ describe("forward phase header rewriting", () => {
     );
   });
 
-  it("drops a mailto-only List-Unsubscribe but stashes the original", async () => {
+  it("proxies a mailto-only List-Unsubscribe through a signed web link", async () => {
     const { alias } = await forwardSetup();
     const { testEnv } = envWithSendMock();
     const msg = makeMessage({
@@ -1261,15 +1265,80 @@ describe("forward phase header rewriting", () => {
         ["From", "news@ext.example"],
         ["To", alias.email],
         ["Subject", "newsletter"],
-        ["List-Unsubscribe", "<mailto:unsub@ext.example>"],
+        // "+" and %XX in the subject param exercise the parse_qs decoding.
+        ["List-Unsubscribe", "<mailto:unsub@ext.example?subject=stop+all%21>"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    // FWD-5: the original mailto target+subject, signed into a web link the
+    // encoded_unsubscribe route can decode (encoding is deterministic).
+    const encoded = encodeUnsubscribeSubject(
+      "test-flask-secretunsub",
+      UnsubscribeAction.OriginalUnsubscribeMailto,
+      {
+        aliasId: alias.id,
+        recipient: "unsub@ext.example",
+        subject: "stop all!",
+      },
+    );
+    const link = `<${env.URL}/dashboard/unsubscribe/encoded/${encoded}>`;
+    expect(rawHeader(out, "List-Unsubscribe")).toBe(link);
+    expect(rawHeader(out, "List-Unsubscribe-Post")).toBe(
+      "List-Unsubscribe=One-Click",
+    );
+    // __preserve_original_headers keeps both the sender's header and the
+    // proxied replacement (X-SL-Proxy-*).
+    expect(rawHeader(out, "X-SimpleLogin-Original-List-Unsubscribe")).toBe(
+      "<mailto:unsub@ext.example?subject=stop+all%21>",
+    );
+    expect(rawHeader(out, "X-SL-Proxy-List-Unsubscribe")).toBe(link);
+  });
+
+  it("keeps only the http(s) methods when mailto and https are mixed", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "news@ext.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "news@ext.example"],
+        ["To", alias.email],
+        ["Subject", "newsletter"],
+        [
+          "List-Unsubscribe",
+          "<mailto:unsub@ext.example>, <https://ext.example/unsub?id=1>",
+        ],
+      ]),
+    });
+    await deliver(msg, testEnv);
+    const out = outboundEmails[outboundEmails.length - 1].raw;
+    // non-mailto methods win; every mailto is dropped (no signed link).
+    expect(rawHeader(out, "List-Unsubscribe")).toBe(
+      "<https://ext.example/unsub?id=1>",
+    );
+    expect(rawHeader(out, "List-Unsubscribe-Post")).toBe(
+      "List-Unsubscribe=One-Click",
+    );
+  });
+
+  it("leaves a message without List-Unsubscribe without one", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv } = envWithSendMock();
+    const msg = makeMessage({
+      from: "news@ext.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "news@ext.example"],
+        ["To", alias.email],
+        ["Subject", "no list headers"],
       ]),
     });
     await deliver(msg, testEnv);
     const out = outboundEmails[outboundEmails.length - 1].raw;
     expect(rawHeader(out, "List-Unsubscribe")).toBeNull();
-    expect(rawHeader(out, "X-SimpleLogin-Original-List-Unsubscribe")).toBe(
-      "<mailto:unsub@ext.example>",
-    );
+    expect(rawHeader(out, "List-Unsubscribe-Post")).toBeNull();
+    expect(rawHeader(out, "X-SL-Proxy-List-Unsubscribe")).toBeNull();
   });
 
   it("uses an https unsubscribe link for the DisableAlias behaviour", async () => {
@@ -1383,7 +1452,7 @@ describe("forward phase header rewriting", () => {
     );
   });
 
-  it("uses a VERP envelope sender and deletes the EmailLog on send failure", async () => {
+  it("uses a VERP envelope sender and schedules a retry on send failure", async () => {
     const { alias } = await forwardSetup();
     const testEnv = envWithFailingSend();
     const msg = makeMessage({
@@ -1397,7 +1466,12 @@ describe("forward phase header rewriting", () => {
     });
     await deliver(msg, testEnv);
 
-    expect(msg.rejectReason).toBe("421 SL E407 Retry later");
+    // Transient-send retry deviation (src/email.ts scheduleEmailRetry): the
+    // binding failure no longer becomes a permanent E407 reject — the built
+    // message is stashed and re-driven by the 'retry-email' job, the inbound
+    // message is accepted and the EmailLog stays (details in
+    // test/email-retry.test.ts).
+    expect(msg.rejectReason).toBeNull();
     expect(outboundEmails[outboundEmails.length - 1].envelopeFrom).toMatch(
       new RegExp(`^sl\\.[a-z2-7]+\\.[a-z2-7]+@${reDomain(env.EMAIL_DOMAIN)}$`),
     );
@@ -1410,7 +1484,10 @@ describe("forward phase header rewriting", () => {
         "SELECT COUNT(*) AS n FROM email_log WHERE contact_id = ?1",
         contact?.id,
       ),
-    ).toBe(0);
+    ).toBe(1);
+    expect(
+      await count("SELECT COUNT(*) AS n FROM job WHERE name = 'retry-email'"),
+    ).toBe(1);
   });
 
   it("falls back to message.forward() when SEND_EMAIL is not bound", async () => {
@@ -2229,5 +2306,340 @@ describe("VERP bounces", () => {
     });
     await deliver(msg);
     expect(msg.rejectReason).toBe("550 SL E512 No such email log");
+  });
+});
+
+// ============================ noreply handling ============================
+
+describe("noreply handling", () => {
+  it("sends transactional mail from noreply@ (Flask NOREPLY spelling)", async () => {
+    const user = await createUser(env.DB);
+    const { testEnv, sends } = envWithSendMock();
+    const noreply = `noreply@${env.EMAIL_DOMAIN}`;
+    const msg = makeMessage({
+      from: user.email,
+      to: noreply,
+      raw: buildRaw([
+        ["From", user.email],
+        ["To", noreply],
+        ["Subject", "ping"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    expect(msg.rejectReason).toBeNull();
+    // the auto-response goes out from noreply@ — the same address the inbound
+    // handler recognizes, so a reply to it is swallowed, never bounced E515.
+    expect(sends).toHaveLength(1);
+    expect(sends[0].to).toBe(user.email);
+    expect(sends[0].from).toBe(noreply);
+    expect(sentEmails.at(-1)?.subject).toBe("Auto: ping");
+  });
+
+  it("still swallows mail to the legacy no-reply@ spelling", async () => {
+    const user = await createUser(env.DB);
+    const { testEnv, sends } = envWithSendMock();
+    const legacy = `no-reply@${env.EMAIL_DOMAIN}`;
+    const msg = makeMessage({
+      from: user.email,
+      to: legacy,
+      raw: buildRaw([
+        ["From", user.email],
+        ["To", legacy],
+        ["Subject", "old address"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    // recognized as a noreply address (defensive extra spelling), NOT treated
+    // as an unknown alias (which would reject with E515).
+    expect(msg.rejectReason).toBeNull();
+    expect(sends.map((s) => s.to)).toEqual([user.email]);
+    expect(sentEmails.at(-1)?.subject).toBe("Auto: old address");
+  });
+});
+
+// ========================= per-minute flood limit =========================
+// Port of app/email/rate_limit.py (MAX_ACTIVITY_DURING_MINUTE_PER_ALIAS=10,
+// MAX_ACTIVITY_DURING_MINUTE_PER_MAILBOX=15, strict `>`). Deviation: instead
+// of Flask's E522 reject, the message is accepted and dropped with a blocked
+// EmailLog (no tempfail on this platform, a reject would bounce for good).
+
+describe("per-minute flood limit", () => {
+  it("drops with a blocked EmailLog above the per-alias limit", async () => {
+    const { user, alias } = await forwardSetup();
+    const contact = await createContact(env.DB, user.id, alias.id, {
+      reply_email: `flood${uniq()}@sl.example.com`,
+    });
+    // 11 activities within the last minute (> 10).
+    for (let i = 0; i < 11; i++)
+      await createEmailLog(env.DB, user.id, contact.id);
+
+    const { testEnv, sends } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["To", alias.email],
+        ["Subject", "flood"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    // deviation: accepted (no E522 reject), nothing delivered, drop logged.
+    expect(msg.rejectReason).toBeNull();
+    expect(sends).toHaveLength(0);
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM email_log WHERE alias_id = ?1 AND blocked = 1",
+        alias.id,
+      ),
+    ).toBe(1);
+  });
+
+  it("still delivers at exactly the per-alias limit (strict >)", async () => {
+    const { user, alias } = await forwardSetup();
+    const contact = await createContact(env.DB, user.id, alias.id, {
+      reply_email: `edge${uniq()}@sl.example.com`,
+    });
+    // exactly 10 prior activities: 10 > 10 is false -> not limited.
+    for (let i = 0; i < 10; i++)
+      await createEmailLog(env.DB, user.id, contact.id);
+
+    const { testEnv, sends } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["To", alias.email],
+        ["Subject", "at the limit"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    expect(msg.rejectReason).toBeNull();
+    expect(sends).toHaveLength(1);
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM email_log WHERE alias_id = ?1 AND blocked = 1",
+        alias.id,
+      ),
+    ).toBe(0);
+  });
+
+  it("drops when the shared primary mailbox exceeds its limit", async () => {
+    const { user, mailbox, alias } = await forwardSetup();
+    const alias2 = await createAlias(env.DB, user.id, mailbox.id);
+    // 8 activities per alias (each under the 10/alias limit) = 16 on the
+    // shared primary mailbox (> 15).
+    for (const a of [alias, alias2]) {
+      const c = await createContact(env.DB, user.id, a.id, {
+        reply_email: `mbx${uniq()}@sl.example.com`,
+      });
+      for (let i = 0; i < 8; i++) await createEmailLog(env.DB, user.id, c.id);
+    }
+
+    const { testEnv, sends } = envWithSendMock();
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["To", alias.email],
+        ["Subject", "mailbox flood"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    expect(msg.rejectReason).toBeNull();
+    expect(sends).toHaveLength(0);
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM email_log WHERE alias_id = ?1 AND blocked = 1",
+        alias.id,
+      ),
+    ).toBe(1);
+  });
+
+  it("drops a flooded reply with a blocked is_reply EmailLog", async () => {
+    const { user, alias, contact } = await replySetup();
+    for (let i = 0; i < 11; i++)
+      await createEmailLog(env.DB, user.id, contact.id);
+
+    const { testEnv, sends } = envWithSendMock();
+    const msg = makeMessage({
+      from: user.email,
+      to: contact.reply_email,
+      raw: buildRaw([
+        ["From", user.email],
+        ["To", contact.reply_email],
+        ["Subject", "reply flood"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    expect(msg.rejectReason).toBeNull();
+    // nothing reaches the contact and no alert is sent.
+    expect(sends).toHaveLength(0);
+    expect(outboundEmails).toHaveLength(0);
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM email_log WHERE alias_id = ?1 AND blocked = 1 AND is_reply = 1",
+        alias.id,
+      ),
+    ).toBe(1);
+  });
+});
+
+// ============================ loop hardening ==============================
+// Deviation (defense-in-depth, no Flask equivalent): rewrite-mode forwards
+// stamp X-SimpleLogin-Loop-Count; inbound mail whose count exceeds 5 is
+// accepted-and-dropped with a blocked EmailLog.
+
+describe("loop hardening", () => {
+  function loopMessage(aliasEmail: string, loopCount?: number) {
+    const headers: [string, string][] = [
+      ["From", "john@wick.example"],
+      ["To", aliasEmail],
+      ["Subject", "loopy"],
+    ];
+    if (loopCount !== undefined)
+      headers.push(["X-SimpleLogin-Loop-Count", String(loopCount)]);
+    return makeMessage({
+      from: "john@wick.example",
+      to: aliasEmail,
+      raw: buildRaw(headers),
+    });
+  }
+
+  it("stamps X-SimpleLogin-Loop-Count: 1 on rewrite-mode forwards", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv, sends } = envWithSendMock();
+    await deliver(loopMessage(alias.email), testEnv);
+
+    expect(sends).toHaveLength(1);
+    expect(rawHeader(outboundEmails[0].raw, "X-SimpleLogin-Loop-Count")).toBe(
+      "1",
+    );
+  });
+
+  it("increments an inbound loop count when forwarding", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv, sends } = envWithSendMock();
+    await deliver(loopMessage(alias.email, 3), testEnv);
+
+    expect(sends).toHaveLength(1);
+    expect(rawHeader(outboundEmails[0].raw, "X-SimpleLogin-Loop-Count")).toBe(
+      "4",
+    );
+  });
+
+  it("still forwards at exactly the threshold value", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv, sends } = envWithSendMock();
+    await deliver(loopMessage(alias.email, 5), testEnv);
+
+    expect(sends).toHaveLength(1);
+    expect(rawHeader(outboundEmails[0].raw, "X-SimpleLogin-Loop-Count")).toBe(
+      "6",
+    );
+  });
+
+  it("drops mail whose loop count exceeds the threshold", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv, sends } = envWithSendMock();
+    const msg = loopMessage(alias.email, 6);
+    await deliver(msg, testEnv);
+
+    // accepted (E209-style drop), nothing delivered, visible in activity.
+    expect(msg.rejectReason).toBeNull();
+    expect(sends).toHaveLength(0);
+    expect(
+      await count(
+        "SELECT COUNT(*) AS n FROM email_log WHERE alias_id = ?1 AND blocked = 1",
+        alias.id,
+      ),
+    ).toBe(1);
+  });
+});
+
+// ==================== notification failure isolation ======================
+
+describe("notify-other-mailbox failure isolation", () => {
+  it("keeps the reply delivered when notifying another mailbox fails", async () => {
+    const { user, mailbox, alias, contact } = await replySetup();
+    const second = await createMailbox(env.DB, user.id, "flaky@other.example");
+    await insert("alias_mailbox", {
+      alias_id: alias.id,
+      mailbox_id: second.id,
+    });
+
+    // The reply to the contact succeeds; the notification copy to the other
+    // mailbox fails at the binding.
+    const sends: { from: string; to: string }[] = [];
+    const sendMock = {
+      send: async (m: EmailMessage) => {
+        if (m.to === "flaky@other.example") throw new Error("mailbox down");
+        sends.push({ from: m.from, to: m.to });
+      },
+    } as unknown as SendEmail;
+    const testEnv = { ...env, SEND_EMAIL: sendMock };
+
+    const msg = makeMessage({
+      from: user.email,
+      to: contact.reply_email,
+      raw: buildRaw([
+        ["From", user.email],
+        ["To", contact.reply_email],
+        ["Subject", "isolated"],
+      ]),
+    });
+    await deliver(msg, testEnv);
+
+    expect(msg.rejectReason).toBeNull();
+    expect(sends.map((s) => s.to)).toEqual([contact.website_email]);
+    // the reply's EmailLog survives — the notification failure is isolated
+    // from the outer send-failure handler (which deletes the log).
+    const emailLog = await one<EmailLogRow>(
+      "SELECT * FROM email_log WHERE contact_id = ?1",
+      contact.id,
+    );
+    expect(emailLog).not.toBeNull();
+    expect(emailLog?.is_reply).toBe(1);
+    expect(emailLog?.mailbox_id).toBe(mailbox.id);
+    // and the user is NOT told the (delivered) reply failed.
+    expect(
+      sentEmails.some((e) => e.subject.startsWith("Email cannot be sent")),
+    ).toBe(false);
+  });
+});
+
+// ========================= outbound capture seam ==========================
+
+describe("outbound capture seam", () => {
+  it("does not retain outbound raw mail without the test binding", async () => {
+    const { alias } = await forwardSetup();
+    const { testEnv, sends } = envWithSendMock();
+    // Simulate production: no TEST_MIGRATIONS binding on the env.
+    const prodEnv = { ...testEnv } as Env & { TEST_MIGRATIONS?: unknown };
+    prodEnv.TEST_MIGRATIONS = undefined;
+
+    const msg = makeMessage({
+      from: "john@wick.example",
+      to: alias.email,
+      raw: buildRaw([
+        ["From", "john@wick.example"],
+        ["To", alias.email],
+        ["Subject", "not captured"],
+      ]),
+    });
+    await deliver(msg, prodEnv);
+
+    // delivery still happens; only the in-memory capture is skipped.
+    expect(msg.rejectReason).toBeNull();
+    expect(sends).toHaveLength(1);
+    expect(outboundEmails).toHaveLength(0);
   });
 });

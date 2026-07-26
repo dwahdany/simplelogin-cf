@@ -12,7 +12,11 @@ import { sentEmails } from "../src/lib/mailer";
 import type { MailboxRow, UserRow } from "../src/lib/rows";
 import { createSession } from "../src/lib/session";
 import type { WebEnv } from "../src/lib/web/webauth";
-import { setMailboxDnsClient } from "../src/web/mailbox-domain-pages";
+import {
+  expectedMxRecords,
+  isMxHostSetEquivalent,
+  setMailboxDnsClient,
+} from "../src/web/mailbox-domain-pages";
 import {
   createAlias,
   createContact,
@@ -808,7 +812,9 @@ describe("route 3: /dashboard/mailbox/<id>", () => {
     ]);
   });
 
-  it("pgp save is deferred: flashes the PGP error and stores nothing", async () => {
+  // full PGP coverage (valid key save/remove, forward-phase encryption) in
+  // test/pgp.test.ts
+  it("pgp save with an invalid key flashes the PGP error and stores nothing", async () => {
     const { mb, cookie, csrf } = await setup();
     const res = await post(`/dashboard/mailbox/${mb.id}`, cookie, {
       "form-name": "pgp",
@@ -1122,10 +1128,37 @@ describe("route 7: /dashboard/domains/<id>/dns", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("sl-verification=tok-abcdef");
+    // EMAIL_SERVERS_WITH_PRIORITY is "" (unset) in tests -> mx1/mx2 fallback
     expect(html).toContain("mx1.sl.example.com.");
-    expect(html).toContain("v=spf1 include:sl.example.com ~all");
+    expect(html).toContain("mx2.sl.example.com.");
+    // Cloudflare deviation: the SPF include is Email Sending's, not EMAIL_DOMAIN
+    expect(html).toContain("v=spf1 include:_spf.mx.cloudflare.net ~all");
     expect(html).toContain("dkim._domainkey.sl.example.com");
     expect(html).toContain("v=DMARC1; p=quarantine; pct=100; adkim=s; aspf=s");
+    // Cloudflare Email Routing note on the MX section
+    expect(html).toContain("Email Routing");
+    expect(html).toContain("scripts/provision-domain.mjs");
+  });
+
+  it("GET renders the route MX hosts when EMAIL_SERVERS_WITH_PRIORITY is set", async () => {
+    const user = await createUser(env.DB);
+    const id = await makeDomain(user.id, `dnsmx${user.id}.example.org`);
+    const cookie = await sessionCookieFor(user.id);
+    const envx = env as unknown as Record<string, unknown>;
+    envx.EMAIL_SERVERS_WITH_PRIORITY =
+      "10 route1.mx.cloudflare.net.,20 route2.mx.cloudflare.net.,30 route3.mx.cloudflare.net.";
+    try {
+      const res = await get(`/dashboard/domains/${id}/dns`, cookie);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("route1.mx.cloudflare.net.");
+      expect(html).toContain("route2.mx.cloudflare.net.");
+      expect(html).toContain("route3.mx.cloudflare.net.");
+      expect(html).not.toContain("mx1.sl.example.com.");
+    } finally {
+      // "" is the pinned "unset" spelling (vitest.config.ts)
+      envx.EMAIL_SERVERS_WITH_PRIORITY = "";
+    }
   });
 
   it("GET lazily generates a missing ownership token", async () => {
@@ -1168,6 +1201,87 @@ describe("route 7: /dashboard/domains/<id>/dns", () => {
     expect(row?.ownership_verified).toBe(0);
   });
 
+  it("POST check-mx on an MX-less domain warns and keeps verified=0", async () => {
+    const user = await createUser(env.DB);
+    const id = await makeDomain(
+      user.id,
+      `no-mx-${user.id}.invalid-tld-for-tests.test`,
+    );
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf(`/dashboard/domains/${id}/dns`, cookie);
+    const res = await post(`/dashboard/domains/${id}/dns`, cookie, {
+      "form-name": "check-mx",
+      csrf_token: csrf,
+    });
+    expect(res.status).toBe(200); // failure falls through to render
+    const html = await res.text();
+    expect(html).toContain("The MX record is not correctly set");
+    expect(html).toContain("(Empty)");
+    const row = await env.DB.prepare(
+      "SELECT verified FROM custom_domain WHERE id = ?1",
+    )
+      .bind(id)
+      .first<{ verified: number }>();
+    expect(row?.verified).toBe(0);
+  });
+
+  it("POST check-mx failure does NOT clear a previously verified domain", async () => {
+    const user = await createUser(env.DB);
+    const id = await makeDomain(
+      user.id,
+      `was-ok-${user.id}.invalid-tld-for-tests.test`,
+    );
+    await env.DB.prepare("UPDATE custom_domain SET verified = 1 WHERE id = ?1")
+      .bind(id)
+      .run();
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf(`/dashboard/domains/${id}/dns`, cookie);
+    const res = await post(`/dashboard/domains/${id}/dns`, cookie, {
+      "form-name": "check-mx",
+      csrf_token: csrf,
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // template shows the special still-verified warning
+    expect(html).toContain("Without the MX record set up correctly");
+    const row = await env.DB.prepare(
+      "SELECT verified FROM custom_domain WHERE id = ?1",
+    )
+      .bind(id)
+      .first<{ verified: number }>();
+    expect(row?.verified).toBe(1);
+  });
+
+  it("POST check-spf failure names the Cloudflare include and un-verifies", async () => {
+    const user = await createUser(env.DB);
+    const id = await makeDomain(
+      user.id,
+      `no-spf-${user.id}.invalid-tld-for-tests.test`,
+    );
+    await env.DB.prepare(
+      "UPDATE custom_domain SET spf_verified = 1 WHERE id = ?1",
+    )
+      .bind(id)
+      .run();
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf(`/dashboard/domains/${id}/dns`, cookie);
+    const res = await post(`/dashboard/domains/${id}/dns`, cookie, {
+      "form-name": "check-spf",
+      csrf_token: csrf,
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(
+      "SPF: _spf.mx.cloudflare.net is not included in your SPF record.",
+    );
+    const row = await env.DB.prepare(
+      "SELECT spf_verified FROM custom_domain WHERE id = ?1",
+    )
+      .bind(id)
+      .first<{ spf_verified: number }>();
+    expect(row?.spf_verified).toBe(0); // failure un-verifies (faithful)
+  });
+
   it("POST with a bad CSRF token flashes Invalid request and redirects", async () => {
     const user = await createUser(env.DB);
     const id = await makeDomain(user.id, `csrf${user.id}.example.org`);
@@ -1195,6 +1309,123 @@ describe("route 7: /dashboard/domains/<id>/dns", () => {
     expect(await getFlashes(cookie)).toEqual([
       { category: "warning", message: "You cannot see this page" },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pure unit tests for the MX matcher + EMAIL_SERVERS_WITH_PRIORITY parsing
+// (deliberate deviation from Flask's positional is_mx_equivalent — see
+// src/web/mailbox-domain-pages.ts isMxHostSetEquivalent).
+// ---------------------------------------------------------------------------
+
+describe("isMxHostSetEquivalent / expectedMxRecords", () => {
+  const ROUTES = [
+    "route1.mx.cloudflare.net.",
+    "route2.mx.cloudflare.net.",
+    "route3.mx.cloudflare.net.",
+  ];
+  const expected = (hosts: string[]) =>
+    hosts.map((h, i) => ({
+      priority: (i + 1) * 10,
+      recommended: h,
+      allowed: [h],
+    }));
+
+  it("accepts the same host set regardless of priorities and order", () => {
+    // Cloudflare-style unpredictable per-zone priorities, shuffled order
+    const found = new Map<number, string[]>([
+      [76, ["route2.mx.cloudflare.net."]],
+      [5, ["route3.mx.cloudflare.net."]],
+      [48, ["route1.mx.cloudflare.net."]],
+    ]);
+    expect(isMxHostSetEquivalent(found, expected(ROUTES))).toBe(true);
+    // several hosts sharing one priority is fine too
+    const samePrio = new Map<number, string[]>([[10, [...ROUTES]]]);
+    expect(isMxHostSetEquivalent(samePrio, expected(ROUTES))).toBe(true);
+  });
+
+  it("normalizes case and trailing dots", () => {
+    const found = new Map<number, string[]>([
+      [1, ["ROUTE1.MX.CLOUDFLARE.NET"]],
+      [2, ["Route2.mx.Cloudflare.net."]],
+      [3, ["route3.mx.cloudflare.net"]],
+    ]);
+    expect(isMxHostSetEquivalent(found, expected(ROUTES))).toBe(true);
+  });
+
+  it("rejects subsets (a missing host)", () => {
+    const found = new Map<number, string[]>([
+      [10, ["route1.mx.cloudflare.net."]],
+      [20, ["route2.mx.cloudflare.net."]],
+    ]);
+    expect(isMxHostSetEquivalent(found, expected(ROUTES))).toBe(false);
+  });
+
+  it("rejects supersets (an extra/leftover host)", () => {
+    const found = new Map<number, string[]>([
+      [10, ["route1.mx.cloudflare.net."]],
+      [20, ["route2.mx.cloudflare.net."]],
+      [30, ["route3.mx.cloudflare.net."]],
+      [40, ["mx.old-provider.example."]],
+    ]);
+    expect(isMxHostSetEquivalent(found, expected(ROUTES))).toBe(false);
+  });
+
+  it("rejects a wrong host and an empty MX set", () => {
+    const found = new Map<number, string[]>([
+      [10, ["route1.mx.cloudflare.net."]],
+      [20, ["route2.mx.cloudflare.net."]],
+      [30, ["mx.wrong.example."]],
+    ]);
+    expect(isMxHostSetEquivalent(found, expected(ROUTES))).toBe(false);
+    expect(isMxHostSetEquivalent(new Map(), expected(ROUTES))).toBe(false);
+  });
+
+  it("parses the production EMAIL_SERVERS_WITH_PRIORITY value", () => {
+    const records = expectedMxRecords({
+      EMAIL_DOMAIN: "sl.example.com",
+      EMAIL_SERVERS_WITH_PRIORITY:
+        "10 route1.mx.cloudflare.net.,20 route2.mx.cloudflare.net.,30 route3.mx.cloudflare.net.",
+    });
+    expect(records).toEqual([
+      {
+        priority: 10,
+        recommended: "route1.mx.cloudflare.net.",
+        allowed: ["route1.mx.cloudflare.net."],
+      },
+      {
+        priority: 20,
+        recommended: "route2.mx.cloudflare.net.",
+        allowed: ["route2.mx.cloudflare.net."],
+      },
+      {
+        priority: 30,
+        recommended: "route3.mx.cloudflare.net.",
+        allowed: ["route3.mx.cloudflare.net."],
+      },
+    ]);
+    // tolerant spellings: spaces after commas, missing trailing dot
+    const tolerant = expectedMxRecords({
+      EMAIL_DOMAIN: "sl.example.com",
+      EMAIL_SERVERS_WITH_PRIORITY: "20 mx-b.example.net, 10 mx-a.example.net.",
+    });
+    expect(tolerant.map((r) => `${r.priority} ${r.recommended}`)).toEqual([
+      "10 mx-a.example.net.",
+      "20 mx-b.example.net.",
+    ]);
+  });
+
+  it('"" and unset fall back to mx1/mx2.{EMAIL_DOMAIN}', () => {
+    for (const value of ["", undefined]) {
+      const records = expectedMxRecords({
+        EMAIL_DOMAIN: "sl.example.com",
+        EMAIL_SERVERS_WITH_PRIORITY: value,
+      });
+      expect(records.map((r) => `${r.priority} ${r.recommended}`)).toEqual([
+        "10 mx1.sl.example.com.",
+        "20 mx2.sl.example.com.",
+      ]);
+    }
   });
 });
 
@@ -1717,6 +1948,34 @@ describe("route 11: /dashboard/subdomain", () => {
       { category: "warning", message: "Invalid new subdomain" },
     ]);
   });
+
+  it("MAX_NB_SUBDOMAIN env var caps the subdomain quota", async () => {
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO public_domain (domain, can_use_subdomain) VALUES ('subs.example.com', 1)",
+    ).run();
+    const user = await createUser(env.DB);
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf("/dashboard/subdomain", cookie);
+    const envx = env as unknown as Record<string, unknown>;
+    envx.MAX_NB_SUBDOMAIN = "0";
+    try {
+      const res = await post("/dashboard/subdomain", cookie, {
+        "form-name": "create",
+        csrf_token: csrf,
+        subdomain: `quotasub${user.id}`,
+        domain: "subs.example.com",
+      });
+      expect(res.status).toBe(302);
+      expect(await getFlashes(cookie)).toEqual([
+        {
+          category: "error",
+          message: "You can't create more than 0 subdomains",
+        },
+      ]);
+    } finally {
+      delete envx.MAX_NB_SUBDOMAIN;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1764,6 +2023,30 @@ describe("route 12: /dashboard/directory", () => {
     expect(await getFlashes(cookie)).toEqual([
       { category: "success", message: `Directory ${name} is created` },
     ]);
+  });
+
+  it("MAX_NB_DIRECTORY env var caps the directory quota", async () => {
+    const user = await createUser(env.DB);
+    const cookie = await sessionCookieFor(user.id);
+    const csrf = await getCsrf("/dashboard/directory", cookie);
+    const envx = env as unknown as Record<string, unknown>;
+    envx.MAX_NB_DIRECTORY = "0";
+    try {
+      const res = await post("/dashboard/directory", cookie, {
+        "form-name": "create",
+        csrf_token: csrf,
+        name: `quotadir${user.id}`,
+      });
+      expect(res.status).toBe(302);
+      expect(await getFlashes(cookie)).toEqual([
+        {
+          category: "warning",
+          message: "You cannot have more than 0 directories",
+        },
+      ]);
+    } finally {
+      delete envx.MAX_NB_DIRECTORY;
+    }
   });
 
   it("reserved names are refused", async () => {

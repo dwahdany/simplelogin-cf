@@ -15,6 +15,7 @@
 
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import { checkAliasPrefix } from "../lib/alias";
 import { type AppEnv, requireApiAuth } from "../lib/auth";
 import {
   randomWords,
@@ -138,11 +139,7 @@ function convertToId(s: string): string {
   return res.slice(0, 64);
 }
 
-/** check_alias_prefix (app/alias_utils.py): 1-40 chars of [0-9a-z-_.]. */
-function checkAliasPrefix(prefix: string): boolean {
-  if (prefix.length > 40) return false;
-  return /^[0-9a-z\-_.]+$/.test(prefix);
-}
+// checkAliasPrefix hoisted to src/lib/alias.ts (shared with batch import).
 
 // --------------------------------------------------------------------------
 // tldextract 3.1.2 port (the version pinned by the Flask app), ICANN PSL from

@@ -1,7 +1,10 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { handleEmail } from "./email";
+import { runPendingJobs } from "./jobs";
+import { runMaintenance } from "./jobs/maintenance";
 import type { AppEnv } from "./lib/auth";
+import type { Env } from "./lib/env";
 import { renderErrorPage } from "./lib/web/render";
 import { aliasCreationRoutes } from "./routes/alias-creation";
 import { aliasRoutes } from "./routes/aliases";
@@ -117,7 +120,23 @@ app.route("/dashboard", webMailboxDomainPagesRoutes);
 app.route("/dashboard", webSettingsPagesRoutes);
 app.route("/dashboard", webBillingPagesRoutes);
 
+// Cron schedules (wrangler.jsonc `triggers.crons`): the per-minute tick runs
+// the job-runner pass; the daily tick runs maintenance (Flask crontab
+// equivalent). Both are cheap no-ops when there is nothing due.
+export const MAINTENANCE_CRON = "17 3 * * *";
+
 export default {
   fetch: app.fetch,
   email: handleEmail,
+  scheduled: async (
+    controller: ScheduledController,
+    env: Env,
+    _ctx: ExecutionContext,
+  ): Promise<void> => {
+    if (controller.cron === MAINTENANCE_CRON) {
+      await runMaintenance(env);
+      return;
+    }
+    await runPendingJobs(env);
+  },
 };

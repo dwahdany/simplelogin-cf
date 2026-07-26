@@ -44,7 +44,6 @@ import {
 import type { Env } from "../lib/env";
 import { sendTransactionalEmail } from "../lib/mailer";
 import { availableSlEmail } from "../lib/models";
-import { clientIp, parseLimits } from "../lib/ratelimit";
 import type { BaseRow, UserRow } from "../lib/rows";
 import { getSession, rotateSession, saveSession } from "../lib/session";
 import {
@@ -54,6 +53,7 @@ import {
   makeField,
   validateCsrfToken,
 } from "../lib/web/forms";
+import { type WebLimiter, webLimiter } from "../lib/web/limiter";
 import {
   type FlashCategory,
   flash,
@@ -124,71 +124,8 @@ function nextUrlOf(c: Ctx): string | null {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Web rate limiting — flask-limiter deduct_when semantics, HTML 429 pages
-// ---------------------------------------------------------------------------
-
-interface WebLimiter {
-  exceeded: boolean;
-  deduct: () => Promise<void>;
-}
-
-/**
- * Check the fixed windows WITHOUT counting; `deduct()` increments (call it
- * unconditionally right after the check for Flask routes without
- * deduct_when, or only on the flagged branches otherwise).
- */
-async function webLimiter(
-  c: Ctx,
-  name: string,
-  spec: string,
-): Promise<WebLimiter> {
-  if (c.env.DISABLE_RATE_LIMIT !== undefined) {
-    return { exceeded: false, deduct: async () => {} };
-  }
-  const session = await getSession(c);
-  const subject =
-    session?.user_id != null
-      ? `userid:${session.user_id}`
-      : `ip:${clientIp(c.req.raw.headers)}`;
-  const windows = parseLimits(spec);
-  const now = Date.now() / 1000;
-  let exceeded = false;
-  for (const win of windows) {
-    const key = `rlw:${name}:${subject}:${win.seconds}`;
-    const row = await c.env.DB.prepare(
-      "SELECT count, window_start FROM rate_limit WHERE key = ?1",
-    )
-      .bind(key)
-      .first<{ count: number; window_start: number }>();
-    if (
-      row &&
-      row.window_start === Math.floor(now / win.seconds) &&
-      row.count >= win.limit
-    ) {
-      exceeded = true;
-      break;
-    }
-  }
-  return {
-    exceeded,
-    deduct: async () => {
-      const at = Date.now() / 1000;
-      for (const win of windows) {
-        const key = `rlw:${name}:${subject}:${win.seconds}`;
-        const windowStart = Math.floor(at / win.seconds);
-        await c.env.DB.prepare(
-          `INSERT INTO rate_limit (key, window_start, count) VALUES (?1, ?2, 1)
-           ON CONFLICT(key) DO UPDATE SET
-             count = CASE WHEN window_start = ?2 THEN count + 1 ELSE 1 END,
-             window_start = ?2`,
-        )
-          .bind(key, windowStart)
-          .run();
-      }
-    },
-  };
-}
+// Web rate limiting hoisted to src/lib/web/limiter.ts (shared with the
+// dashboard page modules); flask-limiter deduct_when semantics unchanged.
 
 // ---------------------------------------------------------------------------
 // Form plumbing
@@ -882,7 +819,10 @@ webAuthPagesRoutes.on(["GET", "POST"], "/register", async (c) => {
     await flash(c, "You are already logged in", "warning");
     return c.redirect(urlFor("dashboard.index"), 302);
   }
-  if (c.env.DISABLE_REGISTRATION !== undefined) {
+  if (
+    c.env.DISABLE_REGISTRATION !== undefined &&
+    c.env.DISABLE_REGISTRATION !== ""
+  ) {
     await flash(c, "Registration is closed", "error");
     return c.redirect(urlFor("auth.login"), 302);
   }

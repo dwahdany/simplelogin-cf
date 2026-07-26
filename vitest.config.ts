@@ -26,6 +26,12 @@ export default defineConfig(async () => {
             MAX_NB_EMAIL_FREE_PLAN: "3",
             // Tests assert the Flask-parity rebuild path.
             FORWARD_MODE: "rewrite",
+            // Deployment-only vars in wrangler.jsonc that must stay unset in
+            // tests (fixtures assume open registration / Flask MX defaults).
+            // Miniflare can't delete a wrangler var, so "" is the documented
+            // "unset" spelling for these two (see src/lib/env.ts).
+            DISABLE_REGISTRATION: "",
+            EMAIL_SERVERS_WITH_PRIORITY: "",
           },
         },
       }),

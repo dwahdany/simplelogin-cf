@@ -429,7 +429,10 @@ authRoutes.post(
     const password = strField(data, "password");
     const db = c.env.DB;
 
-    if (c.env.DISABLE_REGISTRATION !== undefined) {
+    if (
+      c.env.DISABLE_REGISTRATION !== undefined &&
+      c.env.DISABLE_REGISTRATION !== ""
+    ) {
       return badRequest(c, "registration is closed");
     }
     if (

@@ -34,7 +34,7 @@
           <div class="text-danger mt-4">
             Your DNS is not correctly set. The TXT record we obtain is:
             <div class="mb-3 p-3 dns-record">
-              {% if not ownership_errors %}(Empty){% endif %}
+              {% if ownership_errors | length == 0 %}(Empty){% endif %}
               {% for r in ownership_errors %}
                 {{ r }}
                 <br />
@@ -63,6 +63,19 @@
           <br />
           Please note that there's a dot (<em>.</em>) at the end target addresses.
         </div>
+        {# Cloudflare-deployment note (deviation from the upstream template):
+           inbound mail arrives via Cloudflare Email Routing, whose records are
+           zone-managed — see scripts/provision-domain.mjs. #}
+        <div class="alert alert-info">
+          <b>Cloudflare deployment note:</b> this SimpleLogin instance receives
+          mail through Cloudflare Email Routing. The domain's zone must be added
+          to the operator's Cloudflare account with Email Routing enabled — the
+          MX records above are then created automatically — and a catch-all
+          route must point at this worker
+          (<code>scripts/provision-domain.mjs</code> automates these steps).
+          Cloudflare may assign different priority values than the ones shown;
+          verification only compares the target hosts.
+        </div>
         {% for mx in expected_mx_records %}
           <div class="mb-3 p-3 dns-record">
             Record: MX
@@ -90,7 +103,7 @@
           <div class="text-danger mt-4">
             Your DNS is not correctly set. The MX record we obtain is:
             <div class="mb-3 p-3 dns-record">
-              {% if not mx_errors %}(Empty){% endif %}
+              {% if mx_errors | length == 0 %}(Empty){% endif %}
               {% for r in mx_errors %}
                 {{ r }}
                 <br />
@@ -116,6 +129,13 @@
           {% endif %}
         </div>
         <div class="mb-2">Add the following TXT DNS record to your domain.</div>
+        {# Deviation from upstream: the include authorizes Cloudflare Email
+           Sending (this deployment's outbound path), not EMAIL_DOMAIN. #}
+        <div class="mb-2">
+          On this deployment, emails sent from your aliases are delivered
+          through <em>Cloudflare Email Sending</em>; this record authorizes its
+          sending servers for your domain.
+        </div>
         <div class="mb-2 p-3 dns-record">
           Record: TXT
           <br />
@@ -140,7 +160,7 @@
           <div class="text-danger mt-4">
             Your DNS is not correctly set. The TXT record we obtain is:
             <div class="mb-3 p-3 dns-record">
-              {% if not spf_errors %}(Empty){% endif %}
+              {% if spf_errors | length == 0 %}(Empty){% endif %}
               {% for r in spf_errors %}
                 {{ r }}
                 <br />
@@ -163,6 +183,16 @@
           {% endif %}
         </div>
         <div class="mb-2">Add the following CNAME DNS records to your domain.</div>
+        {# Deviation from upstream: only dkim._domainkey is required here —
+           custom-domain DKIM signatures come from Cloudflare Email Sending
+           onboarding, not from this worker's single EMAIL_DOMAIN key. #}
+        <div class="alert alert-info">
+          On this deployment, DKIM signatures for your domain are added by
+          <em>Cloudflare Email Sending</em> once the domain is onboarded by the
+          operator (see <code>scripts/provision-domain.mjs</code>). Only the
+          first record (<em>dkim._domainkey</em>) is required for verification;
+          <em>dkim02</em>/<em>dkim03</em> are legacy records and optional.
+        </div>
         {% for dkim in dkim_records %}
           <div class="mb-2 p-3 dns-record">
             Record: CNAME
@@ -247,7 +277,7 @@
             Your DNS is not correctly set.
             The TXT record we obtain is:
             <div class="mb-3 p-3" style="background-color: #eee">
-              {% if not dmarc_errors %}(Empty){% endif %}
+              {% if dmarc_errors | length == 0 %}(Empty){% endif %}
               {% for r in dmarc_errors %}
                 {{ r }}
                 <br />

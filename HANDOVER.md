@@ -6,10 +6,15 @@ API** so existing client apps (mobile apps, browser extensions) keep working
 unchanged.
 
 **Branch:** `cloudflare-rewrite` (off `master`), everything under `cloudflare/`.
-**Status: functionally complete, deployed, and live.** 765 tests green in real
+**Status: functionally complete, deployed, and live.** 888 tests green in real
 workerd; `tsc` and Biome clean. All three layers (API, email worker, web
 dashboard) have been through an adversarial line-by-line diff against the
-original Flask source.
+original Flask source. A 2026-07-26 fix program added the missing operational
+half: a cron-driven D1 job runner (batch import now actually imports;
+mailbox/domain/account deletion complete; onboarding + user-report emails),
+DSN/bounce detection under the no-VERP model, transient-send retry, FWD-5
+signed unsubscribe proxy, PGP (openpgp.js), Email-Routing-aware custom-domain
+verification, and domain provisioning/backup tooling (see §4a).
 
 ## 0. Live deployment (as of 2026-07-06)
 
@@ -30,7 +35,14 @@ original Flask source.
   API key → alias creation → inbound forward (reverse-alias From, Cloudflare
   DKIM, DMARC pass) → reply through the reverse alias delivered to the contact.
 - **Test account:** `you@example.com` (change the password via the
-  dashboard). Test alias created: `slug_eagle137@mail.example.com`.
+  dashboard). Test alias created: `slug_eagle137@mail.example.com`. The
+  account has `lifetime = 1` set directly in remote D1 (2026-07-26) — that is
+  the self-hosted "become premium" path (no billing backend is wired).
+- **Registration is closed** (`DISABLE_REGISTRATION` var) and **Workers Logs
+  observability is enabled** — both in `wrangler.jsonc` since 2026-07-26.
+- **Cron triggers**: `* * * * *` drains the D1 `job` queue (src/jobs/), and
+  `17 3 * * *` runs daily maintenance (trash purge, rate_limit/notification/
+  job-row trims). Wired via `scheduled()` in `src/index.ts`.
 
 ### Email delivery model — READ THIS before touching `src/email.ts`
 
@@ -124,24 +136,63 @@ Cloudflare DKIM instead of Postfix; `ts_vector` search → LIKE approximation.
 
 ## 4. Remaining / nice-to-have (nothing blocking)
 
-- **FWD-5** (deferred): mailto-only `List-Unsubscribe` should be proxied through
-  a signed SimpleLogin web-unsubscribe link instead of dropped — needs a
-  `/dashboard/unsubscribe/<encoded>` decoder endpoint (a documented web shell).
 - **Config-gated shells** (routes exist, feature stubbed): FIDO/WebAuthn
-  assertion verification, PGP key import (needs an OpenPGP port), Paddle
-  checkout/webhooks, Zendesk support tickets (needs `ZENDESK_HOST`), OAuth
-  provider token exchanges (need provider creds), hCaptcha (needs secret).
+  assertion verification, Paddle checkout/webhooks, Zendesk support tickets
+  (needs `ZENDESK_HOST`), OAuth provider token exchanges (need provider
+  creds), hCaptcha (needs secret).
 - **Skipped as unreachable** (documented in code, not bugs): OOO-over-VERP
   re-delivery and cross-recipient dedup — depend on VERP-addressed inbound /
   multi-RCPT transactions that don't occur under the envelope model (§0).
-- **Free cron ideas** (not yet wired): purge trashed aliases past `delete_on`;
-  process queued `job` rows (scheduled account deletion, mailbox transfers).
+- **PGP scope**: forward-path mailbox PGP only; reply-phase *contact* PGP and
+  the contact-detail PGP form are not implemented (documented in src/lib/pgp.ts).
 - **Refactors flagged by agents:** extract duplicated helpers (email
-  validation, suffix signing, alias delete) from route/web modules into
+  validation, suffix signing, alias delete — now also exported from
+  `src/jobs/handlers/delete-mailbox.ts`) from route/web modules into
   `src/lib`; deterministic-time seams for humanize/premium boundary tests.
 - **Not ported (out of scope, documented):** Flask-Admin panel, SpamAssassin/
-  rspamd scoring, PGP encryption, RefusedEmail→S3 quarantine, Proton OAuth
-  partner flows, phone reservations UI, batch import S3 jobs, HIBP cron.
+  rspamd scoring, RefusedEmail→S3 quarantine, Proton OAuth partner flows,
+  phone reservations UI, HIBP cron.
+
+## 4a. Added by the 2026-07-26 fix program
+
+- **Job runner** (`src/jobs/`): cron-driven port of job_runner.py — claim /
+  retry-after-30min / error-after-5-attempts parity. Handlers: batch-import
+  (full import_from_csv port — CSV from hosted SimpleLogin imports as-is,
+  custom-domain rows only), delete-mailbox / delete-domain / delete-account,
+  onboarding-1/2/4, send-user-report (zip attachment), retry-email.
+  Maintenance (03:17 UTC): trash purge past `delete_on`, rate_limit /
+  notification / old-job trims.
+- **Email worker hardening** (`src/email.ts`): DSN/bounce detection without
+  VERP (multipart/report → email_log bounce bookkeeping + user alert);
+  transient send failures now stash the built message in KV and retry via
+  `retry-email` jobs with backoff (5m/30m/2h/12h/24h) instead of hard SMTP
+  rejects; per-minute flood limit accepts-and-drops with a blocked EmailLog
+  (deviation: no tempfail on this platform); `X-SimpleLogin-Loop-Count` loop
+  guard; noreply/no-reply spelling unified; notification-send failures no
+  longer fail the reply; outbound test-capture gated to test env.
+- **FWD-5 unsubscribe** (`src/lib/unsubscribe.ts`): byte-compatible
+  UnsubscribeEncoder port (itsdangerous+SHA3-224 vectors); mailto-only
+  List-Unsubscribe now proxied through a signed
+  `/dashboard/unsubscribe/encoded/<payload>` link; the encoded decoder route
+  is real (disable alias / block contact / newsletter unsub).
+- **PGP** (`src/lib/pgp.ts`, openpgp.js): mailbox key import validates and
+  stores; forward path builds RFC 3156 multipart/encrypted per
+  prepare_pgp_message; falls back to plaintext with the Flask banner on
+  encryption failure.
+- **Custom domains on Email Routing**: MX verification is host-set based
+  (`route1/2/3.mx.cloudflare.net` from `EMAIL_SERVERS_WITH_PRIORITY`,
+  priorities ignored — CF assigns them per zone); SPF check expects
+  `include:_spf.mx.cloudflare.net`; DKIM verifies on the primary record
+  (custom-domain DKIM comes from Email Sending onboarding). DNS page carries
+  Cloudflare-specific instructions.
+- **Tooling**: `scripts/provision-domain.mjs` (zone → Email Routing → 
+  catch-all-to-worker → DMARC via API; prints manual steps for Email Sending
+  onboarding, which has no public write API), `scripts/backup-d1.sh`,
+  `scripts/seed-public-domain.sql`, `docs/DOMAINS.md` (full add-a-domain
+  runbook), `test/cors.test.ts` (browser-extension CORS contract).
+- **Test-env note**: wrangler vars merge into the vitest miniflare env; for
+  presence-based flags `""` now means "unset" (`DISABLE_REGISTRATION`,
+  `EMAIL_SERVERS_WITH_PRIORITY` are pinned to `""` in vitest.config.ts).
 
 ## 5. Redeploy / rotate runbook
 
@@ -149,11 +200,16 @@ From `cloudflare/` with `nvm use 22` (or the equivalent Node 22):
 - Deploy: `npm run deploy` (predeploy builds templates + assets).
 - Migrations: `npx wrangler d1 migrations apply simplelogin --remote`.
 - Secrets: `npx wrangler secret put FLASK_SECRET` / `DKIM_PRIVATE_KEY`.
-- New domain: enable Email Routing + Sending on it, add its DKIM/SPF/DMARC +
-  catch-all-to-worker records, seed a `public_domain` row in D1, set
-  `EMAIL_DOMAIN`/`ALIAS_DOMAINS`. NOTE: wrangler's OAuth token cannot write
-  arbitrary DNS records or reach `email/sending` endpoints without the paid
-  plan — use the dashboard or a scoped API token for those.
+- New domain: follow `docs/DOMAINS.md`. Short version: zone into the account,
+  `CLOUDFLARE_API_TOKEN=... node scripts/provision-domain.mjs --zone <domain>
+  --dmarc` (Email Routing + catch-all + DMARC), onboard Email Sending in the
+  dashboard (no public write API), then for a shared domain seed
+  `public_domain` (scripts/seed-public-domain.sql) + extend `ALIAS_DOMAINS`;
+  for a user custom domain just verify in the dashboard (MX check accepts the
+  route*.mx.cloudflare.net set). NOTE: wrangler's OAuth token cannot write
+  DNS or email settings — use a scoped API token.
+- Backups: `scripts/backup-d1.sh` (dated `wrangler d1 export`); KV `file:*`
+  blobs (batch-import uploads) are outside D1 backups.
 - Full setup notes also in `cloudflare/README.md`.
 
 ## 6. Original Flask reference points

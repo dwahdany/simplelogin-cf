@@ -14,8 +14,23 @@ export interface Env {
   /** Base URL of the app, used in emails/links */
   URL: string;
   MAX_NB_EMAIL_FREE_PLAN: string;
-  /** Presence-based flag, like the Flask app ("0" still counts as set!) */
+  /**
+   * Presence-based flag, like the Flask app ("0" still counts as set!) —
+   * EXCEPT "" which counts as unset (deviation: miniflare cannot delete a
+   * wrangler var in tests, so "" is the test-config "unset" spelling).
+   */
   DISABLE_REGISTRATION?: string;
+  /**
+   * Expected MX records for custom-domain verification, Flask format:
+   * "10 mx1.example.com.,20 mx2.example.com.". On this deployment the hosts
+   * are Cloudflare Email Routing's route1/2/3.mx.cloudflare.net.
+   * "" counts as unset (same test-config reason as DISABLE_REGISTRATION).
+   */
+  EMAIL_SERVERS_WITH_PRIORITY?: string;
+  /** Max subdomains per user (Flask config.MAX_NB_SUBDOMAIN, default 5). */
+  MAX_NB_SUBDOMAIN?: string;
+  /** Max directories per user (Flask config.MAX_NB_DIRECTORY, default 50). */
+  MAX_NB_DIRECTORY?: string;
   /** Presence-based flag disabling all rate limits */
   DISABLE_RATE_LIMIT?: string;
   /** Presence-based flag disabling signed alias suffixes */
