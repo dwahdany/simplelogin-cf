@@ -543,10 +543,14 @@ webCloudflarePagesRoutes.get(
     // pin below is skipped — CF_ACCOUNT_ID is still enforced per zone during
     // provisioning, where the zone object carries its own account id.
     const accountsProbe = await probeAccountsWithToken(token.accessToken);
+    // AUTHORITATIVE list — only ever from /accounts. The zone-derived account
+    // below must NOT feed this: it comes from a single per_page=1 zone, so
+    // treating it as "every account this grant can reach" would wrongly
+    // refuse a pinned account that simply does not own that first zone.
     const reachable = accountsProbe.ok ? accountsProbe.accounts : [];
     if (!accountsProbe.ok) {
       console.log(
-        `cf-oauth: account listing unavailable (${accountsProbe.status} ${accountsProbe.detail}) — expected without account.read`,
+        `cf-oauth: account listing unavailable (${accountsProbe.status} ${accountsProbe.detail}) — expected without account.read; falling back to the zone's account for display`,
       );
     }
 
@@ -584,9 +588,13 @@ webCloudflarePagesRoutes.get(
 
     // Prefer the pinned account over "whatever came back first" — the panel
     // then names the account that will actually be written to.
+    // Display/record only. `probe.account` (the owning account of the zone
+    // the liveness probe read) is the no-extra-scope stand-in for the
+    // /accounts listing; it is last so an authoritative answer always wins.
     const account =
       (pinned ? reachable.find((a) => a.id === pinned) : null) ??
       reachable[0] ??
+      probe.account ??
       null;
 
     // 7. RECONNECT: revoke whatever this row held before overwriting it.

@@ -521,7 +521,10 @@ interface CfEnvelope {
  */
 export async function probeApiWithToken(
   accessToken: string,
-): Promise<{ ok: true } | { ok: false; status: number; detail: string }> {
+): Promise<
+  | { ok: true; account: CfAccountRef | null }
+  | { ok: false; status: number; detail: string }
+> {
   try {
     const res = await cfOauthFetch(`${CF_API_ZONES_URL}?per_page=1`, {
       method: "GET",
@@ -536,7 +539,21 @@ export async function probeApiWithToken(
     } catch {
       /* non-JSON */
     }
-    if (res.ok && data?.success === true) return { ok: true };
+    if (res.ok && data?.success === true) {
+      // Zone objects carry their owning account, so the account identity the
+      // UI shows (and CF_ACCOUNT_ID compares) costs no extra scope — this is
+      // what replaces the ungrantable account.read. Null when the grant can
+      // see no zones yet, or the response omits the field.
+      const first = (Array.isArray(data.result) ? data.result : [])[0] as
+        | { account?: { id?: unknown; name?: unknown } }
+        | undefined;
+      const acc = first?.account;
+      const account =
+        acc && typeof acc.id === "string"
+          ? { id: acc.id, name: str(acc.name) ?? "" }
+          : null;
+      return { ok: true, account };
+    }
     const detail =
       (data?.errors ?? [])
         .map((e) => `[${e.code}] ${e.message}`)
