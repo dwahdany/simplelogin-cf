@@ -115,7 +115,10 @@ Cloudflare DKIM instead of Postfix; `ts_vector` search → LIKE approximation.
   lock, KV sessions, models (subscription-precedence premium logic),
   serializers, mailer seam. Werkzeug 405-vs-404 parity in `src/index.ts`.
 - **Schema**: `migrations/0001_init.sql` (50 tables) + `0002_rate_limit.sql` +
-  `0003_web_tables.sql`.
+  `0003_web_tables.sql` + `0004_cf_oauth.sql` (table `cf_oauth_token`, one
+  row per user, `ON DELETE CASCADE`). **0004 is not applied on the live D1
+  yet** — run `npx wrangler d1 migrations apply simplelogin --remote` before
+  the next deploy.
 
 ## 3. Working on this codebase
 
@@ -191,10 +194,23 @@ Cloudflare DKIM instead of Postfix; `ts_vector` search → LIKE approximation.
   `scripts/seed-public-domain.sql`, `docs/DOMAINS.md` (full add-a-domain
   runbook), `test/cors.test.ts` (browser-extension CORS contract).
   The provisioning script also has a one-click dashboard port ("Auto-
-  configure on Cloudflare" on the custom-domain DNS page), enabled by the
-  `CF_API_TOKEN` secret — `src/lib/cfapi.ts` + the cf-provision branch in
+  configure on Cloudflare" on the custom-domain DNS page) —
+  `src/lib/cfapi.ts` + the cf-provision branch in
   `src/web/mailbox-domain-pages.ts`; guards, rate limit and token-scoping
-  requirements in `docs/DOMAINS.md` §3.
+  requirements in `docs/DOMAINS.md` §3. It runs under **either** of two
+  credentials:
+  - the acting user's **Cloudflare OAuth grant** (preferred) — self-managed
+    OAuth, GA 2026-06-03: `src/lib/cfoauth.ts` (endpoints, PKCE, AES-GCM
+    grant storage in `cf_oauth_token`) + `src/web/cloudflare-pages.ts`
+    (`POST /dashboard/cloudflare/connect`, `GET .../callback`,
+    `POST .../disconnect`, mounted at `/dashboard` in `src/index.ts`) +
+    `templates/dashboard-mailbox/_cloudflare_connect.html`. Secrets:
+    `CF_OAUTH_CLIENT_ID`, `CF_OAUTH_CLIENT_SECRET`, plus `CF_ACCOUNT_ID`
+    (the account hosting this worker — cross-account zones cannot be
+    provisioned) and the optional `CF_OAUTH_SCOPES` override. Requires
+    migration `0004_cf_oauth.sql`. Not registered on the live deployment yet;
+    registration walkthrough in `docs/DOMAINS.md` §3.1–§3.4.
+  - the operator-wide `CF_API_TOKEN` secret (fallback, unchanged).
 - **Test-env note**: wrangler vars merge into the vitest miniflare env; for
   presence-based flags `""` now means "unset" (`DISABLE_REGISTRATION`,
   `EMAIL_SERVERS_WITH_PRIORITY` are pinned to `""` in vitest.config.ts).

@@ -10,6 +10,11 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { JOB_STATE_DONE, runPendingJobs } from "../src/jobs";
+import {
+  CF_OAUTH_REVOKE_URL,
+  saveGrant,
+  setCfOauthFetch,
+} from "../src/lib/cfoauth";
 import { nowStr } from "../src/lib/dates";
 import type { Env } from "../src/lib/env";
 import { sentEmails } from "../src/lib/mailer";
@@ -523,6 +528,63 @@ describe("delete-account job", () => {
         a1.email,
       ),
     ).toBe(0);
+  });
+
+  it("hands the user's Cloudflare OAuth grant back before the cascade drops it", async () => {
+    // The cf_oauth_token row is ON DELETE CASCADE, so this is the last
+    // moment anyone can revoke: after the users-row delete the refresh token
+    // is live in the ex-user's Cloudflare account and its ciphertext is gone.
+    const revoked: Array<Record<string, string>> = [];
+    setCfOauthFetch(async (input, init) => {
+      if (input !== CF_OAUTH_REVOKE_URL) throw new Error(`unexpected ${input}`);
+      revoked.push(
+        Object.fromEntries(
+          new URLSearchParams(typeof init?.body === "string" ? init.body : ""),
+        ),
+      );
+      return new Response("", { status: 200 });
+    });
+    try {
+      const user = await createUser(db);
+      await saveGrant(tenv, user.id, {
+        accessToken: "at-live",
+        refreshToken: "rt-live",
+      });
+
+      await enqueue("delete-account", { user_id: user.id });
+      await runPendingJobs(tenv);
+
+      expect(revoked).toEqual([
+        { token: "rt-live", token_type_hint: "refresh_token" },
+        { token: "at-live", token_type_hint: "access_token" },
+      ]);
+      expect(
+        await count(
+          "SELECT COUNT(*) AS n FROM cf_oauth_token WHERE user_id = ?1",
+          user.id,
+        ),
+      ).toBe(0);
+    } finally {
+      setCfOauthFetch(null); // singleWorker: never leave the seam installed
+    }
+  });
+
+  it("a failing revoke endpoint does not block the deletion", async () => {
+    setCfOauthFetch(async () => {
+      throw new Error("network down");
+    });
+    try {
+      const user = await createUser(db);
+      await saveGrant(tenv, user.id, { accessToken: "at-live" });
+      const jobId = await enqueue("delete-account", { user_id: user.id });
+      expect(await runPendingJobs(tenv)).toBe(1);
+      expect(await jobState(jobId)).toBe(JOB_STATE_DONE);
+      expect(
+        await count("SELECT COUNT(*) AS n FROM users WHERE id = ?1", user.id),
+      ).toBe(0);
+    } finally {
+      setCfOauthFetch(null);
+    }
   });
 
   it("vanished user: job completes silently, no email", async () => {

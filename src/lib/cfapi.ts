@@ -29,6 +29,9 @@
  *   the live deployment the apex zone's mail is Protonmail's).
  * Network-level fetch rejections are rethrown as CfApiError with status 0 so
  * callers have a single error type for "the Cloudflare API call failed".
+ *
+ * The client authenticates with either the operator's static CF_API_TOKEN or
+ * a per-user Cloudflare OAuth grant — see CfCredential below.
  */
 
 const API_BASE = "https://api.cloudflare.com/client/v4";
@@ -56,6 +59,13 @@ export function setCfFetch(f: CfFetch | null): void {
 export interface CfZone {
   id: string;
   name: string;
+  /**
+   * Owning account, as returned by GET /zones. Optional because callers must
+   * not depend on it (an older/partial response, or a fake in tests, may omit
+   * it) — the account check in handleCfProvision fails OPEN when it is
+   * absent, rather than blocking every provisioning run on a response shape.
+   */
+  account?: { id?: string; name?: string };
 }
 
 export interface CfEmailRoutingSettings {
@@ -141,8 +151,43 @@ export class ForeignMxError extends Error {
 // client
 // ---------------------------------------------------------------------------
 
+/**
+ * A bearer token, resolved lazily before EVERY request. Used for the per-user
+ * Cloudflare OAuth grant (src/lib/cfoauth.ts `getValidAccessToken`), whose
+ * access token is short-lived: one provisioning run makes up to ~9 calls and
+ * the token can hit its refresh window between two of them, so the credential
+ * must be re-resolved per request rather than captured once.
+ *
+ * The provider may throw. A CfApiError is propagated unchanged (callers can
+ * use its status, e.g. 401, to say "reconnect your Cloudflare account");
+ * anything else is wrapped as CfApiError with status 0, so callers still have
+ * exactly one error type for "the Cloudflare API call failed".
+ */
+export type CfTokenProvider = () => string | Promise<string>;
+
+/** Static token string (operator CF_API_TOKEN) or a per-request provider. */
+export type CfCredential = string | CfTokenProvider;
+
 export class CfClient {
-  constructor(private readonly token: string) {}
+  /**
+   * @param credential a token string (unchanged legacy form) or a
+   * CfTokenProvider resolved before every request.
+   */
+  constructor(private readonly credential: CfCredential) {}
+
+  /** The bearer token for the next request (see CfTokenProvider). */
+  private async resolveToken(method: string, path: string): Promise<string> {
+    if (typeof this.credential === "string") return this.credential;
+    try {
+      return await this.credential();
+    } catch (e) {
+      if (e instanceof CfApiError) throw e;
+      throw new CfApiError(
+        `${method} ${path}: no usable Cloudflare credential: ${e instanceof Error ? e.message : String(e)}`,
+        0,
+      );
+    }
+  }
 
   /** Cloudflare v4 envelope fetch: returns `result` or throws CfApiError. */
   private async request<T>(
@@ -150,12 +195,13 @@ export class CfClient {
     opts: { method?: string; body?: unknown } = {},
   ): Promise<T> {
     const { method = "GET", body } = opts;
+    const token = await this.resolveToken(method, path);
     let res: Response;
     try {
       res = await cfFetch(`${API_BASE}${path}`, {
         method,
         headers: {
-          authorization: `Bearer ${this.token}`,
+          authorization: `Bearer ${token}`,
           ...(body !== undefined ? { "content-type": "application/json" } : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,

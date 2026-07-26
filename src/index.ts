@@ -14,6 +14,7 @@ import { userRoutes } from "./routes/user";
 import { webAliasPagesRoutes } from "./web/alias-pages";
 import { webAuthPagesRoutes } from "./web/auth-pages";
 import { webBillingPagesRoutes } from "./web/billing-pages";
+import { webCloudflarePagesRoutes } from "./web/cloudflare-pages";
 import { webInfraRoutes } from "./web/infra";
 import { webMailboxDomainPagesRoutes } from "./web/mailbox-domain-pages";
 import { webSettingsPagesRoutes } from "./web/settings-pages";
@@ -119,6 +120,7 @@ app.route("/dashboard", webAliasPagesRoutes);
 app.route("/dashboard", webMailboxDomainPagesRoutes);
 app.route("/dashboard", webSettingsPagesRoutes);
 app.route("/dashboard", webBillingPagesRoutes);
+app.route("/dashboard", webCloudflarePagesRoutes);
 
 // Cron schedules (wrangler.jsonc `triggers.crons`): the per-minute tick runs
 // the job-runner pass; the daily tick runs maintenance (Flask crontab

@@ -78,37 +78,50 @@ export const requireWebLogin: MiddlewareHandler<WebEnv> = async (c, next) => {
  * The @sudo_required equivalent — must run AFTER requireWebLogin. On a stale
  * sudo, pending flashes are stashed in extra._preserved_flashes and restored
  * by the next sudo-fresh request (enter_sudo re-render keeps them alive).
+ *
+ * `nextPath` overrides where enter_sudo sends the user after the password
+ * check. It defaults to the current path, which is right for the Flask-style
+ * GET|POST pages this gates — but a POST-ONLY endpoint has no page to come
+ * back to (enter_sudo redirects with a GET), so those pass the path of the
+ * page carrying their form. See src/web/cloudflare-pages.ts.
  */
-export const requireWebSudo: MiddlewareHandler<WebEnv> = async (c, next) => {
-  const session = c.get("webSession");
-  const now = Date.now() / 1000;
-  const sudoFresh =
-    session.sudo_time !== undefined && now - session.sudo_time <= SUDO_GAP_SECS;
-  if (!sudoFresh) {
-    if (session.flashes?.length) {
-      session.extra = {
-        ...session.extra,
-        _preserved_flashes: session.flashes,
-      };
-      session.flashes = [];
+export function makeRequireWebSudo(
+  nextPath?: string,
+): MiddlewareHandler<WebEnv> {
+  return async (c, next) => {
+    const session = c.get("webSession");
+    const now = Date.now() / 1000;
+    const sudoFresh =
+      session.sudo_time !== undefined &&
+      now - session.sudo_time <= SUDO_GAP_SECS;
+    if (!sudoFresh) {
+      if (session.flashes?.length) {
+        session.extra = {
+          ...session.extra,
+          _preserved_flashes: session.flashes,
+        };
+        session.flashes = [];
+        await saveSession(c, session);
+      }
+      const url = new URL(c.req.url);
+      return c.redirect(
+        urlFor("dashboard.enter_sudo", { next: nextPath ?? url.pathname }),
+        302,
+      );
+    }
+    const preserved = session.extra?._preserved_flashes as
+      | SessionData["flashes"]
+      | undefined;
+    if (preserved?.length) {
+      session.flashes = [...preserved, ...(session.flashes ?? [])];
+      delete session.extra?._preserved_flashes;
       await saveSession(c, session);
     }
-    const url = new URL(c.req.url);
-    return c.redirect(
-      urlFor("dashboard.enter_sudo", { next: url.pathname }),
-      302,
-    );
-  }
-  const preserved = session.extra?._preserved_flashes as
-    | SessionData["flashes"]
-    | undefined;
-  if (preserved?.length) {
-    session.flashes = [...preserved, ...(session.flashes ?? [])];
-    delete session.extra?._preserved_flashes;
-    await saveSession(c, session);
-  }
-  await next();
-};
+    await next();
+  };
+}
+
+export const requireWebSudo: MiddlewareHandler<WebEnv> = makeRequireWebSudo();
 
 /**
  * login_user(): rotate the session token, keep pre-login session data

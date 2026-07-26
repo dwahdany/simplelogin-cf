@@ -52,9 +52,11 @@ cd cloudflare
 CLOUDFLARE_API_TOKEN=... node scripts/provision-domain.mjs --zone new-domain.example --dmarc
 ```
 
-The token must be a **scoped API token** (Zone:Read, DNS:Edit, Email Routing
-Rules:Edit) — wrangler's OAuth token from `wrangler login` cannot write DNS
-records or email settings. See `--help`.
+The token must be a **scoped API token** (Zone:Read, **Zone Settings:Edit**,
+DNS:Edit, Email Routing Rules:Edit) — wrangler's OAuth token from
+`wrangler login` cannot write DNS records or email settings. Zone Settings is
+the non-obvious one: enabling Email Routing is gated on it, not on Email
+Routing Rules (§3.3). See `--help`.
 
 Zone limit: up to 30 domains per zone across Email Routing + Email Sending,
 apex included.
@@ -152,24 +154,180 @@ otherwise forwards for aliases on it fail DMARC at strict receivers.
 
 ### One-click provisioning from the dashboard (optional)
 
-When the operator stores a Cloudflare API token as the `CF_API_TOKEN`
-secret (`npx wrangler secret put CF_API_TOKEN`), the DNS page
-(`/dashboard/domains/<id>/dns`) grows an **"Auto-configure on Cloudflare"**
-button — a server-side port of `provision-domain.mjs` (`src/lib/cfapi.ts` +
-the cf-provision branch in `src/web/mailbox-domain-pages.ts`). One click
-runs zone lookup → Email Routing → catch-all-to-worker → ownership TXT +
-DMARC, then re-runs the page's ownership/MX/SPF/DMARC checks in-process.
-Unset (or `""`) disables the feature: the button is hidden and the POST
-form-name is ignored. `CF_WORKER_NAME` overrides the catch-all target
-worker (default `simplelogin`).
+The DNS page (`/dashboard/domains/<id>/dns`) can grow an **"Auto-configure on
+Cloudflare"** button — a server-side port of `provision-domain.mjs`
+(`src/lib/cfapi.ts` + the cf-provision branch in
+`src/web/mailbox-domain-pages.ts`). One click runs zone lookup → Email
+Routing → catch-all-to-worker → ownership TXT + DMARC, then re-runs the
+page's ownership/MX/SPF/DMARC checks in-process. `CF_WORKER_NAME` overrides
+the catch-all target worker (default `simplelogin`).
 
-Security model — the button plants the ownership TXT with the *operator's*
-token, i.e. clicking it "proves" ownership of any name the token can edit,
-for whichever user added the domain:
+#### 3.1 Two credential paths
 
-- The token MUST be a scoped API token (Zone:Read, DNS:Edit, Email Routing
-  Rules:Edit) and should additionally be **zone-scoped to only the zones
-  intended for user custom domains** wherever possible.
+The button appears when **either** credential exists, and provisioning always
+prefers the first:
+
+| | **A. User's Cloudflare account (OAuth)** | **B. Operator's static token** |
+|---|---|---|
+| Config | `CF_OAUTH_CLIENT_ID` + `CF_OAUTH_CLIENT_SECRET` | `CF_API_TOKEN` |
+| Whose account | the account *the user connects themselves* | the operator's |
+| Per user | yes (one grant per user, D1 `cf_oauth_token`) | no, instance-wide |
+| Revocation | user: Disconnect button; account owner: Cloudflare dashboard > Manage Account > Authorized apps | operator rotates the secret |
+| Storage | AES-GCM ciphertext in D1, key derived from `FLASK_SECRET` | wrangler secret |
+| Lifetime | short-lived access token, auto-refreshed (refresh token) | until revoked |
+
+Both paths run **the same code** (`handleCfProvision`): identical guards,
+identical rate limit, identical refusals. The only difference is the bearer
+token on the outgoing calls — the OAuth token is resolved once per run and
+re-resolved as soon as it enters the 60 s refresh window, so an access token
+that ages out mid-run is refreshed transparently (it never falls back to
+`CF_API_TOKEN` mid-run: that would finish writing under an authorization the
+user never granted).
+
+A grant that exists but yields no token right now (expired with no refresh
+token, or revoked at Cloudflare) is a **refusal, not a downgrade**: the run
+stops with "please connect your Cloudflare account again" rather than
+quietly continuing under the operator's account-wide token. The connect panel
+says the same thing before the click (`needs_reconnect`).
+
+With neither credential the feature is off: the button is hidden and the POST
+`form-name` is ignored (falls through to a plain page render). `""` counts as
+unset everywhere, and a half-configured OAuth client (id without secret) is
+off.
+
+**Cross-account provisioning does NOT work — by design of the platform.**
+Cloudflare Email Routing can only deliver a zone's mail to a Worker in the
+**same account**, and the catch-all this code writes names `CF_WORKER_NAME`
+with no account qualifier. So whichever path is used, the domain's zone must
+live in the Cloudflare account that hosts this worker. Path A's value is
+therefore *delegation*, not multi-tenancy: the user authorizes their own
+(operator-hosted) account with a revocable, per-user grant instead of the
+operator holding one token that can edit every zone.
+
+Pin that account so the code can enforce it:
+
+```sh
+npx wrangler secret put CF_ACCOUNT_ID   # or add it to wrangler.jsonc `vars`
+```
+
+With `CF_ACCOUNT_ID` set, (a) the OAuth callback refuses (and revokes) a
+grant that cannot see that account, and (b) provisioning refuses a zone whose
+`account.id` differs — **before** the Email-Routing enable, which would
+otherwise write and lock the zone's MX records and only then fail on the
+catch-all, leaving the zone advertising Cloudflare MX with nothing behind
+them (inbound mail rejected). Unset, both checks are skipped and that failure
+mode is on the operator to avoid.
+
+#### 3.2 Registering the OAuth client (path A, operator, one-off)
+
+Cloudflare self-managed OAuth went GA 2026-06-03
+([docs](https://developers.cloudflare.com/fundamentals/oauth/)). Requires the
+role **Super Administrator**, **Administrator** or **OAuth Client Write**.
+
+1. Cloudflare dashboard > **Manage Account > OAuth clients > Create client**.
+2. Fields:
+   - **Client name**: anything, e.g. `SimpleLogin (self-hosted)`.
+   - **Response types**: `code` (Authorization Code is the only flow
+     supported for third-party clients).
+   - **Grant types**: `authorization_code` **and** `refresh_token` (without
+     the latter the grant dies at the first access-token expiry and every
+     user has to reconnect).
+   - **Token endpoint auth method**: `client_secret_basic` — this is a
+     server-side Worker, i.e. a confidential client. (PKCE S256 is sent
+     anyway.)
+   - **Redirect URL**: `<URL var>/dashboard/cloudflare/callback`, e.g.
+     `https://simplelogin.example.workers.dev/dashboard/cloudflare/callback`.
+     It is derived from the `URL` var, never from the request Host header, so
+     it must match that var exactly.
+   - **Scopes**: see §3.3 — including `offline_access`.
+3. Store the credentials:
+
+   ```sh
+   npx wrangler secret put CF_OAUTH_CLIENT_ID
+   npx wrangler secret put CF_OAUTH_CLIENT_SECRET
+   npx wrangler secret put CF_ACCOUNT_ID      # §3.1, account hosting the worker
+   ```
+
+   Optional: `CF_OAUTH_SCOPES` (space-separated) overrides the requested
+   scope list without a code change. It is read from the environment like
+   any other var, so it only exists at runtime if you either add it to
+   `wrangler.jsonc` `vars` **or** push it with
+   `npx wrangler secret put CF_OAUTH_SCOPES` — setting it anywhere else is a
+   silent no-op and the built-in defaults are used.
+
+Endpoints used (all on `dash.cloudflare.com`, **not** `api.cloudflare.com`):
+`/oauth2/auth`, `/oauth2/token`, `/oauth2/revoke`, discovery at
+`https://dash.cloudflare.com/.well-known/openid-configuration`. The API calls
+the grant then authorizes still go to `api.cloudflare.com/client/v4`; the
+callback proves that end-to-end with a `GET /client/v4/accounts` probe before
+storing anything, and refuses to store a grant the API will not accept.
+
+#### 3.3 Scopes — the caveat and the zone-settings trap
+
+Default requested scopes (`DEFAULT_CF_OAUTH_SCOPES` in
+`src/web/cloudflare-pages.ts`):
+
+```
+offline_access account.read zone.read zone-settings.read zone-settings.write
+email-routing-rule.read email-routing-rule.write dns.read dns.write
+```
+
+**Only `account.read` is officially documented** (`offline_access` is a
+protocol scope and appears in the discovery document's `scopes_supported`).
+The rest are derived from Cloudflare's permission-group labels and are
+**unverified**. Enumerate the real ids before registering the client — the
+endpoint takes *any* API token:
+
+```sh
+curl -s https://api.cloudflare.com/client/v4/oauth/scopes \
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq '.result[] | {id, name}'
+```
+
+Use the `id` field verbatim (ids are dot-delimited; colon-delimited forms are
+rejected).
+
+**`offline_access` is requested explicitly and must be ticked in the client's
+scope picker.** Cloudflare's authorization server is Ory Hydra/fosite
+(visible in the discovery document), which mints a refresh token only when
+`offline`/`offline_access` is among the **granted** scopes — listing
+`refresh_token` in the client's grant types is necessary but *not*
+sufficient. Without it every grant dies ~1 h after connecting and cannot be
+renewed. The callback detects this at connect time: it stores the grant and
+flashes a warning naming `offline_access` and `CF_OAUTH_SCOPES` (and logs
+it), and the connect panel then shows "this authorization can no longer be
+renewed" once the access token has expired.
+
+**The trap:** the Accepted-Permissions badge on each endpoint does not follow
+the product names.
+
+| Call the provisioner makes | Permission actually required |
+|---|---|
+| `GET /zones?name=` | **Zone** Read |
+| `GET/POST /zones/{id}/email/routing`, `.../enable`, `.../dns` | **Zone Settings** read/write (*not* Email Routing Rules) |
+| `GET/PUT /zones/{id}/email/routing/rules/catch_all` | **Email Routing Rules** read/write |
+| `GET/POST /zones/{id}/dns_records` | **DNS** read/write |
+
+An OAuth client registered without the zone-settings scopes therefore
+authorizes fine, passes the callback probe, and then **403s exactly at the
+Email-Routing-enable step**. The dashboard says so: a 401/403 under an OAuth
+grant flashes "the authorization is missing a permission or has expired",
+names the zone-settings scopes and tells the user to reconnect (a 401/403
+under `CF_API_TOKEN` keeps the generic "Cloudflare API error" wording — the
+user cannot fix the operator's token).
+
+The same mapping applies to the static token of path B: scope it
+Zone:Read, **Zone Settings:Edit**, DNS:Edit, Email Routing Rules:Edit.
+
+#### 3.4 Security model
+
+Under path B the button plants the ownership TXT with the *operator's* token,
+i.e. clicking it "proves" ownership of any name that token can edit, for
+whichever user added the domain. Path A narrows this to the user's own
+account, but every guard below applies to both paths:
+
+- `CF_API_TOKEN` MUST be a scoped API token (see §3.3) and should
+  additionally be **zone-scoped to only the zones intended for user custom
+  domains** wherever possible.
 - The server refuses domains that overlap the deployment's own mail
   domains (`EMAIL_DOMAIN`, `FIRST_ALIAS_DOMAIN`, `ALIAS_DOMAINS`,
   `PREMIUM_ALIAS_DOMAINS`, every `public_domain` row) **and** any domain
@@ -180,8 +338,30 @@ for whichever user added the domain:
 - Non-destructive: it refuses (never overwrites) a catch-all rule with a
   foreign destination — even a disabled one — and refuses to enable Email
   Routing on a name that already carries non-Cloudflare MX records.
-- Rate-limited per user (3/minute; 20/hour) — each click spends up to ~9
-  authenticated calls of the account-wide Cloudflare API quota.
+- **Nothing is written until every read-only check has passed**, and an
+  authorization failure during those checks is never mistaken for "this zone
+  has no Email Routing yet": a 401/403 on the catch-all preflight aborts
+  before the Email-Routing enable rather than falling through into it (that
+  ordering is what keeps a wrong `email-routing-rule.*` scope from leaving a
+  zone with Cloudflare MX and no rule behind them). Same for the
+  `CF_ACCOUNT_ID` check of §3.1.
+- Rate-limited per user (3/minute; 20/hour) — each click spends up to ~10
+  authenticated calls of the Cloudflare API quota (the *user's* quota under
+  path A, the operator's under path B).
+- Flashes never contain tokens, zone names or zone ids; full errors go to
+  Workers Logs via `console.error`.
+- Connect and Disconnect are **POSTs with the page's CSRF token, behind web
+  sudo** (like `/api_key`): the session cookie is `SameSite=Lax`, so a
+  cross-site top-level navigation would otherwise be able to start — and for
+  an already-consented user silently finish — a connection.
+- Tokens are AES-GCM encrypted at rest with a key derived from
+  `FLASK_SECRET`, versioned (`v1.<iv>.<ct>`) and bound to the owning
+  `user_id` as GCM additional data, so a row copied to another user fails to
+  decrypt. Rotating `FLASK_SECRET` invalidates every grant (users reconnect).
+- Every path that drops a grant asks Cloudflare to revoke **both** tokens
+  first — Disconnect, a failed post-issue probe, reconnecting over an
+  existing grant, and account deletion (the `cf_oauth_token` cascade in
+  `handleDeleteAccount` would otherwise strand a live refresh token).
 - What it does NOT do (reported in the flash as the remaining manual
   steps): Email Sending onboarding (§1.4, dashboard-only) and
   destination-address verification (§1.6).
@@ -239,7 +419,16 @@ appear in the sender's bounce and in Workers Logs (observability is enabled).
   in Workers Logs if it persists.
 - **`provision-domain.mjs` fails with 403/Authentication error** — the token
   is missing scopes or is wrangler's OAuth token, which cannot write DNS or
-  email settings. Create a scoped API token (see `--help`).
+  email settings. Create a scoped API token (see `--help` and §3.3).
+- **"Auto-configure on Cloudflare" fails right after "zone found", with
+  "the authorization is missing a permission"** — under a connected
+  Cloudflare account this is almost always the zone-settings trap (§3.3):
+  the OAuth client was registered without `zone-settings.read` /
+  `zone-settings.write`, so enabling Email Routing is refused. Fix the
+  client's scopes in Manage Account > OAuth clients, then have the user
+  Disconnect and Connect again — existing grants keep the scopes they were
+  issued with. If the wording is the generic "Cloudflare API error" instead,
+  the run used the operator's `CF_API_TOKEN`: add Zone Settings:Edit there.
 - **Onboarding a subdomain fails with a limit error** — zones cap at 30
   Email Routing/Sending domains combined, apex included.
 

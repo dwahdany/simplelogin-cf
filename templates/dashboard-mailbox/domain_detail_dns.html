@@ -6,33 +6,68 @@
     <div>Please follow the steps below to set up your domain.</div>
     <div class="small-text mb-5">DNS changes could take up to 24 hours to update.</div>
     {# One-click provisioning (deviation from upstream): server-side port of
-       scripts/provision-domain.mjs, only rendered when the operator stored a
-       scoped CF_API_TOKEN — see the cf-provision branch in
-       src/web/mailbox-domain-pages.ts. #}
-    {% if cf_provision_available %}
+       scripts/provision-domain.mjs — see the cf-provision branch in
+       src/web/mailbox-domain-pages.ts. Rendered when EITHER credential can
+       exist: the user's own Cloudflare OAuth grant (preferred) or the
+       operator's static CF_API_TOKEN. The card also carries the
+       connect/disconnect panel, so a user whose operator registered an OAuth
+       client can get from "no credential" to "connected" without leaving the
+       page. #}
+    {% if cf_provision_available or (cf_oauth and cf_oauth.configured) %}
       <div id="cf-provision-form" class="alert alert-primary">
         <div class="font-weight-bold">Auto-configure on Cloudflare</div>
-        <div class="mb-2">
-          This instance can set up the Cloudflare side for you: find the
-          domain's zone in the operator's Cloudflare account, enable Email
-          Routing, point the <em>zone-wide</em> catch-all route at this
-          worker, create the ownership TXT and DMARC records, then re-run
-          the ownership, MX, SPF and DMARC checks below. Safe to click again
-          at any time — steps already done are skipped, and it refuses
-          (rather than modifies) any existing mail setup that points
-          somewhere else: foreign MX records, or a catch-all rule with
-          another destination (even a disabled one). Two manual steps remain
-          afterwards, both for the operator: Email Sending onboarding in the
-          Cloudflare dashboard, needed for replies sent <em>from</em> this
-          domain's aliases, and verifying your mailboxes as Email Routing
-          destination addresses — Cloudflare only delivers forwarded mail to
-          verified destinations.
-        </div>
-        <form method="post" action="#cf-provision-form">
-          {{ csrf_form.csrf_token }}
-          <input type="hidden" name="form-name" value="cf-provision">
-          <button type="submit" class="btn btn-primary">Auto-configure on Cloudflare</button>
-        </form>
+        {% if cf_provision_available %}
+          <div class="mb-2">
+            This instance can set up the Cloudflare side for you: find the
+            domain's zone in the Cloudflare account, enable Email Routing,
+            point the <em>zone-wide</em> catch-all route at this worker,
+            create the ownership TXT and DMARC records, then re-run the
+            ownership, MX, SPF and DMARC checks below. Safe to click again
+            at any time — steps already done are skipped, and it refuses
+            (rather than modifies) any existing mail setup that points
+            somewhere else: foreign MX records, or a catch-all rule with
+            another destination (even a disabled one). Two manual steps remain
+            afterwards, both for the operator: Email Sending onboarding in the
+            Cloudflare dashboard, needed for replies sent <em>from</em> this
+            domain's aliases, and verifying your mailboxes as Email Routing
+            destination addresses — Cloudflare only delivers forwarded mail to
+            verified destinations.
+          </div>
+          <form method="post" action="#cf-provision-form">
+            {{ csrf_form.csrf_token }}
+            <input type="hidden" name="form-name" value="cf-provision">
+            <button type="submit" class="btn btn-primary">Auto-configure on Cloudflare</button>
+          </form>
+        {% else %}
+          <div class="mb-2">
+            Connect your Cloudflare account below and this instance can set up
+            the Cloudflare side of this domain for you in one click: zone
+            lookup, Email Routing, the zone-wide catch-all route, and the
+            ownership TXT plus DMARC records.
+          </div>
+        {% endif %}
+        {% include "dashboard-mailbox/_cloudflare_connect.html" %}
+        {# Only where connecting an account is actually possible: with no
+           OAuth client registered there is no choice to describe (and no
+           Connect button on this page — the partial self-suppresses). #}
+        {% if cf_oauth and cf_oauth.configured %}
+          <div class="small-text">
+            {% if cf_oauth.connected and not cf_oauth.needs_reconnect %}
+              Auto-configuration runs with the delegated access of the
+              connected account above; if that authorization has expired or
+              been revoked it refuses to run rather than falling back.
+            {% elif cf_oauth.connected %}
+              The connected authorization can no longer be renewed, so
+              auto-configuration will refuse to run until you connect the
+              account again above.
+            {% else %}
+              With no Cloudflare account connected, auto-configuration falls back to
+              this instance's own Cloudflare credentials{% if not cf_provision_available %}, which this instance does not have{% endif %} —
+              those can only reach zones inside the operator's Cloudflare
+              account.
+            {% endif %}
+          </div>
+        {% endif %}
       </div>
     {% endif %}
     {% if not custom_domain.ownership_verified %}

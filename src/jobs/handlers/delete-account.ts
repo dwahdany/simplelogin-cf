@@ -13,13 +13,19 @@
  * Deletion itself is a manual trash/delete pass over the user's aliases
  * (delete_alias — fills the deleted_alias blocklist so hard-deleted alias
  * emails cannot be re-registered) followed by the users-row delete. Every
- * user_id FK in migrations/0001_init.sql + 0003_web_tables.sql is ON DELETE
- * CASCADE (api_key, mailbox, alias, contact, custom_domain →
- * domain_deleted_alias, directory, ...), so no other manual deletes are
- * needed; deleted_alias and the *_audit_log tables have no FK on purpose and
- * survive, matching Flask/Postgres.
+ * user_id FK in migrations/0001_init.sql + 0003_web_tables.sql + 0004_cf_
+ * oauth.sql is ON DELETE CASCADE (api_key, mailbox, alias, contact,
+ * custom_domain → domain_deleted_alias, directory, cf_oauth_token, ...), so
+ * no other manual deletes are needed; deleted_alias and the *_audit_log
+ * tables have no FK on purpose and survive, matching Flask/Postgres.
+ *
+ * DEVIATION (no Flask counterpart): a Cloudflare OAuth grant must be handed
+ * back BEFORE that cascade runs. The cascade only drops our copy — the
+ * refresh token stays live in the (now ex-)user's Cloudflare account, and
+ * once the ciphertext is gone nobody here can ever revoke it.
  */
 
+import { getGrant, revokeGrantTokens } from "../../lib/cfoauth";
 import type { Env } from "../../lib/env";
 import { sendTransactionalEmail } from "../../lib/mailer";
 import type { AliasRow, UserRow } from "../../lib/rows";
@@ -63,6 +69,13 @@ export async function handleDeleteAccount(
   for (const alias of aliases.results) {
     await deleteAliasForUser(db, alias, user, REASON_USER_HAS_BEEN_DELETED);
   }
+  // Hand back the Cloudflare delegated authorization while we still hold the
+  // (encrypted) tokens: `DELETE FROM users` cascades cf_oauth_token away, and
+  // after that the grant is live at Cloudflare and unrevokable from here.
+  // Best effort — revokeGrantTokens never throws and must not block deletion.
+  const grant = await getGrant(env, user.id);
+  if (grant) await revokeGrantTokens(env, grant);
+
   // ...then the row delete; the FK cascades cover everything else.
   await db.prepare("DELETE FROM users WHERE id = ?1").bind(user.id).run();
 }

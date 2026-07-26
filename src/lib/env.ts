@@ -37,6 +37,34 @@ export interface Env {
   CF_API_TOKEN?: string;
   /** Worker name the provisioned catch-all routes to; default "simplelogin". */
   CF_WORKER_NAME?: string;
+  /**
+   * Cloudflare account id that hosts CF_WORKER_NAME. Email Routing can only
+   * route a zone's mail to a Worker in the SAME account, so a zone outside
+   * this account can never be provisioned: when this is set, provisioning
+   * refuses such a zone BEFORE the Email-Routing enable (which would
+   * otherwise write MX records and then fail at the catch-all), and the
+   * OAuth callback refuses a grant that cannot see this account. Unset ("")
+   * skips both checks — see docs/DOMAINS.md §3.1.
+   */
+  CF_ACCOUNT_ID?: string;
+  /**
+   * Cloudflare OAuth client credentials (Manage Account > OAuth clients).
+   * When both are set, the dashboard offers "Connect Cloudflare account" and
+   * provisioning uses the per-user delegated grant (revocable from the
+   * Cloudflare dashboard) in preference to the static CF_API_TOKEN.
+   * Set via `wrangler secret put CF_OAUTH_CLIENT_ID` / `..._SECRET`.
+   */
+  CF_OAUTH_CLIENT_ID?: string;
+  CF_OAUTH_CLIENT_SECRET?: string;
+  /**
+   * Space-separated Cloudflare OAuth scope ids; overrides
+   * DEFAULT_CF_OAUTH_SCOPES (src/web/cloudflare-pages.ts). Declared here so
+   * a typo is a type error rather than a silent fallback — this is the
+   * documented escape hatch for the scope ids that Cloudflare does not
+   * publish. Must be a wrangler var or `wrangler secret put CF_OAUTH_SCOPES`
+   * to exist at runtime (docs/DOMAINS.md §3.2).
+   */
+  CF_OAUTH_SCOPES?: string;
   /** Max subdomains per user (Flask config.MAX_NB_SUBDOMAIN, default 5). */
   MAX_NB_SUBDOMAIN?: string;
   /** Max directories per user (Flask config.MAX_NB_DIRECTORY, default 50). */
