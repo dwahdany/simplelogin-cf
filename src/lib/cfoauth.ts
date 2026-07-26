@@ -1,7 +1,35 @@
 /**
- * Cloudflare **self-managed OAuth** client (GA 2026-06-03) + encrypted grant
- * storage, backing the "Connect your Cloudflare account" flow in
- * src/web/cloudflare-pages.ts. No Flask counterpart.
+ * Cloudflare **self-managed OAuth** client (GA 2026-06-03) for a ONE-SHOT,
+ * never-stored authorization, backing the "Auto-configure on Cloudflare"
+ * hand-off in src/web/cloudflare-pages.ts. No Flask counterpart.
+ *
+ * THE MODEL, in one sentence: the user is sent to Cloudflare, the code that
+ * comes back is redeemed, the resulting access token is spent INSIDE that one
+ * request to provision exactly one domain, and it is handed back to
+ * Cloudflare's revocation endpoint in a `finally` block. Nothing about the
+ * authorization is ever written to D1 — there is no grant table, no
+ * ciphertext, no "connected account" state to leak, expire or forget to
+ * revoke. The operator of this instance can never act on a user's Cloudflare
+ * account outside of a run the user just clicked through.
+ *
+ * ONE HOLE IN "every path revokes", stated rather than papered over: if the
+ * token request itself fails at the NETWORK level, Cloudflare may have minted
+ * a token whose value never reached us, so there is nothing to hand back.
+ * Everything we can see is revoked — `tokenRequest` parses `access_token`
+ * BEFORE it inspects `error`/status, so a token returned alongside an error
+ * is revoked before the throw — and the ~1 h Hydra ceiling below is the
+ * backstop for the rest.
+ *
+ * NO REFRESH TOKEN, DELIBERATELY. `offline_access` is NOT requested (and
+ * scopesFor() strips it even if an operator puts it in CF_OAUTH_SCOPES).
+ * Cloudflare's authorization server is Ory Hydra, which mints a refresh token
+ * only when `offline`/`offline_access` is among the GRANTED scopes — so
+ * omitting it means the issued authorization is capped by Hydra's access-token
+ * lifetime (~1 h) and CANNOT be renewed by anyone, including us. That ceiling
+ * is the backstop if revocation ever fails; the normal case is that the token
+ * dies seconds after it was issued. If Cloudflare ever returns a refresh token
+ * anyway, `CfTokenResponse.refreshToken` carries it purely so the caller can
+ * revoke that too rather than strand it.
  *
  * ENDPOINTS. Verified against
  * developers.cloudflare.com/fundamentals/oauth/integrate-with-cloudflare/
@@ -20,33 +48,15 @@
  * (an attacker who steals the code from the redirect still cannot redeem it
  * without the verifier, which never leaves the KV session).
  *
- * TOKEN LIFETIME IS NEVER HARDCODED: expiry is derived from the token
- * response's `expires_in`. If the provider omits it, we fall back to a
- * deliberately SHORT window (FALLBACK_EXPIRES_IN_SECS) so we refresh early
- * and often rather than assuming a long-lived token that may already be
- * dead.
- *
- * AT-REST ENCRYPTION: access/refresh tokens are AES-GCM encrypted with a key
- * derived from FLASK_SECRET (SHA-256 over the secret plus a domain-
- * separation string, so this key can never collide with the itsdangerous
- * signing use of the same secret). Stored as
- * "<version>.<base64 iv>.<base64 ct>" with a fresh random 12-byte IV per
- * encryption, so a D1 dump alone does not yield usable Cloudflare
- * credentials. The version prefix tells a FLASK_SECRET rotation apart from a
- * format change, and the user id is passed as GCM `additionalData`, so a
- * ciphertext relocated to another user_id by a D1-write-capable attacker
- * fails the authentication tag instead of decrypting. Rotating FLASK_SECRET
- * invalidates every stored grant (users must reconnect) — by design.
- *
- * OPEN RISK (documented, handled at runtime): no public worked example shows
- * a dash.cloudflare.com OAuth access token being accepted as a bearer token
- * by api.cloudflare.com/client/v4. `probeAccountsWithToken` exists precisely
- * so the callback can PROVE this at connect time and degrade gracefully
- * (the static CF_API_TOKEN stays the fallback) instead of storing a grant
- * that silently 403s later.
+ * WHAT THE CONSENT SCREEN CANNOT DO (probed 2026-07-26, stated honestly in
+ * the UI rather than papered over): it shows the account and the scope list
+ * and nothing else. There is no zone picker, and the discovery document
+ * advertises no `authorization_details_types_supported`, so RFC 9396 rich
+ * authorization requests are not available either. For the lifetime of the
+ * run the token is therefore account-wide — which is exactly why it is
+ * one-shot and revoked immediately.
  */
 
-import { addSeconds, nowStr, toDate, toStr } from "./dates";
 import type { Env } from "./env";
 
 // ---------------------------------------------------------------------------
@@ -68,26 +78,25 @@ export const CF_OAUTH_REVOKE_URL = "https://dash.cloudflare.com/oauth2/revoke";
  */
 export const CF_OIDC_DISCOVERY_URL =
   "https://dash.cloudflare.com/.well-known/openid-configuration";
-/** Where the granted token is actually spent (src/lib/cfapi.ts API_BASE). */
-export const CF_API_ZONES_URL = "https://api.cloudflare.com/client/v4/zones";
-export const CF_API_ACCOUNTS_URL =
-  "https://api.cloudflare.com/client/v4/accounts";
 
 /**
- * Refresh this many seconds BEFORE the recorded expiry: covers clock skew
- * between us and Cloudflare plus the round-trip of the request the token is
- * about to be used for.
+ * App-root-relative paths of the flow. `CF_OAUTH_CALLBACK_PATH` is what the
+ * operator registers as the OAuth client's redirect URL (docs/DOMAINS.md
+ * §3.2) — changing it invalidates the registration. They live here, not in a
+ * web module, so both src/web/cloudflare-pages.ts (which serves them) and
+ * src/web/mailbox-domain-pages.ts (whose confirmation page posts to the
+ * first) can reference them without importing each other.
  */
-export const REFRESH_SKEW_SECS = 60;
+export const CF_OAUTH_START_PATH = "/dashboard/cloudflare/start";
+export const CF_OAUTH_CALLBACK_PATH = "/dashboard/cloudflare/callback";
 
-/**
- * Conservative fallback when a token response omits `expires_in`. Five
- * minutes, chosen to be far shorter than any plausible real lifetime: the
- * cost of being wrong is one extra refresh round-trip, whereas guessing too
- * long means every API call fails with an expired token until the row is
- * touched. NEVER replace this with an assumed real Cloudflare lifetime.
- */
-export const FALLBACK_EXPIRES_IN_SECS = 300;
+/** Both client credentials present ("" counts as unset, like CF_API_TOKEN). */
+export function cfOauthConfigured(env: Env): boolean {
+  return (
+    (env.CF_OAUTH_CLIENT_ID ?? "") !== "" &&
+    (env.CF_OAUTH_CLIENT_SECRET ?? "") !== ""
+  );
+}
 
 // ---------------------------------------------------------------------------
 // fetch test seam (modeled exactly on setCfFetch in src/lib/cfapi.ts —
@@ -128,16 +137,6 @@ export class CfOauthError extends Error {
   ) {
     super(message);
   }
-
-  /**
-   * True when retrying with the SAME grant can never succeed: the user
-   * revoked us in the Cloudflare dashboard, or the refresh token rotated
-   * away / expired. The stored row is then dead weight and is deleted, which
-   * is also what stops a refresh loop (see getValidAccessToken).
-   */
-  get grantIsDead(): boolean {
-    return this.code === "invalid_grant";
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,23 +144,11 @@ export class CfOauthError extends Error {
 // ---------------------------------------------------------------------------
 
 const enc = new TextEncoder();
-const dec = new TextDecoder();
 
 function b64(bytes: Uint8Array): string {
   let s = "";
   for (const b of bytes) s += String.fromCharCode(b);
   return btoa(s);
-}
-
-function unb64(s: string): Uint8Array | null {
-  try {
-    const bin = atob(s);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  } catch {
-    return null;
-  }
 }
 
 function b64url(bytes: Uint8Array): string {
@@ -250,17 +237,22 @@ export interface AuthorizeParams {
 }
 
 /**
- * Build the authorization-request URL. `code_challenge_method` is ALWAYS
- * S256 — plain is never emitted, and there is no non-PKCE path.
+ * Build the authorization-request URL. Two invariants, both load-bearing for
+ * the one-shot model:
+ *
+ * - `code_challenge_method` is ALWAYS S256 — plain is never emitted, and
+ *   there is no non-PKCE path.
+ * - `prompt=consent` is ALWAYS sent (OIDC Core §3.1.2.1). Hydra remembers a
+ *   previous consent for the same client+subject+scopes and would otherwise
+ *   skip the screen entirely on the second run, so a single earlier click
+ *   would silently authorize every later run — exactly the "long-lived
+ *   delegation" this design exists to avoid. With it, every run costs the
+ *   user one deliberate approval.
  *
  * The caller decides the scope list (DEFAULT_CF_OAUTH_SCOPES in
- * src/web/cloudflare-pages.ts, overridable with CF_OAUTH_SCOPES). It MUST
- * include `offline_access`: the discovery document identifies Cloudflare's
- * authorization server as Ory Hydra/fosite, whose `canIssueRefreshToken`
- * mints a refresh token only when `offline`/`offline_access` is among the
- * GRANTED scopes of the request — having `refresh_token` in the client's
- * grant_types is necessary but not sufficient. Without it the grant silently
- * dies at the first access-token expiry.
+ * src/web/cloudflare-pages.ts, overridable with CF_OAUTH_SCOPES). It must NOT
+ * contain `offline_access`/`offline` — see the module docstring; scopesFor()
+ * strips them before they ever reach here.
  */
 export function buildAuthorizeUrl(p: AuthorizeParams): string {
   const q = new URLSearchParams({
@@ -271,6 +263,7 @@ export function buildAuthorizeUrl(p: AuthorizeParams): string {
     state: p.state,
     code_challenge: p.codeChallenge,
     code_challenge_method: "S256",
+    prompt: "consent",
   });
   return `${CF_OAUTH_AUTHORIZE_URL}?${q.toString()}`;
 }
@@ -281,15 +274,18 @@ export function buildAuthorizeUrl(p: AuthorizeParams): string {
 
 export interface CfTokenResponse {
   accessToken: string;
-  /** null when the provider did not return one (do not clobber a stored one). */
+  /**
+   * Normally null: no `offline_access` is requested, so Hydra mints none.
+   * Carried ONLY so the caller can revoke an unexpected one instead of
+   * stranding a renewable authorization it never asked for. It is never
+   * stored and never used to refresh.
+   */
   refreshToken: string | null;
-  /** canonical "YYYY-MM-DD HH:MM:SS+00:00", derived from expires_in. */
-  expiresAt: string;
-  /** seconds actually used (response value, or FALLBACK_EXPIRES_IN_SECS). */
-  expiresIn: number;
   /** space-separated scopes as GRANTED (may differ from what we asked for). */
   scope: string | null;
   tokenType: string | null;
+  /** provider `expires_in` when present — diagnostics/logging only. */
+  expiresIn: number | null;
 }
 
 interface RawTokenBody {
@@ -327,8 +323,7 @@ async function tokenRequest(
       body: body.toString(),
     });
   } catch (e) {
-    // Network-level rejection: status 0, no provider error code, so it is
-    // NOT treated as a dead grant (transient — the row survives).
+    // Network-level rejection: status 0, no provider error code.
     throw new CfOauthError(
       `token request network error: ${e instanceof Error ? e.message : String(e)}`,
       0,
@@ -347,8 +342,38 @@ async function tokenRequest(
       res.status,
     );
   }
+  // Tokens are parsed BEFORE the error branch on purpose: a response can
+  // carry both an `error` member (or an odd status) and a usable token, and
+  // throwing without looking would strand an authorization we can no longer
+  // revoke — we would never have learned its value. See the docstring above
+  // for the one hole that remains (a network-level failure).
+  const accessToken = str(data.access_token);
+  const refreshToken = str(data.refresh_token);
   const errCode = str(data.error);
   if (errCode || !res.ok) {
+    if (accessToken || refreshToken) {
+      console.error(
+        "cf-oauth: the token endpoint returned an error alongside a token — " +
+          "revoking it before failing",
+      );
+      // Best effort, never throws (revokeToken's contract).
+      if (refreshToken) {
+        await revokeToken({
+          clientId,
+          clientSecret,
+          token: refreshToken,
+          tokenTypeHint: "refresh_token",
+        });
+      }
+      if (accessToken) {
+        await revokeToken({
+          clientId,
+          clientSecret,
+          token: accessToken,
+          tokenTypeHint: "access_token",
+        });
+      }
+    }
     throw new CfOauthError(
       `token endpoint refused the request: HTTP ${res.status} ${errCode ?? ""} ${str(data.error_description) ?? ""}`.trim(),
       res.status,
@@ -356,7 +381,6 @@ async function tokenRequest(
       str(data.error_description),
     );
   }
-  const accessToken = str(data.access_token);
   if (!accessToken) {
     throw new CfOauthError(
       "token endpoint returned no access_token",
@@ -364,25 +388,22 @@ async function tokenRequest(
     );
   }
 
-  // Lifetime is ALWAYS derived, never assumed (see FALLBACK_EXPIRES_IN_SECS).
   const rawExpires =
     typeof data.expires_in === "number"
       ? data.expires_in
       : typeof data.expires_in === "string"
         ? Number(data.expires_in)
         : Number.NaN;
-  const expiresIn =
-    Number.isFinite(rawExpires) && rawExpires > 0
-      ? Math.floor(rawExpires)
-      : FALLBACK_EXPIRES_IN_SECS;
 
   return {
     accessToken,
-    refreshToken: str(data.refresh_token),
-    expiresAt: toStr(addSeconds(new Date(), expiresIn)),
-    expiresIn,
+    refreshToken,
     scope: str(data.scope),
     tokenType: str(data.token_type),
+    expiresIn:
+      Number.isFinite(rawExpires) && rawExpires > 0
+        ? Math.floor(rawExpires)
+        : null,
   };
 }
 
@@ -403,27 +424,12 @@ export function exchangeCode(args: {
 }
 
 /**
- * Refresh-token grant. The response's refresh_token MAY be a NEW one
- * (rotation): callers must persist whatever comes back — see
- * getValidAccessToken.
- */
-export function refreshAccessToken(args: {
-  clientId: string;
-  clientSecret: string;
-  refreshToken: string;
-}): Promise<CfTokenResponse> {
-  return tokenRequest(args.clientId, args.clientSecret, {
-    grant_type: "refresh_token",
-    refresh_token: args.refreshToken,
-  });
-}
-
-/**
  * RFC 7009 revocation, best effort: never throws, returns whether the
- * provider acknowledged. Called on disconnect so the grant dies at
- * Cloudflare too, not just in our D1.
+ * provider acknowledged. Module-private — every caller outside this file
+ * goes through `revokeOneShotToken`, which revokes BOTH tokens in the right
+ * order and logs failures.
  */
-export async function revokeToken(args: {
+async function revokeToken(args: {
   clientId: string;
   clientSecret: string;
   token: string;
@@ -448,541 +454,54 @@ export async function revokeToken(args: {
 }
 
 /**
- * Hand a grant's tokens back to Cloudflare. BOTH of them: RFC 7009 §2.1
- * makes the cascade from a refresh token to its outstanding access tokens a
- * SHOULD, not a MUST, so revoking only the refresh token can leave a
- * fully-scoped access token alive until it expires.
+ * End the one-shot authorization: hand every token the response contained
+ * back to Cloudflare. Called from the `finally` of the provisioning run
+ * (src/web/cloudflare-pages.ts), so it runs on success, on refusal, and on an
+ * unexpected throw alike.
  *
- * Never throws (revokeToken is best-effort by contract), so EVERY path that
- * drops a grant calls it unconditionally: disconnect, a failed post-issue
- * probe, reconnect-over-an-existing-row (src/web/cloudflare-pages.ts) and
- * account deletion (src/jobs/handlers/delete-account.ts). It is deliberately
- * NOT gated on the client credentials looking present: if they really are
- * gone the request just fails, whereas skipping it strands an authorization
- * that nobody can revoke once the ciphertext is deleted.
+ * BOTH tokens, when a refresh token unexpectedly appeared: RFC 7009 §2.1
+ * makes the cascade from a refresh token to its outstanding access tokens a
+ * SHOULD, not a MUST, so revoking only one can leave the other alive. The
+ * refresh token goes first — it is the one that could outlive the request.
+ *
+ * Never throws (revokeToken is best-effort by contract) and deliberately NOT
+ * gated on the client credentials looking present: if they really are gone
+ * the request just fails, whereas skipping it strands an authorization
+ * nobody can revoke. Failure is not silent — it is logged, and the ~1 h Hydra
+ * ceiling is the backstop, because without `offline_access` the token cannot
+ * be renewed by anyone.
  */
-export async function revokeGrantTokens(
+export async function revokeOneShotToken(
   env: Env,
   tokens: { accessToken?: string | null; refreshToken?: string | null },
 ): Promise<void> {
   const clientId = env.CF_OAUTH_CLIENT_ID ?? "";
   const clientSecret = env.CF_OAUTH_CLIENT_SECRET ?? "";
   if (tokens.refreshToken) {
-    await revokeToken({
+    console.error(
+      "cf-oauth: token response carried a refresh_token although " +
+        "offline_access was never requested — revoking it immediately",
+    );
+    const ok = await revokeToken({
       clientId,
       clientSecret,
       token: tokens.refreshToken,
       tokenTypeHint: "refresh_token",
     });
+    if (!ok) console.error("cf-oauth: refresh-token revocation was refused");
   }
   if (tokens.accessToken) {
-    await revokeToken({
+    const ok = await revokeToken({
       clientId,
       clientSecret,
       token: tokens.accessToken,
       tokenTypeHint: "access_token",
     });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// "does this token actually work against api.cloudflare.com?" probe
-// ---------------------------------------------------------------------------
-
-export interface CfAccountRef {
-  id: string;
-  name: string;
-}
-
-export type AccountProbe =
-  | { ok: true; accounts: CfAccountRef[] }
-  | { ok: false; status: number; detail: string };
-
-/** Cloudflare v4 response envelope (same shape as src/lib/cfapi.ts). */
-interface CfEnvelope {
-  success?: boolean;
-  result?: unknown;
-  errors?: Array<{ code?: number; message?: string }>;
-}
-
-/**
- * PROVE the dash.cloudflare.com-issued token is accepted by
- * api.cloudflare.com — the one materially unverified assumption of this
- * whole feature — using GET /zones, which `zone.read` covers.
- *
- * Why not /accounts: `account.read` is the only product scope Cloudflare
- * documents, but the live authorize endpoint REFUSES it for this
- * deployment's OAuth client ("The OAuth 2.0 Client is not allowed to request
- * scope 'account.read'"), and Hydra rejects the entire authorization request
- * if any one scope is disallowed — so the flow cannot ask for it. Account
- * identity is recovered best-effort by `probeAccountsWithToken` below, and
- * authoritatively from a zone's own `account` field at provisioning time.
- * Never throws.
- */
-export async function probeApiWithToken(
-  accessToken: string,
-): Promise<
-  | { ok: true; account: CfAccountRef | null }
-  | { ok: false; status: number; detail: string }
-> {
-  try {
-    const res = await cfOauthFetch(`${CF_API_ZONES_URL}?per_page=1`, {
-      method: "GET",
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        accept: "application/json",
-      },
-    });
-    let data: CfEnvelope | null = null;
-    try {
-      data = (await res.json()) as CfEnvelope;
-    } catch {
-      /* non-JSON */
-    }
-    if (res.ok && data?.success === true) {
-      // Zone objects carry their owning account, so the account identity the
-      // UI shows (and CF_ACCOUNT_ID compares) costs no extra scope — this is
-      // what replaces the ungrantable account.read. Null when the grant can
-      // see no zones yet, or the response omits the field.
-      const first = (Array.isArray(data.result) ? data.result : [])[0] as
-        | { account?: { id?: unknown; name?: unknown } }
-        | undefined;
-      const acc = first?.account;
-      const account =
-        acc && typeof acc.id === "string"
-          ? { id: acc.id, name: str(acc.name) ?? "" }
-          : null;
-      return { ok: true, account };
-    }
-    const detail =
-      (data?.errors ?? [])
-        .map((e) => `[${e.code}] ${e.message}`)
-        .filter(Boolean)
-        .join("; ") || `HTTP ${res.status}`;
-    return { ok: false, status: res.status, detail };
-  } catch (e) {
-    return {
-      ok: false,
-      status: 0,
-      detail: `network error: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
-}
-
-/**
- * GET /client/v4/accounts with the OAuth access token — BEST EFFORT ONLY:
- * it needs `account.read`, which this client is not allowed to request (see
- * probeApiWithToken). A failure here is not fatal; it only means the UI
- * cannot name the account and CF_ACCOUNT_ID pinning has nothing to check at
- * connect time (it still applies per-zone during provisioning, where the
- * zone object carries its own account id). Never throws.
- */
-export async function probeAccountsWithToken(
-  accessToken: string,
-): Promise<AccountProbe> {
-  let res: Response;
-  try {
-    // per_page: the default page is small, and the caller may be looking for
-    // ONE specific account id (CF_ACCOUNT_ID) in this list — a pinned account
-    // that fell off page 1 would be refused as "not reachable".
-    res = await cfOauthFetch(`${CF_API_ACCOUNTS_URL}?per_page=50`, {
-      method: "GET",
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        accept: "application/json",
-      },
-    });
-  } catch (e) {
-    return {
-      ok: false,
-      status: 0,
-      detail: `network error: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
-  let data: CfEnvelope | null = null;
-  try {
-    data = (await res.json()) as CfEnvelope;
-  } catch {
-    /* non-JSON */
-  }
-  if (!data || typeof data !== "object") {
-    return {
-      ok: false,
-      status: res.status,
-      detail: `HTTP ${res.status} (non-JSON response)`,
-    };
-  }
-  if (!res.ok || data.success !== true) {
-    const detail =
-      (data.errors ?? [])
-        .map((e) => `[${e.code}] ${e.message}`)
-        .filter(Boolean)
-        .join("; ") || `HTTP ${res.status}`;
-    return { ok: false, status: res.status, detail };
-  }
-  const accounts = (Array.isArray(data.result) ? data.result : [])
-    .map((r) => r as { id?: unknown; name?: unknown })
-    .filter((r) => typeof r.id === "string")
-    .map((r) => ({ id: r.id as string, name: (str(r.name) ?? "") as string }));
-  return { ok: true, accounts };
-}
-
-// ---------------------------------------------------------------------------
-// AES-GCM at-rest encryption
-// ---------------------------------------------------------------------------
-
-/**
- * Domain separation: FLASK_SECRET also keys itsdangerous signing (alias
- * suffixes, CSRF, mfa). Hashing it together with this constant guarantees
- * the AES key is unrelated to any signing key derived from the same secret.
- */
-const KEY_DOMAIN = "simplelogin/cf-oauth/aes-gcm/v1";
-
-const keyCache = new Map<string, Promise<CryptoKey>>();
-
-function aesKey(flaskSecret: string): Promise<CryptoKey> {
-  let k = keyCache.get(flaskSecret);
-  if (!k) {
-    k = (async () => {
-      const digest = await crypto.subtle.digest(
-        "SHA-256",
-        enc.encode(`${flaskSecret}${KEY_DOMAIN}`),
+    if (!ok) {
+      console.error(
+        "cf-oauth: access-token revocation was refused — the authorization " +
+          "now expires on its own (no refresh token was ever issued)",
       );
-      return crypto.subtle.importKey(
-        "raw",
-        digest,
-        { name: "AES-GCM" },
-        false,
-        ["encrypt", "decrypt"],
-      );
-    })();
-    keyCache.set(flaskSecret, k);
-  }
-  return k;
-}
-
-/**
- * Ciphertext format version. It is INSIDE the stored blob so that a decrypt
- * failure can be attributed: an unknown/absent prefix is a format change, a
- * well-formed "v1" blob that will not decrypt is a rotated FLASK_SECRET (or
- * a row moved between users — see the AAD below).
- */
-const BLOB_VERSION = "v1";
-
-/**
- * Encrypt a token for storage. Format:
- * "v1.<base64 iv>.<base64 ciphertext>" with a FRESH random 96-bit IV per
- * call (never reused — GCM IV reuse under the same key is catastrophic). The
- * GCM tag is appended to the ciphertext by WebCrypto, so tampering is
- * detected on decrypt.
- *
- * `aad` is authenticated but not encrypted: callers pass the owning user id,
- * which BINDS the ciphertext to that row. An attacker with D1 write access
- * who copies another user's ciphertext into their own row then gets a tag
- * failure (null) instead of a usable Cloudflare token.
- */
-export async function encryptSecretValue(
-  flaskSecret: string,
-  plaintext: string,
-  aad = "",
-): Promise<string> {
-  const key = await aesKey(flaskSecret);
-  const iv = randomBytes(12);
-  const ct = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv, additionalData: enc.encode(aad) },
-    key,
-    enc.encode(plaintext),
-  );
-  return `${BLOB_VERSION}.${b64(iv)}.${b64(new Uint8Array(ct))}`;
-}
-
-/**
- * Decrypt a stored token. Returns null (never throws) on a malformed blob, a
- * version this build does not know, a failed authentication tag (tampered,
- * or the row was moved to another user id — see `aad`), or a FLASK_SECRET
- * that has been rotated since the grant was written. Callers treat all of
- * those as "not connected".
- */
-export async function decryptSecretValue(
-  flaskSecret: string,
-  blob: string,
-  aad = "",
-): Promise<string | null> {
-  const parts = blob.split(".");
-  if (parts.length !== 3 || parts[0] !== BLOB_VERSION) return null;
-  const iv = unb64(parts[1]);
-  const ct = unb64(parts[2]);
-  if (!iv || !ct || iv.length !== 12 || ct.length === 0) return null;
-  try {
-    const key = await aesKey(flaskSecret);
-    const pt = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv, additionalData: enc.encode(aad) },
-      key,
-      ct,
-    );
-    return dec.decode(pt);
-  } catch {
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// D1 storage (migrations/0004_cf_oauth.sql, table cf_oauth_token)
-// ---------------------------------------------------------------------------
-
-/** Raw row shape; *_enc columns hold ciphertext, never plaintext. */
-interface CfOauthTokenRow {
-  id: number;
-  created_at: string;
-  updated_at: string | null;
-  user_id: number;
-  access_token_enc: string;
-  refresh_token_enc: string | null;
-  expires_at: string | null;
-  scopes: string | null;
-  cf_account_id: string | null;
-  cf_account_name: string | null;
-}
-
-/** Non-secret grant metadata — safe to render. */
-export interface CfGrantMeta {
-  createdAt: string;
-  updatedAt: string | null;
-  expiresAt: string | null;
-  scopes: string | null;
-  accountId: string | null;
-  accountName: string | null;
-  /**
-   * Whether a refresh token is stored. Read from `refresh_token_enc IS NOT
-   * NULL` — no decryption, no secret — so the UI can say "connected but the
-   * authorization can no longer be renewed" instead of claiming a dead grant
-   * is in use (Cloudflare only issues one when `offline_access` was granted).
-   */
-  hasRefreshToken: boolean;
-}
-
-/** A grant with its tokens DECRYPTED. Never log or render these fields. */
-export interface CfOauthGrant extends CfGrantMeta {
-  userId: number;
-  /** null when the ciphertext could not be decrypted (FLASK_SECRET rotated). */
-  accessToken: string | null;
-  refreshToken: string | null;
-}
-
-export interface SaveGrantInput {
-  accessToken: string;
-  refreshToken?: string | null;
-  expiresAt?: string | null;
-  scopes?: string | null;
-  accountId?: string | null;
-  accountName?: string | null;
-}
-
-/**
- * Insert-or-replace the (unique) row for `userId`, encrypting both tokens
- * with the user id as GCM additional data (see encryptSecretValue).
- */
-export async function saveGrant(
-  env: Env,
-  userId: number,
-  g: SaveGrantInput,
-): Promise<void> {
-  const aad = String(userId);
-  const accessEnc = await encryptSecretValue(
-    env.FLASK_SECRET,
-    g.accessToken,
-    aad,
-  );
-  const refreshEnc = g.refreshToken
-    ? await encryptSecretValue(env.FLASK_SECRET, g.refreshToken, aad)
-    : null;
-  await env.DB.prepare(
-    `INSERT INTO cf_oauth_token
-       (user_id, access_token_enc, refresh_token_enc, expires_at, scopes,
-        cf_account_id, cf_account_name, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-     ON CONFLICT(user_id) DO UPDATE SET
-       access_token_enc = excluded.access_token_enc,
-       refresh_token_enc = excluded.refresh_token_enc,
-       expires_at = excluded.expires_at,
-       scopes = excluded.scopes,
-       cf_account_id = excluded.cf_account_id,
-       cf_account_name = excluded.cf_account_name,
-       updated_at = excluded.updated_at`,
-  )
-    .bind(
-      userId,
-      accessEnc,
-      refreshEnc,
-      g.expiresAt ?? null,
-      g.scopes ?? null,
-      g.accountId ?? null,
-      g.accountName ?? null,
-      nowStr(),
-    )
-    .run();
-}
-
-/** The grant with tokens decrypted, or null when the user has none. */
-export async function getGrant(
-  env: Env,
-  userId: number,
-): Promise<CfOauthGrant | null> {
-  const row = await env.DB.prepare(
-    "SELECT * FROM cf_oauth_token WHERE user_id = ?1",
-  )
-    .bind(userId)
-    .first<CfOauthTokenRow>();
-  if (!row) return null;
-  const aad = String(row.user_id);
-  return {
-    userId: row.user_id,
-    accessToken: await decryptSecretValue(
-      env.FLASK_SECRET,
-      row.access_token_enc,
-      aad,
-    ),
-    refreshToken: row.refresh_token_enc
-      ? await decryptSecretValue(env.FLASK_SECRET, row.refresh_token_enc, aad)
-      : null,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    expiresAt: row.expires_at,
-    scopes: row.scopes,
-    accountId: row.cf_account_id,
-    accountName: row.cf_account_name,
-    hasRefreshToken: row.refresh_token_enc !== null,
-  };
-}
-
-/** Non-secret columns only — for status rendering (no decryption at all). */
-export async function getGrantMeta(
-  env: Env,
-  userId: number,
-): Promise<CfGrantMeta | null> {
-  const row = await env.DB.prepare(
-    `SELECT created_at, updated_at, expires_at, scopes, cf_account_id,
-            cf_account_name,
-            (refresh_token_enc IS NOT NULL) AS has_refresh
-       FROM cf_oauth_token WHERE user_id = ?1`,
-  )
-    .bind(userId)
-    .first<
-      Omit<
-        CfOauthTokenRow,
-        "id" | "user_id" | "access_token_enc" | "refresh_token_enc"
-      > & { has_refresh: number }
-    >();
-  if (!row) return null;
-  return {
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    expiresAt: row.expires_at,
-    scopes: row.scopes,
-    accountId: row.cf_account_id,
-    accountName: row.cf_account_name,
-    hasRefreshToken: row.has_refresh === 1,
-  };
-}
-
-export async function deleteGrant(env: Env, userId: number): Promise<void> {
-  await env.DB.prepare("DELETE FROM cf_oauth_token WHERE user_id = ?1")
-    .bind(userId)
-    .run();
-}
-
-/** A usable access token plus when it goes stale (unix ms, null = unknown). */
-export interface CfResolvedToken {
-  token: string;
-  expiresAtMs: number | null;
-}
-
-/**
- * The one entry point provisioning code should use: a currently-valid access
- * token for `userId`, or null.
- *
- * Refreshes transparently when `now >= expires_at - REFRESH_SKEW_SECS`, and
- * persists WHATEVER the provider returns — Cloudflare may ROTATE the refresh
- * token, in which case the old one is invalid the moment the new one is
- * issued, so the new one must be written or the grant is lost on the next
- * refresh. When no new refresh token comes back, the existing one is kept.
- *
- * NO LOOPS: exactly one refresh attempt per call, and a permanently dead
- * grant (RFC 6749 invalid_grant — user revoked us, or the refresh token
- * expired) DELETES the row, so the next call short-circuits at "no grant"
- * instead of hammering the token endpoint. Transient failures (network,
- * 5xx, client misconfiguration) leave the row alone and just return null,
- * so a fixed CF_OAUTH_CLIENT_SECRET resurrects the grant without a
- * reconnect.
- *
- * Returns null when: no row, ciphertext undecryptable, expired with no
- * refresh token, or the refresh failed.
- *
- * `resolveAccessToken` additionally reports the token's expiry so a caller
- * making many API calls in one run can hold it in memory and come back only
- * when it is actually about to go stale, instead of paying a D1 read plus
- * two AES-GCM decrypts per call (src/web/mailbox-domain-pages.ts
- * cfProvisionCredential).
- */
-export async function getValidAccessToken(
-  env: Env,
-  userId: number,
-): Promise<string | null> {
-  return (await resolveAccessToken(env, userId))?.token ?? null;
-}
-
-export async function resolveAccessToken(
-  env: Env,
-  userId: number,
-): Promise<CfResolvedToken | null> {
-  const grant = await getGrant(env, userId);
-  if (!grant) return null;
-  if (!grant.accessToken) {
-    // FLASK_SECRET rotated (or the row was corrupted): the tokens are
-    // unrecoverable, so the grant is dead — drop it and make the user
-    // reconnect rather than retrying forever.
-    console.error(
-      `cf-oauth: undecryptable grant for user ${userId} (FLASK_SECRET rotated?) — dropping`,
-    );
-    await deleteGrant(env, userId);
-    return null;
-  }
-
-  const now = Date.now();
-  const expiresAtMs =
-    grant.expiresAt === null ? null : toDate(grant.expiresAt).getTime();
-  const stillFresh =
-    expiresAtMs === null || now < expiresAtMs - REFRESH_SKEW_SECS * 1000;
-  if (stillFresh) return { token: grant.accessToken, expiresAtMs };
-
-  if (!grant.refreshToken) return null;
-  const clientId = env.CF_OAUTH_CLIENT_ID ?? "";
-  const clientSecret = env.CF_OAUTH_CLIENT_SECRET ?? "";
-  if (!clientId || !clientSecret) return null;
-
-  try {
-    const tok = await refreshAccessToken({
-      clientId,
-      clientSecret,
-      refreshToken: grant.refreshToken,
-    });
-    await saveGrant(env, userId, {
-      accessToken: tok.accessToken,
-      // rotation-safe: keep the old refresh token only if none came back
-      refreshToken: tok.refreshToken ?? grant.refreshToken,
-      expiresAt: tok.expiresAt,
-      scopes: tok.scope ?? grant.scopes,
-      accountId: grant.accountId,
-      accountName: grant.accountName,
-    });
-    return {
-      token: tok.accessToken,
-      expiresAtMs: toDate(tok.expiresAt).getTime(),
-    };
-  } catch (e) {
-    if (!(e instanceof CfOauthError)) throw e;
-    console.error(`cf-oauth: refresh failed for user ${userId}: ${e.message}`);
-    if (e.grantIsDead) await deleteGrant(env, userId);
-    return null;
+    }
   }
 }

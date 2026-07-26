@@ -31,7 +31,9 @@
  * callers have a single error type for "the Cloudflare API call failed".
  *
  * The client authenticates with either the operator's static CF_API_TOKEN or
- * a per-user Cloudflare OAuth grant — see CfCredential below.
+ * the one-shot Cloudflare OAuth access token a user just approved (minted,
+ * spent and revoked inside a single request — src/web/cloudflare-pages.ts).
+ * Both arrive here as a plain bearer string; see CfCredential below.
  */
 
 const API_BASE = "https://api.cloudflare.com/client/v4";
@@ -62,7 +64,7 @@ export interface CfZone {
   /**
    * Owning account, as returned by GET /zones. Optional because callers must
    * not depend on it (an older/partial response, or a fake in tests, may omit
-   * it) — the account check in handleCfProvision fails OPEN when it is
+   * it) — the account check in runCfProvision fails OPEN when it is
    * absent, rather than blocking every provisioning run on a response shape.
    */
   account?: { id?: string; name?: string };
@@ -151,43 +153,15 @@ export class ForeignMxError extends Error {
 // client
 // ---------------------------------------------------------------------------
 
-/**
- * A bearer token, resolved lazily before EVERY request. Used for the per-user
- * Cloudflare OAuth grant (src/lib/cfoauth.ts `getValidAccessToken`), whose
- * access token is short-lived: one provisioning run makes up to ~9 calls and
- * the token can hit its refresh window between two of them, so the credential
- * must be re-resolved per request rather than captured once.
- *
- * The provider may throw. A CfApiError is propagated unchanged (callers can
- * use its status, e.g. 401, to say "reconnect your Cloudflare account");
- * anything else is wrapped as CfApiError with status 0, so callers still have
- * exactly one error type for "the Cloudflare API call failed".
- */
-export type CfTokenProvider = () => string | Promise<string>;
-
-/** Static token string (operator CF_API_TOKEN) or a per-request provider. */
-export type CfCredential = string | CfTokenProvider;
-
 export class CfClient {
   /**
-   * @param credential a token string (unchanged legacy form) or a
-   * CfTokenProvider resolved before every request.
+   * @param token a bearer token: the operator's CF_API_TOKEN, or the one-shot
+   * access token of a delegated run. There is deliberately no lazy
+   * "token provider" form — the OAuth token is minted, spent and revoked
+   * inside a single request (src/web/cloudflare-pages.ts) and cannot go stale
+   * mid-run, so nothing would ever re-resolve.
    */
-  constructor(private readonly credential: CfCredential) {}
-
-  /** The bearer token for the next request (see CfTokenProvider). */
-  private async resolveToken(method: string, path: string): Promise<string> {
-    if (typeof this.credential === "string") return this.credential;
-    try {
-      return await this.credential();
-    } catch (e) {
-      if (e instanceof CfApiError) throw e;
-      throw new CfApiError(
-        `${method} ${path}: no usable Cloudflare credential: ${e instanceof Error ? e.message : String(e)}`,
-        0,
-      );
-    }
-  }
+  constructor(private readonly token: string) {}
 
   /** Cloudflare v4 envelope fetch: returns `result` or throws CfApiError. */
   private async request<T>(
@@ -195,7 +169,7 @@ export class CfClient {
     opts: { method?: string; body?: unknown } = {},
   ): Promise<T> {
     const { method = "GET", body } = opts;
-    const token = await this.resolveToken(method, path);
+    const token = this.token;
     let res: Response;
     try {
       res = await cfFetch(`${API_BASE}${path}`, {

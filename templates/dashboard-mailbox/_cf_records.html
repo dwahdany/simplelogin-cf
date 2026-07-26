@@ -1,0 +1,121 @@
+{# The exact Cloudflare-side diff, rendered from `cf_plan` =
+   cfProvisionPlan(env, custom_domain) in src/web/mailbox-domain-pages.ts —
+   the SAME object runCfProvision writes from, so this table can never drift
+   from what actually gets written. Included by the confirmation page and by
+   the manual panel on the DNS page. Renders nothing without a plan, so it is
+   safe to include unconditionally.
+
+   `cf_manual` switches the VOICE. The DNS page passes true: there the table
+   is the do-it-yourself instructions (imperative, "add this"), and in `none`
+   mode it is the whole offer, so it must not describe a run that cannot
+   happen. The confirmation page passes false: there it is the preview of an
+   API write that is about to happen, so it says what the run does — and, for
+   the two steps where the run REFUSES rather than overwrites, says that too,
+   because the manual path has the opposite hazard (Cloudflare's own wizard
+   does overwrite). #}
+{% if cf_plan %}
+  <ol class="mb-2">
+    {% if cf_plan.ownership %}
+      <li>
+        <b>Ownership TXT record</b> —
+        {% if cf_manual %}add this.{% else %}created by us.{% endif %}
+        <div class="mb-2 p-3 dns-record">
+          Record: {{ cf_plan.ownership.type }}
+          <br />
+          Name: <b>{{ cf_plan.ownership.name }}</b>
+          <br />
+          Value:
+          <em data-toggle="tooltip"
+              title="Click to copy"
+              class="clipboard"
+              data-clipboard-text="{{ cf_plan.ownership.value }}">{{ cf_plan.ownership.value }}</em>
+        </div>
+      </li>
+    {% else %}
+      <li>
+        <b>Ownership TXT record</b> — already verified, so
+        {% if cf_manual %}
+          there is nothing to add.
+        {% else %}
+          it is left alone.
+        {% endif %}
+      </li>
+    {% endif %}
+    <li>
+      <b>DMARC TXT record</b> —
+      {% if cf_manual %}
+        add this if <em>{{ cf_plan.dmarc.name }}</em> has no TXT record yet
+        (do not replace an existing DMARC policy).
+      {% else %}
+        created by us, only if <em>{{ cf_plan.dmarc.name }}</em> has no TXT
+        record yet (an existing one is never modified).
+      {% endif %}
+      <div class="mb-2 p-3 dns-record">
+        Record: {{ cf_plan.dmarc.type }}
+        <br />
+        Name: <b>{{ cf_plan.dmarc.name }}</b>
+        <br />
+        Value:
+        <em data-toggle="tooltip"
+            title="Click to copy"
+            class="clipboard"
+            data-clipboard-text="{{ cf_plan.dmarc.value }}">{{ cf_plan.dmarc.value }}</em>
+      </div>
+    </li>
+    <li>
+      {% if cf_manual %}
+        <b>Enable Email Routing for {{ cf_plan.domain }}</b>. Cloudflare
+        creates <em>and locks</em> these records itself — they cannot be
+        edited by hand afterwards, and enabling it replaces any MX record
+        currently on <em>{{ cf_plan.domain }}</em>, so mail for that name
+        stops going wherever it goes today:
+      {% else %}
+        <b>Email Routing is enabled for {{ cf_plan.domain }}</b>. Cloudflare
+        then creates <em>and locks</em> these records itself — they cannot be
+        edited by hand afterwards. If <em>{{ cf_plan.domain }}</em> already
+        has MX records pointing anywhere other than Cloudflare, nothing is
+        written at all: the run refuses instead, so a mail setup that is live
+        today is never replaced behind your back.
+      {% endif %}
+      <div class="mb-2 p-3 dns-record">
+        {% for mx in cf_plan.mx %}
+          Record: MX &nbsp; Name: {{ cf_plan.domain }} &nbsp; Priority:
+          {{ mx.priority }} &nbsp; Target: <b>{{ mx.target }}</b>
+          <br />
+        {% endfor %}
+        Record: {{ cf_plan.spf.type }} &nbsp; Name: {{ cf_plan.spf.name }}
+        &nbsp; Value:
+        <em data-toggle="tooltip"
+            title="Click to copy"
+            class="clipboard"
+            data-clipboard-text="{{ cf_plan.spf.value }}">{{ cf_plan.spf.value }}</em>
+      </div>
+      (Cloudflare picks its own MX priorities per zone; verification only
+      compares the target hosts.)
+    </li>
+    <li>
+      {% if cf_manual %}
+        <b>Point the zone's catch-all route at the Worker
+        <code>{{ cf_plan.worker }}</code></b> — that is what delivers mail to
+        SimpleLogin. The catch-all is <em>zone-wide</em>: it covers every
+        routing-enabled name in the zone that has no more specific rule, so do
+        not overwrite an existing catch-all that routes somewhere else (even a
+        disabled one) — that would reroute or drop the zone's other mail.
+      {% else %}
+        <b>The zone's catch-all route is pointed at the Worker
+        <code>{{ cf_plan.worker }}</code></b> — that is what delivers mail to
+        SimpleLogin. The catch-all is <em>zone-wide</em>: it covers every
+        routing-enabled name in the zone that has no more specific rule. An
+        existing catch-all that routes anywhere else is never overwritten —
+        the run refuses instead, even if that rule is currently disabled.
+      {% endif %}
+    </li>
+  </ol>
+  <div class="small-text mb-2">
+    Not changed by any of this: your DKIM CNAMEs, and Email Sending
+    onboarding for the domain (dashboard-only at Cloudflare, needed for
+    replies sent <em>from</em> this domain's aliases). Cloudflare also only
+    delivers forwarded mail to <em>verified destination addresses</em>, so
+    each mailbox this domain forwards to must be verified in Email Routing.
+  </div>
+{% endif %}

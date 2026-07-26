@@ -35,6 +35,28 @@ export async function flash<E extends { Bindings: Env }>(
   await saveSession(c, session);
 }
 
+/**
+ * Sanitize third-party diagnostic text (an OAuth provider's
+ * `error_description`, a Cloudflare API error body) before it is put in a
+ * flash. Flash text renders inside `toastr.<category>("...")` in a <script>
+ * block (base.html), where the template's HTML escaping is NOT JS-string
+ * escaping — a message ending in a backslash would escape the closing quote.
+ * So: printable ASCII only, quotes/backslashes/angle brackets dropped, hard
+ * length cap. Every flash that interpolates provider text must go through
+ * this (src/web/cloudflare-pages.ts, runCfProvision).
+ */
+export function safeDiagnostic(
+  s: string | null | undefined,
+  max = 160,
+): string {
+  if (!s) return "";
+  return s
+    .replace(/[^\x20-\x7e]+/g, " ")
+    .replace(/["'`\\<>]/g, "")
+    .slice(0, max)
+    .trim();
+}
+
 /** Anonymous current_user — error pages and auth pages render through base.html. */
 const ANONYMOUS_USER = {
   is_authenticated: false,

@@ -42,17 +42,19 @@ export interface Env {
    * route a zone's mail to a Worker in the SAME account, so a zone outside
    * this account can never be provisioned: when this is set, provisioning
    * refuses such a zone BEFORE the Email-Routing enable (which would
-   * otherwise write MX records and then fail at the catch-all), and the
-   * OAuth callback refuses a grant that cannot see this account. Unset ("")
-   * skips both checks — see docs/DOMAINS.md §3.1.
+   * otherwise write MX records and then fail at the catch-all). Unset ("")
+   * skips that check — see docs/DOMAINS.md §3.1.
    */
   CF_ACCOUNT_ID?: string;
   /**
    * Cloudflare OAuth client credentials (Manage Account > OAuth clients).
-   * When both are set, the dashboard offers "Connect Cloudflare account" and
-   * provisioning uses the per-user delegated grant (revocable from the
-   * Cloudflare dashboard) in preference to the static CF_API_TOKEN.
-   * Set via `wrangler secret put CF_OAUTH_CLIENT_ID` / `..._SECRET`.
+   * When both are set, "Auto-configure on Cloudflare" runs under a ONE-SHOT
+   * authorization the user approves per run: the confirmation page shows the
+   * record diff, the access token is spent inside the callback request and
+   * revoked immediately, and nothing is stored (no refresh token is ever
+   * requested). Takes precedence over the static CF_API_TOKEN, which stays
+   * the headless fallback. Set via `wrangler secret put CF_OAUTH_CLIENT_ID` /
+   * `..._SECRET`.
    */
   CF_OAUTH_CLIENT_ID?: string;
   CF_OAUTH_CLIENT_SECRET?: string;
@@ -62,7 +64,8 @@ export interface Env {
    * a typo is a type error rather than a silent fallback — this is the
    * documented escape hatch for the scope ids that Cloudflare does not
    * publish. Must be a wrangler var or `wrangler secret put CF_OAUTH_SCOPES`
-   * to exist at runtime (docs/DOMAINS.md §3.2).
+   * to exist at runtime (docs/DOMAINS.md §3.2). `offline_access`/`offline`
+   * are stripped from it: a refresh token would defeat the one-shot model.
    */
   CF_OAUTH_SCOPES?: string;
   /** Max subdomains per user (Flask config.MAX_NB_SUBDOMAIN, default 5). */

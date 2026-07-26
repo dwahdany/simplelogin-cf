@@ -1,6 +1,6 @@
 /**
  * One-click Cloudflare domain provisioning: route 7's cf-provision branch
- * (src/web/mailbox-domain-pages.ts handleCfProvision) + src/lib/cfapi.ts.
+ * (src/web/mailbox-domain-pages.ts runCfProvision) + src/lib/cfapi.ts.
  * The Cloudflare API is faked through the setCfFetch seam and the page's
  * DNS checks through setDomainDnsClient — tests share the SELF isolate, so
  * module-level seams reach the worker under test; they are installed in
@@ -11,10 +11,11 @@
  * in-process re-verification flip the ownership/MX/SPF/DMARC flags like the
  * manual check buttons.
  *
- * The last describe covers the CREDENTIAL choice: the acting user's
- * Cloudflare OAuth grant (src/lib/cfoauth.ts) is preferred over the
- * operator's static CF_API_TOKEN, and the dash.cloudflare.com token endpoint
- * is faked through the separate setCfOauthFetch seam.
+ * The last describe covers the ONE-SHOT authorization path (confirmation
+ * page -> Cloudflare -> inline run -> revoke, nothing stored): the
+ * dash.cloudflare.com token/revoke endpoints are faked through the separate
+ * setCfOauthFetch seam. Everything before it runs the headless fallback, the
+ * operator's static CF_API_TOKEN, whose behavior is unchanged.
  */
 
 import { env, SELF } from "cloudflare:test";
@@ -22,13 +23,10 @@ import { Hono } from "hono";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { setCfFetch } from "../src/lib/cfapi";
 import {
+  CF_OAUTH_REVOKE_URL,
   CF_OAUTH_TOKEN_URL,
-  getGrant,
-  saveGrant,
   setCfOauthFetch,
 } from "../src/lib/cfoauth";
-import { addSeconds, toStr } from "../src/lib/dates";
-import type { Env } from "../src/lib/env";
 import { createSession } from "../src/lib/session";
 import type { WebEnv } from "../src/lib/web/webauth";
 import { setDomainDnsClient } from "../src/web/mailbox-domain-pages";
@@ -237,6 +235,11 @@ beforeEach(() => {
       return null;
     },
   });
+  // No OAuth client by default => `token` mode, the headless fallback.
+  // Any dash.cloudflare.com traffic in that mode is a bug.
+  setCfOauthFetch(async (input) => {
+    throw new Error(`unexpected OAuth endpoint call: ${input}`);
+  });
   // CF_API_TOKEN is a secret (absent from vitest bindings): feature is off
   // by default; enable it for these tests. "" restores "unset".
   envx.CF_API_TOKEN = "test-cf-token";
@@ -250,6 +253,7 @@ afterEach(() => {
   envx.PREMIUM_ALIAS_DOMAINS = "";
   envx.CF_OAUTH_CLIENT_ID = "";
   envx.CF_OAUTH_CLIENT_SECRET = "";
+  envx.CF_ACCOUNT_ID = "";
 });
 
 // singleWorker shares the module graph with every other test file: restore
@@ -372,7 +376,8 @@ async function domainFlags(id: number): Promise<DomainFlags> {
   return row;
 }
 
-async function provision(id: number, cookie: string): Promise<Response> {
+/** The DNS-page button: POST/Redirect/GET to the confirmation page. */
+async function clickProvision(id: number, cookie: string): Promise<Response> {
   const csrf = await getCsrf(`/dashboard/domains/${id}/dns`, cookie);
   return post(`/dashboard/domains/${id}/dns`, cookie, {
     "form-name": "cf-provision",
@@ -380,7 +385,91 @@ async function provision(id: number, cookie: string): Promise<Response> {
   });
 }
 
+const CONFIRM_PATH = (id: number) => `/dashboard/domains/${id}/cf-confirm`;
+
+/** The confirmation page's HTML (the click, then the redirect it returns). */
+async function confirmPage(id: number, cookie: string): Promise<string> {
+  const clicked = await clickProvision(id, cookie);
+  expect(clicked.status).toBe(302);
+  expect(clicked.headers.get("location")).toBe(CONFIRM_PATH(id));
+  const page = await get(CONFIRM_PATH(id), cookie);
+  expect(page.status).toBe(200);
+  return page.text();
+}
+
+/** csrf token + one-time confirm nonce out of any page that renders them. */
+function confirmFields(html: string): { csrf: string; nonce: string } {
+  const csrf = html.match(
+    /name="csrf_token" type="hidden" value="([^"]+)"/,
+  )?.[1];
+  const nonce = html.match(/name="cf_nonce" value="([^"]+)"/)?.[1];
+  if (!csrf || !nonce)
+    throw new Error("no csrf/nonce on the confirmation page");
+  return { csrf, nonce };
+}
+
+/**
+ * The `token`-mode click: ONE post. The DNS page already renders the record
+ * diff and mints the confirm nonce, so the button runs the provisioning
+ * directly — there is no interstitial confirmation page in the happy path
+ * (it survives only as the bounce target for a stale/mismatched nonce).
+ */
+async function provision(id: number, cookie: string): Promise<Response> {
+  const html = await (await get(`/dashboard/domains/${id}/dns`, cookie)).text();
+  // No nonce is rendered when the feature is off (no credential, or an SL
+  // subdomain). Post anyway with an empty one — that is exactly the "the
+  // POST is inert" case those tests assert.
+  const csrf =
+    html.match(/name="csrf_token" type="hidden" value="([^"]+)"/)?.[1] ?? "";
+  const nonce = html.match(/name="cf_nonce" value="([^"]+)"/)?.[1] ?? "";
+  return post(`/dashboard/domains/${id}/dns`, cookie, {
+    "form-name": "cf-provision-confirmed",
+    csrf_token: csrf,
+    cf_nonce: nonce,
+  });
+}
+
+/** The distinct Authorization headers the run sent (credential under test). */
+const bearers = (): string[] => [
+  ...new Set(fake.calls.map((c) => c.auth ?? "")),
+];
+
 // ---------------------------------------------------------------------------
+
+describe("cf-provision: one click", () => {
+  /**
+   * The maintainer's requirement is "a convenient one-click onboarding" where
+   * you nonetheless "see which entries it'll add" first. Both halves are
+   * properties of the DNS page: it renders the diff AND mints the confirm
+   * nonce, so the button commits without an interstitial page. Guard both, so
+   * nobody reintroduces a confirmation hop or a button that commits blind.
+   */
+  it("the DNS page shows the diff and its button commits directly — no interstitial", async () => {
+    const user = await createUser(env.DB);
+    const domain = `oneclick${user.id}.example.org`;
+    envx.CF_API_TOKEN = "op-token";
+    fake.zones.push({ id: "zone-1c", name: domain });
+    const id = await makeDomain(user.id, domain, "onetok");
+    const cookie = await sessionCookieFor(user.id);
+
+    const html = await (
+      await get(`/dashboard/domains/${id}/dns`, cookie)
+    ).text();
+    // the diff is on the same page as the button...
+    expect(html).toContain("sl-verification=onetok");
+    expect(html).toContain(DMARC_RECORD);
+    // ...and the button carries the binding nonce, so one POST runs it
+    expect(html).toMatch(/name="cf_nonce" value="[^"]+"/);
+
+    const res = await provision(id, cookie);
+    // a 302 back to the DNS page, NOT a redirect to a confirmation page
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(`/dashboard/domains/${id}/dns`);
+    expect(res.headers.get("location")).not.toContain("cf-confirm");
+    // and it actually wrote
+    expect(fake.writes().length).toBeGreaterThan(0);
+  });
+});
 
 describe("cf-provision: happy paths", () => {
   it("apex: exact API calls (conflict preflight before any write), records planted, all flags set", async () => {
@@ -390,11 +479,14 @@ describe("cf-provision: happy paths", () => {
     const id = await makeDomain(user.id, domain, "tokapex");
     const cookie = await sessionCookieFor(user.id);
 
-    // token stored => the button renders on GET
+    // token stored => the one-click button renders on GET, already carrying
+    // the confirm nonce bound to the diff shown on the same page
     const page = await get(`/dashboard/domains/${id}/dns`, cookie);
-    expect(await page.text()).toContain(
-      'name="form-name" value="cf-provision"',
+    const pageHtml = await page.text();
+    expect(pageHtml).toContain(
+      'name="form-name" value="cf-provision-confirmed"',
     );
+    expect(pageHtml).toMatch(/name="cf_nonce" value="[^"]+"/);
 
     const res = await provision(id, cookie);
     expect(res.status).toBe(302);
@@ -744,8 +836,8 @@ describe("cf-provision: refusals and errors", () => {
   });
 });
 
-describe("cf-provision: feature gate", () => {
-  it("without CF_API_TOKEN the button is absent and the POST branch is inert", async () => {
+describe("cf-provision: feature gate and the manual fallback", () => {
+  it("with no credential at all: no button, inert POST, MANUAL panel instead", async () => {
     envx.CF_API_TOKEN = ""; // "" = unset (vitest convention)
     const user = await createUser(env.DB);
     const domain = `gated${user.id}.example.org`;
@@ -755,11 +847,22 @@ describe("cf-provision: feature gate", () => {
 
     const page = await get(`/dashboard/domains/${id}/dns`, cookie);
     const html = await page.text();
-    expect(html).not.toContain("cf-provision");
-    expect(html).not.toContain("Auto-configure on Cloudflare");
-    // and with no OAuth client registered (the live deployment's shape) the
-    // page says nothing about credentials the user cannot choose between
-    expect(html).not.toContain("Cloudflare account connected");
+    // no automated offer...
+    expect(html).not.toContain('value="cf-provision"');
+    expect(html).toContain("holds no Cloudflare credentials");
+    // ...but there is ALWAYS a route the user can take without one: the full
+    // record list plus Cloudflare's own onboarding wizard, which shows its
+    // own diff and writes the records inside the user's own session
+    expect(html).toContain("sl-verification=tokgated");
+    expect(html).toContain(DMARC_RECORD);
+    expect(html).toContain(SPF_RECORD);
+    expect(html).toContain("route1.mx.cloudflare.net.");
+    expect(html).toContain(
+      "https://dash.cloudflare.com/?to=/:account/email-service/routing",
+    );
+    expect(html).toContain("catch-all");
+    expect(html).toContain("simplelogin"); // the worker the catch-all targets
+    // the operator's secret name is never shown to end users
     expect(html).not.toContain("CF_API_TOKEN");
 
     // POST behaves like an unknown form-name: renders the page, no effects
@@ -768,6 +871,23 @@ describe("cf-provision: feature gate", () => {
     expect(fake.calls).toEqual([]);
     expect(await getFlashes(cookie)).toEqual([]);
     expect(await domainFlags(id)).toEqual(NO_FLAGS);
+  });
+
+  it("the manual panel is shown ALONGSIDE the button when a credential exists", async () => {
+    const user = await createUser(env.DB);
+    const domain = `both${user.id}.example.org`;
+    fake.zones.push({ id: "zone-both", name: domain });
+    const id = await makeDomain(user.id, domain, "tokboth");
+    const cookie = await sessionCookieFor(user.id);
+
+    const html = await (
+      await get(`/dashboard/domains/${id}/dns`, cookie)
+    ).text();
+    expect(html).toContain('name="form-name" value="cf-provision-confirmed"');
+    expect(html).toContain("sl-verification=tokboth");
+    expect(html).toContain(
+      "https://dash.cloudflare.com/?to=/:account/email-service/routing",
+    );
   });
 
   it("SL subdomains never render nor handle the cf-provision form", async () => {
@@ -972,366 +1092,325 @@ describe("cf-provision: deployment-domain collision guard", () => {
 });
 
 // ===========================================================================
-// Credential selection: per-user OAuth grant preferred over CF_API_TOKEN
+// The ONE-SHOT Cloudflare authorization path: confirmation page -> Cloudflare
+// -> inline run -> revoke. Nothing is stored (no grant table exists), so what
+// matters here is (a) the preview equals the writes and (b) the inline run
+// goes through the very same gauntlet as the CF_API_TOKEN click.
 // ===========================================================================
 
-describe("cf-provision: Cloudflare OAuth credential", () => {
-  const envt = env as unknown as Env;
-  /** access tokens minted by the fake dash.cloudflare.com token endpoint */
-  let minted = 0;
+describe("cf-provision: one-shot Cloudflare authorization", () => {
+  const ACCESS_TOKEN = "cf-oneshot-at-77";
+  const START_PATH = "/dashboard/cloudflare/start";
+  const CALLBACK_PATH = "/dashboard/cloudflare/callback";
+  /** dash.cloudflare.com traffic: token + revoke, recorded. */
+  let oauthCalls: Array<{ url: string; form: Record<string, string> }> = [];
 
   beforeEach(() => {
-    // the operator registered an OAuth client (both halves required)
+    // `oauth` mode needs BOTH a registered client and a pinned account (a
+    // zone outside the worker's account can never be finished), and it is
+    // only offered when the operator has NO static CF_API_TOKEN — that
+    // credential works for every user, a delegated one only for whoever can
+    // sign in to the operator's account.
     envx.CF_OAUTH_CLIENT_ID = "cf-client-id";
     envx.CF_OAUTH_CLIENT_SECRET = "cf-client-secret";
-    minted = 0;
-    // Any traffic to dash.cloudflare.com is a bug unless the test wants a
-    // refresh (the tests below install their own seam for that).
-    setCfOauthFetch(async (input) => {
+    envx.CF_ACCOUNT_ID = "acc-operator";
+    envx.CF_API_TOKEN = "";
+    oauthCalls = [];
+    setCfOauthFetch(async (input, init) => {
+      const form = Object.fromEntries(
+        new URLSearchParams(typeof init?.body === "string" ? init.body : ""),
+      );
+      oauthCalls.push({ url: input, form });
+      if (input === CF_OAUTH_TOKEN_URL) {
+        return Response.json({
+          access_token: ACCESS_TOKEN,
+          expires_in: 3600,
+          token_type: "bearer",
+        });
+      }
+      if (input === CF_OAUTH_REVOKE_URL)
+        return new Response("", { status: 200 });
       throw new Error(`unexpected OAuth endpoint call: ${input}`);
     });
   });
 
-  /** Token endpoint that mints a NEW, immediately-stale access token. */
-  function refreshingOauthEndpoint(): void {
-    setCfOauthFetch(async (input) => {
-      if (!input.startsWith(CF_OAUTH_TOKEN_URL)) {
-        throw new Error(`unexpected OAuth endpoint call: ${input}`);
-      }
-      minted += 1;
-      return Response.json({
-        access_token: `at-${minted}`,
-        refresh_token: "rt-1",
-        // inside the 60s refresh skew => every resolution refreshes again
-        expires_in: 1,
-        token_type: "bearer",
-      });
+  const revokes = () => oauthCalls.filter((c) => c.url === CF_OAUTH_REVOKE_URL);
+
+  /** Walk the whole flow: confirm page -> start -> Cloudflare -> callback. */
+  async function runFlow(id: number, cookie: string): Promise<Response> {
+    const html = await confirmPage(id, cookie);
+    const { csrf, nonce } = confirmFields(html);
+    const started = await post(START_PATH, cookie, {
+      csrf_token: csrf,
+      cf_nonce: nonce,
     });
+    expect(started.status).toBe(302);
+    const authorize = new URL(started.headers.get("location") ?? "");
+    const state = authorize.searchParams.get("state") ?? "";
+    return get(
+      `${CALLBACK_PATH}?code=the-code&state=${encodeURIComponent(state)}`,
+      cookie,
+    );
   }
 
-  async function connect(
-    userId: number,
-    accessToken: string,
-    ageSecs = 3600,
-  ): Promise<void> {
-    await saveGrant(envt, userId, {
-      accessToken,
-      refreshToken: "rt-1",
-      expiresAt: toStr(addSeconds(new Date(), ageSecs)),
-      scopes: "account.read zone.read zone-settings.write dns.write",
-      accountId: "acc-1",
-      accountName: "Acme Ltd",
-    });
-  }
-
-  const bearers = (): string[] => [
-    ...new Set(fake.calls.map((c) => c.auth ?? "")),
-  ];
-
-  it("uses the user's grant for every call, in preference to CF_API_TOKEN", async () => {
+  it("the button shows the record diff and runs NOTHING yet", async () => {
     const user = await createUser(env.DB);
-    const domain = `oauth${user.id}.example.org`;
-    fake.zones.push({ id: "zone-oauth", name: domain });
-    await connect(user.id, "cf-oauth-at-1");
-    const id = await makeDomain(user.id, domain, "tokoauth");
+    const domain = `confirm${user.id}.example.org`;
+    fake.zones.push({ id: "zone-confirm", name: domain });
+    const id = await makeDomain(user.id, domain, "tokconfirm");
     const cookie = await sessionCookieFor(user.id);
 
-    const res = await provision(id, cookie);
+    const html = await confirmPage(id, cookie);
+    // every value the run will write, verbatim
+    expect(html).toContain("sl-verification=tokconfirm");
+    expect(html).toContain(DMARC_RECORD);
+    expect(html).toContain(`_dmarc.${domain}`);
+    expect(html).toContain(SPF_RECORD);
+    expect(html).toContain("route1.mx.cloudflare.net.");
+    expect(html).toContain("catch-all");
+    expect(html).toContain("simplelogin");
+    // the honest bits about the authorization itself
+    expect(html).toContain("no zone picker");
+    expect(html).toContain("never stored");
+    expect(html).toContain("cannot be renewed");
+    expect(html).toContain("revoked as soon as the run finishes");
+    // ...including the constraint that decides whether it can work at all
+    expect(html).toContain("mail worker");
+    expect(html).toContain("same</em> account");
+    // the MX bullet says what the code does: it REFUSES, it never replaces
+    expect(html).toContain("the run refuses instead");
+    expect(html).not.toContain("stops going wherever it goes today");
+    // and the way out that needs no credential at all
+    expect(html).toContain(
+      "https://dash.cloudflare.com/?to=/:account/email-service/routing",
+    );
+    // the hand-off is a CSRF-carrying POST bound to THIS rendering by a
+    // one-time nonce — no domain id the client could swap
+    expect(html).toContain(`action="${START_PATH}"`);
+    expect(html).not.toContain("custom_domain_id");
+    expect(confirmFields(html).nonce.length).toBeGreaterThan(20);
+
+    // NOTHING happened: no Cloudflare call, no OAuth call, no flag flipped
+    expect(fake.calls).toEqual([]);
+    expect(oauthCalls).toEqual([]);
+    expect(await domainFlags(id)).toEqual(NO_FLAGS);
+    // ...and no budget was spent on merely reading the diff
+    const rl = await env.DB.prepare(
+      "SELECT count FROM rate_limit WHERE key = ?1",
+    )
+      .bind(`rlw:web_cf_provision:userid:${user.id}:60`)
+      .first<{ count: number }>();
+    expect(rl).toBeNull();
+  });
+
+  it("the confirmation page's values are EXACTLY what the run then writes", async () => {
+    const user = await createUser(env.DB);
+    const domain = `same${user.id}.example.org`;
+    fake.zones.push({ id: "zone-same", name: domain });
+    const id = await makeDomain(user.id, domain, "toksame");
+    const cookie = await sessionCookieFor(user.id);
+
+    const html = await confirmPage(id, cookie);
+    // pull the previewed record values straight out of the rendered page
+    const shown = [...html.matchAll(/data-clipboard-text="([^"]+)"/g)].map(
+      (m) => m[1],
+    );
+    expect(shown).toContain(`sl-verification=toksame`);
+    expect(shown).toContain(DMARC_RECORD);
+
+    const res = await runFlow(id, cookie);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(`/dashboard/domains/${id}/dns`);
+
+    const written = fake.calls
+      .filter((c) => c.method === "POST" && c.path.endsWith("/dns_records"))
+      .map((c) => c.body as { name: string; content: string });
+    expect(written).toEqual([
+      {
+        type: "TXT",
+        name: domain,
+        content: '"sl-verification=toksame"',
+        ttl: 1,
+        comment: "SimpleLogin ownership verification (auto-configure)",
+      },
+      {
+        type: "TXT",
+        name: `_dmarc.${domain}`,
+        content: `"${DMARC_RECORD}"`,
+        ttl: 1,
+        comment: "SimpleLogin (auto-configure)",
+      },
+    ]);
+    // the previewed strings and the written ones are the same strings
+    for (const rec of written) {
+      expect(shown).toContain(rec.content.replace(/^"|"$/g, ""));
+    }
+    expect(await domainFlags(id)).toEqual(ALL_FLAGS);
+  });
+
+  it("runs the FULL gauntlet inline under the one-shot token, then revokes it", async () => {
+    const user = await createUser(env.DB);
+    const domain = `inline${user.id}.example.org`;
+    fake.zones.push({ id: "zone-inline", name: domain });
+    const id = await makeDomain(user.id, domain, "tokinline");
+    const cookie = await sessionCookieFor(user.id);
+
+    const res = await runFlow(id, cookie);
     expect(res.status).toBe(302);
 
-    // the full run happened (same gauntlet as the static-token happy path)
+    // byte-for-byte the same call sequence as the static-token happy path,
+    // read-only preflight first
     expect(fake.calls.map((c) => [c.method, c.path])).toEqual([
       ["GET", `/client/v4/zones?name=${domain}`],
-      ["GET", "/client/v4/zones/zone-oauth/email/routing/rules/catch_all"],
+      ["GET", "/client/v4/zones/zone-inline/email/routing/rules/catch_all"],
       [
         "GET",
-        `/client/v4/zones/zone-oauth/dns_records?type=MX&name.exact=${domain}`,
+        `/client/v4/zones/zone-inline/dns_records?type=MX&name.exact=${domain}`,
       ],
-      ["GET", "/client/v4/zones/zone-oauth/email/routing"],
-      ["POST", "/client/v4/zones/zone-oauth/email/routing/enable"],
-      ["PUT", "/client/v4/zones/zone-oauth/email/routing/rules/catch_all"],
+      ["GET", "/client/v4/zones/zone-inline/email/routing"],
+      ["POST", "/client/v4/zones/zone-inline/email/routing/enable"],
+      ["PUT", "/client/v4/zones/zone-inline/email/routing/rules/catch_all"],
       [
         "GET",
-        `/client/v4/zones/zone-oauth/dns_records?type=TXT&name.exact=${domain}`,
+        `/client/v4/zones/zone-inline/dns_records?type=TXT&name.exact=${domain}`,
       ],
-      ["POST", "/client/v4/zones/zone-oauth/dns_records"],
+      ["POST", "/client/v4/zones/zone-inline/dns_records"],
       [
         "GET",
-        `/client/v4/zones/zone-oauth/dns_records?type=TXT&name.exact=_dmarc.${domain}`,
+        `/client/v4/zones/zone-inline/dns_records?type=TXT&name.exact=_dmarc.${domain}`,
       ],
-      ["POST", "/client/v4/zones/zone-oauth/dns_records"],
+      ["POST", "/client/v4/zones/zone-inline/dns_records"],
     ]);
-    // EVERY outgoing call carried the delegated token; the operator's static
-    // token (set in the file-level beforeEach) was never used
-    expect(bearers()).toEqual(["Bearer cf-oauth-at-1"]);
+    // every call used the delegated one-shot token, never the operator's
+    expect([...new Set(fake.calls.map((c) => c.auth))]).toEqual([
+      `Bearer ${ACCESS_TOKEN}`,
+    ]);
+    expect(revokes().map((r) => r.form)).toEqual([
+      { token: ACCESS_TOKEN, token_type_hint: "access_token" },
+    ]);
     expect(await domainFlags(id)).toEqual(ALL_FLAGS);
-
     const flashes = await getFlashes(cookie);
-    expect(flashes).toHaveLength(1);
     expect(flashes[0].category).toBe("success");
-    // no credential material in user-facing output
-    expect(flashes[0].message).not.toContain("cf-oauth-at-1");
-    expect(flashes[0].message).not.toContain("test-cf-token");
+    expect(flashes[0].message).not.toContain(ACCESS_TOKEN);
   });
 
-  it("falls back to CF_API_TOKEN when the user has no grant", async () => {
+  it("the one-shot token is the only credential the run uses", async () => {
     const user = await createUser(env.DB);
-    const domain = `nogrant${user.id}.example.org`;
-    fake.zones.push({ id: "zone-nogrant", name: domain });
-    const id = await makeDomain(user.id, domain, "toknogrant");
+    const domain = `pref${user.id}.example.org`;
+    fake.zones.push({ id: "zone-pref", name: domain });
+    const id = await makeDomain(user.id, domain, "tokpref");
     const cookie = await sessionCookieFor(user.id);
+
+    await runFlow(id, cookie);
+    expect(bearers()).toEqual([`Bearer ${ACCESS_TOKEN}`]);
+  });
+
+  it("CF_API_TOKEN takes precedence: no user is sent to a consent screen the operator's own credential makes unnecessary", async () => {
+    // Cross-account provisioning is impossible (Email Routing delivers only
+    // to a Worker in the same account), so a delegated authorization can only
+    // ever work for someone who can sign in to the operator's account —
+    // while CF_API_TOKEN works for every user. Offering `oauth` on top of it
+    // would hide the credential that works behind consent screens that
+    // cannot help.
+    envx.CF_API_TOKEN = "test-cf-token";
+    const user = await createUser(env.DB);
+    const domain = `prec${user.id}.example.org`;
+    fake.zones.push({ id: "zone-prec", name: domain });
+    const id = await makeDomain(user.id, domain, "tokprec");
+    const cookie = await sessionCookieFor(user.id);
+
+    // the confirmation page still comes first — the preview is a property of
+    // the feature, not of the OAuth hand-off — but it hands off to the DNS
+    // page, not to Cloudflare
+    const html = await confirmPage(id, cookie);
+    expect(html).toContain('value="cf-provision-confirmed"');
+    expect(html).not.toContain(`action="${START_PATH}"`);
+    expect(html).toContain("operator's own Cloudflare credentials");
 
     const res = await provision(id, cookie);
     expect(res.status).toBe(302);
     expect(bearers()).toEqual(["Bearer test-cf-token"]);
+    expect(oauthCalls).toEqual([]);
     expect(await domainFlags(id)).toEqual(ALL_FLAGS);
   });
 
-  it("another user's grant is never borrowed (per-user, not global)", async () => {
-    const owner = await createUser(env.DB);
-    const other = await createUser(env.DB);
-    await connect(other.id, "someone-elses-token");
-    const domain = `mine${owner.id}.example.org`;
-    fake.zones.push({ id: "zone-mine", name: domain });
-    const id = await makeDomain(owner.id, domain, "tokmine");
-    const cookie = await sessionCookieFor(owner.id);
-
-    const res = await provision(id, cookie);
-    expect(res.status).toBe(302);
-    expect(bearers()).toEqual(["Bearer test-cf-token"]);
-  });
-
-  it("re-resolves the token per request, so a mid-provisioning refresh works", async () => {
-    refreshingOauthEndpoint();
+  it("an OAuth client without CF_ACCOUNT_ID is not offered at all (a run could only half-configure the zone)", async () => {
+    envx.CF_ACCOUNT_ID = "";
     const user = await createUser(env.DB);
-    const domain = `refresh${user.id}.example.org`;
-    fake.zones.push({ id: "zone-refresh", name: domain });
-    // already expired: the very first resolution has to refresh
-    await connect(user.id, "at-stale", -10);
-    const id = await makeDomain(user.id, domain, "tokrefresh");
-    const cookie = await sessionCookieFor(user.id);
-
-    const res = await provision(id, cookie);
-    expect(res.status).toBe(302);
-
-    // one fresh token per Cloudflare API call: the client asked the provider
-    // again for each request instead of capturing the token once
-    const seen = fake.calls.map((c) => c.auth);
-    expect(new Set(seen).size).toBe(seen.length);
-    expect(seen[0]).toBe("Bearer at-2"); // at-1 was minted choosing the credential
-    expect(seen[seen.length - 1]).toBe(`Bearer at-${minted}`);
-    expect(minted).toBe(fake.calls.length + 1);
-    // ...and the rotated grant was persisted, not just used in memory
-    const grant = await getGrant(envt, user.id);
-    expect(grant?.accessToken).toBe(`at-${minted}`);
-    expect(await domainFlags(id)).toEqual(ALL_FLAGS);
-  });
-
-  it("401/403 under a grant flashes the reconnect hint (with the zone-settings trap)", async () => {
-    const user = await createUser(env.DB);
-    const domain = `denied${user.id}.example.org`;
-    fake.zones.push({ id: "zone-denied", name: domain });
-    // exactly the documented trap: an OAuth client without the zone-settings
-    // scopes authorizes fine, then 403s on the routing-enable endpoint
-    const realFetch = fake.fetch;
-    fake.fetch = async (input, init) => {
-      if ((init?.method ?? "GET") === "POST" && input.endsWith("/enable")) {
-        await realFetch(input, init); // still recorded as a call
-        fake.routingEnabled.delete("zone-denied");
-        return Response.json(
-          {
-            success: false,
-            errors: [{ code: 10000, message: "Authentication error" }],
-            result: null,
-          },
-          { status: 403 },
-        );
-      }
-      return realFetch(input, init);
-    };
-    await connect(user.id, "cf-oauth-at-1");
-    const id = await makeDomain(user.id, domain, "tokdenied");
-    const cookie = await sessionCookieFor(user.id);
-
-    const res = await provision(id, cookie);
-    expect(res.status).toBe(302);
-    const flashes = await getFlashes(cookie);
-    expect(flashes).toHaveLength(1);
-    expect(flashes[0].category).toBe("error");
-    expect(flashes[0].message).toContain("authorization is missing a");
-    expect(flashes[0].message).toContain("connect your Cloudflare account");
-    expect(flashes[0].message).toContain("zone-settings.write");
-    expect(flashes[0].message).toContain("Email Routing");
-    expect(flashes[0].message).toContain("zone found"); // completed steps kept
-    expect(flashes[0].message).toContain("safe to retry");
-    // never leaks the token, the zone id or the request path
-    expect(flashes[0].message).not.toContain("cf-oauth-at-1");
-    expect(flashes[0].message).not.toContain("zone-denied");
-    expect(flashes[0].message).not.toContain("/zones/");
-    // the ordinary API-error wording is NOT used for an auth failure
-    expect(flashes[0].message).not.toContain("Cloudflare API error");
-    expect(await domainFlags(id)).toEqual(NO_FLAGS);
-  });
-
-  it("a non-auth API error under a grant keeps the ordinary wording", async () => {
-    const user = await createUser(env.DB);
-    const domain = `boom${user.id}.example.org`;
-    fake.zones.push({ id: "zone-boom", name: domain });
-    const realFetch = fake.fetch;
-    fake.fetch = async (input, init) => {
-      if ((init?.method ?? "GET") === "POST" && input.endsWith("/enable")) {
-        return Response.json(
-          {
-            success: false,
-            errors: [{ code: 1000, message: "Internal error" }],
-            result: null,
-          },
-          { status: 500 },
-        );
-      }
-      return realFetch(input, init);
-    };
-    await connect(user.id, "cf-oauth-at-1");
-    const id = await makeDomain(user.id, domain, "tokboom");
-    const cookie = await sessionCookieFor(user.id);
-
-    await provision(id, cookie);
-    const flashes = await getFlashes(cookie);
-    expect(flashes[0].message).toContain("Cloudflare API error");
-    expect(flashes[0].message).not.toContain("zone-settings");
-  });
-
-  it("a grant alone enables the feature: button rendered, provisioning runs", async () => {
-    envx.CF_API_TOKEN = ""; // no operator token at all
-    const user = await createUser(env.DB);
-    const domain = `only${user.id}.example.org`;
-    fake.zones.push({ id: "zone-only", name: domain });
-    await connect(user.id, "cf-oauth-at-1");
-    const id = await makeDomain(user.id, domain, "tokonly");
+    const domain = `unpinned${user.id}.example.org`;
+    fake.zones.push({ id: "zone-unpinned", name: domain });
+    const id = await makeDomain(user.id, domain, "tokunpinned");
     const cookie = await sessionCookieFor(user.id);
 
     const page = await get(`/dashboard/domains/${id}/dns`, cookie);
     const html = await page.text();
-    expect(html).toContain('name="form-name" value="cf-provision"');
-    // the connect panel renders the account name + a Disconnect action, and
-    // never the token
-    expect(html).toContain("Acme Ltd");
-    expect(html).toContain("Disconnect Cloudflare account");
-    expect(html).toContain("/dashboard/cloudflare/disconnect");
-    expect(html).not.toContain("cf-oauth-at-1");
-
-    const res = await provision(id, cookie);
-    expect(res.status).toBe(302);
-    expect(bearers()).toEqual(["Bearer cf-oauth-at-1"]);
-    expect(await domainFlags(id)).toEqual(ALL_FLAGS);
-  });
-
-  it("no grant and no CF_API_TOKEN: Connect offered, provisioning inert", async () => {
-    envx.CF_API_TOKEN = "";
-    const user = await createUser(env.DB);
-    const domain = `none${user.id}.example.org`;
-    fake.zones.push({ id: "zone-none", name: domain });
-    const id = await makeDomain(user.id, domain, "toknone");
-    const cookie = await sessionCookieFor(user.id);
-
-    const page = await get(`/dashboard/domains/${id}/dns`, cookie);
-    const html = await page.text();
-    expect(html).toContain("Connect Cloudflare account");
-    // the fallback is described, but the operator's secret is NOT named to
-    // end users (it stays in docs/DOMAINS.md)
-    expect(html).toContain("this instance's own Cloudflare credentials");
-    expect(html).toContain("which this instance does not have");
-    expect(html).not.toContain("CF_API_TOKEN");
     expect(html).not.toContain('value="cf-provision"');
+    expect(html).toContain("holds no Cloudflare credentials");
 
-    // POST falls through to the page render like an unknown form-name
-    const res = await provision(id, cookie);
-    expect(res.status).toBe(200);
-    expect(fake.calls).toEqual([]);
-    expect(await getFlashes(cookie)).toEqual([]);
-    expect(await domainFlags(id)).toEqual(NO_FLAGS);
-  });
-
-  it("a dead grant REFUSES the run instead of downgrading to CF_API_TOKEN", async () => {
-    // invalid_grant => getValidAccessToken drops the row and returns null
-    setCfOauthFetch(async () =>
-      Response.json({ error: "invalid_grant" }, { status: 400 }),
+    // ...and the confirmation page / hand-off refuse too
+    const confirm = await get(CONFIRM_PATH(id), cookie);
+    expect(confirm.status).toBe(302);
+    expect(confirm.headers.get("location")).toBe(
+      `/dashboard/domains/${id}/dns`,
     );
-    const user = await createUser(env.DB);
-    const domain = `dead${user.id}.example.org`;
-    fake.zones.push({ id: "zone-dead", name: domain });
-    await connect(user.id, "at-dead", -10); // expired => refresh attempted
-    const id = await makeDomain(user.id, domain, "tokdead");
-    const cookie = await sessionCookieFor(user.id);
-
-    const res = await provision(id, cookie);
-    expect(res.status).toBe(302);
-    // NOT the operator's account-wide credential: no Cloudflare call at all
     expect(fake.calls).toEqual([]);
-    const flashes = await getFlashes(cookie);
-    expect(flashes).toHaveLength(1);
-    expect(flashes[0].category).toBe("error");
-    expect(flashes[0].message).toContain("connect your Cloudflare account");
-    expect(flashes[0].message).toContain("nothing was changed");
-    // the row is already gone, so the message must not say "disconnect"
-    expect(flashes[0].message).not.toContain("disconnect");
-    expect(await getGrant(envt, user.id)).toBeNull(); // dead row dropped
-    expect(await domainFlags(id)).toEqual(NO_FLAGS);
+    expect(oauthCalls).toEqual([]);
   });
 
-  it("resolves the token ONCE per run and holds it across the ~10 API calls", async () => {
+  it("guard: a foreign catch-all refuses BEFORE any write, on the inline path", async () => {
     const user = await createUser(env.DB);
-    const domain = `memo${user.id}.example.org`;
-    fake.zones.push({ id: "zone-memo", name: domain });
-    await connect(user.id, "cf-oauth-at-1");
-    const id = await makeDomain(user.id, domain, "tokmemo");
+    const domain = `ibusy${user.id}.example.org`;
+    fake.zones.push({ id: "zone-ibusy", name: domain });
+    fake.catchAll.set("zone-ibusy", {
+      enabled: true,
+      name: "ops forward",
+      matchers: [{ type: "all" }],
+      actions: [{ type: "forward", value: ["ops@elsewhere.example"] }],
+    });
+    const id = await makeDomain(user.id, domain, "tokibusy");
     const cookie = await sessionCookieFor(user.id);
 
-    // Drop the grant row after the FIRST Cloudflare call: a run that
-    // re-reads D1 before every call would 401 from here on; a run that
-    // resolved the still-valid token once completes normally.
-    const realFetch = fake.fetch;
-    let seen = 0;
-    fake.fetch = async (input, init) => {
-      const res = await realFetch(input, init);
-      if (++seen === 1) {
-        await env.DB.prepare("DELETE FROM cf_oauth_token WHERE user_id = ?1")
-          .bind(user.id)
-          .run();
-      }
-      return res;
-    };
-
-    const res = await provision(id, cookie);
+    const res = await runFlow(id, cookie);
     expect(res.status).toBe(302);
-    expect(fake.calls.length).toBeGreaterThan(5);
-    expect(bearers()).toEqual(["Bearer cf-oauth-at-1"]);
-    expect((await getFlashes(cookie))[0].category).toBe("success");
-    expect(await domainFlags(id)).toEqual(ALL_FLAGS);
-  });
-
-  it("zone not found under a grant names the CONNECTED account, not the operator's", async () => {
-    const user = await createUser(env.DB);
-    const domain = `nozone${user.id}.example.org`; // no fake.zones entry
-    await connect(user.id, "cf-oauth-at-1");
-    const id = await makeDomain(user.id, domain, "toknozone");
-    const cookie = await sessionCookieFor(user.id);
-
-    const res = await provision(id, cookie);
-    expect(res.status).toBe(302);
+    expect(fake.calls.map((c) => [c.method, c.path])).toEqual([
+      ["GET", `/client/v4/zones?name=${domain}`],
+      ["GET", "/client/v4/zones/zone-ibusy/email/routing/rules/catch_all"],
+    ]);
     expect(fake.writes()).toEqual([]);
+    expect(await domainFlags(id)).toEqual(NO_FLAGS);
     const flashes = await getFlashes(cookie);
     expect(flashes[0].category).toBe("error");
-    expect(flashes[0].message).toContain("Cloudflare account you connected");
-    expect(flashes[0].message).not.toContain("operator's Cloudflare account");
+    expect(flashes[0].message).toContain("Refusing to change the catch-all");
+    // the failure path still hands the authorization back
+    expect(revokes()).toHaveLength(1);
   });
 
-  it("a 403 on the catch-all preflight refuses BEFORE enabling Email Routing", async () => {
+  it("guard: foreign MX refuses before enabling Email Routing, on the inline path", async () => {
     const user = await createUser(env.DB);
-    const domain = `pre403${user.id}.example.org`;
-    fake.zones.push({ id: "zone-pre403", name: domain });
-    // exactly the "email-routing-rule.* ids are wrong" misconfiguration: the
-    // only endpoints that 403 are the catch-all ones
+    const domain = `imx${user.id}.example.org`;
+    fake.zones.push({ id: "zone-imx", name: domain });
+    fake.dnsRecords.push({
+      id: "mx-foreign",
+      zoneId: "zone-imx",
+      type: "MX",
+      name: domain,
+      content: "mail.protonmail.ch",
+    });
+    const id = await makeDomain(user.id, domain, "tokimx");
+    const cookie = await sessionCookieFor(user.id);
+
+    await runFlow(id, cookie);
+    expect(fake.writes()).toEqual([]);
+    expect(fake.routingEnabled.has("zone-imx")).toBe(false);
+    const flashes = await getFlashes(cookie);
+    expect(flashes[0].message).toContain("Refusing to enable Email Routing");
+    expect(revokes()).toHaveLength(1);
+  });
+
+  it("guard: a 403 on the catch-all preflight refuses BEFORE enabling Email Routing", async () => {
+    const user = await createUser(env.DB);
+    const domain = `i403${user.id}.example.org`;
+    fake.zones.push({ id: "zone-i403", name: domain });
     const realFetch = fake.fetch;
     fake.fetch = async (input, init) => {
       if (input.includes("/rules/catch_all")) {
@@ -1346,83 +1425,34 @@ describe("cf-provision: Cloudflare OAuth credential", () => {
       }
       return realFetch(input, init);
     };
-    await connect(user.id, "cf-oauth-at-1");
-    const id = await makeDomain(user.id, domain, "tokpre403");
+    const id = await makeDomain(user.id, domain, "toki403");
     const cookie = await sessionCookieFor(user.id);
 
-    const res = await provision(id, cookie);
-    expect(res.status).toBe(302);
-    // NOTHING was written: no MX/SPF, no catch-all, no TXT
+    await runFlow(id, cookie);
     expect(fake.writes()).toEqual([]);
-    expect(fake.routingEnabled.has("zone-pre403")).toBe(false);
+    expect(fake.routingEnabled.has("zone-i403")).toBe(false);
     const flashes = await getFlashes(cookie);
     expect(flashes[0].category).toBe("error");
-    expect(flashes[0].message).toContain("authorization is missing a");
+    // the delegated wording, naming the scope trap the user's operator can fix
+    expect(flashes[0].message).toContain("missing a permission");
     expect(flashes[0].message).toContain("email-routing-rule.write");
+    expect(flashes[0].message).not.toContain("Cloudflare API error");
     expect(await domainFlags(id)).toEqual(NO_FLAGS);
+    expect(revokes()).toHaveLength(1);
   });
 
-  it("refuses a zone outside the account that hosts the mail worker", async () => {
-    envx.CF_ACCOUNT_ID = "acc-operator";
-    try {
-      const user = await createUser(env.DB);
-      const domain = `xacct${user.id}.example.org`;
-      fake.zones.push({
-        id: "zone-xacct",
-        name: domain,
-        account: { id: "acc-someone-else", name: "Their Account" },
-      });
-      await connect(user.id, "cf-oauth-at-1");
-      const id = await makeDomain(user.id, domain, "tokxacct");
-      const cookie = await sessionCookieFor(user.id);
-
-      const res = await provision(id, cookie);
-      expect(res.status).toBe(302);
-      // refused before the first write: Email Routing would have written MX
-      // and the catch-all PUT would then have failed (no such worker there)
-      expect(fake.writes()).toEqual([]);
-      const flashes = await getFlashes(cookie);
-      expect(flashes[0].category).toBe("error");
-      expect(flashes[0].message).toContain("mail worker");
-      expect(await domainFlags(id)).toEqual(NO_FLAGS);
-    } finally {
-      envx.CF_ACCOUNT_ID = "";
-    }
-  });
-
-  it("allows a zone in the pinned account", async () => {
-    envx.CF_ACCOUNT_ID = "acc-operator";
-    try {
-      const user = await createUser(env.DB);
-      const domain = `sameacct${user.id}.example.org`;
-      fake.zones.push({
-        id: "zone-same",
-        name: domain,
-        account: { id: "acc-operator", name: "Operator" },
-      });
-      await connect(user.id, "cf-oauth-at-1");
-      const id = await makeDomain(user.id, domain, "toksame");
-      const cookie = await sessionCookieFor(user.id);
-
-      const res = await provision(id, cookie);
-      expect(res.status).toBe(302);
-      expect((await getFlashes(cookie))[0].category).toBe("success");
-      expect(await domainFlags(id)).toEqual(ALL_FLAGS);
-    } finally {
-      envx.CF_ACCOUNT_ID = "";
-    }
-  });
-
-  it("the guards apply identically under a grant (deployment-zone collision)", async () => {
+  it("guard: the deployment-zone collision refuses before the hand-off", async () => {
     const user = await createUser(env.DB);
     // sibling of EMAIL_DOMAIN sl.example.com inside the operator's zone
     const domain = `evil${user.id}.example.com`;
     fake.zones.push({ id: "zone-deploy", name: "example.com" });
-    await connect(user.id, "cf-oauth-at-1");
     const id = await makeDomain(user.id, domain, "tokevilo");
     const cookie = await sessionCookieFor(user.id);
 
-    const res = await provision(id, cookie);
+    // The string-level guard cannot see this one (it is a sibling, not an
+    // overlap), so the flow gets as far as Cloudflare — and the zone-level
+    // guard then refuses inline, before any write.
+    const res = await runFlow(id, cookie);
     expect(res.status).toBe(302);
     expect(fake.writes()).toEqual([]);
     const flashes = await getFlashes(cookie);
@@ -1430,16 +1460,57 @@ describe("cf-provision: Cloudflare OAuth credential", () => {
     expect(flashes[0].message).toContain(
       "hosts this SimpleLogin deployment's own domains",
     );
+    expect(revokes()).toHaveLength(1);
   });
 
-  it("the rate limit applies identically under a grant", async () => {
+  it("guard: a string-level collision is refused up front, without any hand-off", async () => {
     const user = await createUser(env.DB);
-    const domain = `rlo${user.id}.example.org`;
-    fake.zones.push({ id: "zone-rlo", name: domain });
-    await connect(user.id, "cf-oauth-at-1");
-    const id = await makeDomain(user.id, domain, "tokrlo");
+    const domain = `hijack${user.id}.sl.example.com`; // under EMAIL_DOMAIN
+    const id = await makeDomain(user.id, domain, "tokhij");
     const cookie = await sessionCookieFor(user.id);
 
+    const res = await provision(id, cookie);
+    expect(res.status).toBe(302); // straight back to the DNS page
+    expect(fake.calls).toEqual([]);
+    expect(oauthCalls).toEqual([]);
+    const flashes = await getFlashes(cookie);
+    expect(flashes[0].category).toBe("error");
+    expect(flashes[0].message).toContain("overlaps");
+  });
+
+  it("guard: a zone outside the worker's account is refused before the first write", async () => {
+    envx.CF_ACCOUNT_ID = "acc-operator";
+    try {
+      const user = await createUser(env.DB);
+      const domain = `ixacct${user.id}.example.org`;
+      fake.zones.push({
+        id: "zone-ixacct",
+        name: domain,
+        account: { id: "acc-someone-else", name: "Their Account" },
+      });
+      const id = await makeDomain(user.id, domain, "tokixacct");
+      const cookie = await sessionCookieFor(user.id);
+
+      await runFlow(id, cookie);
+      expect(fake.writes()).toEqual([]);
+      const flashes = await getFlashes(cookie);
+      expect(flashes[0].category).toBe("error");
+      expect(flashes[0].message).toContain("mail worker");
+      expect(await domainFlags(id)).toEqual(NO_FLAGS);
+      expect(revokes()).toHaveLength(1);
+    } finally {
+      envx.CF_ACCOUNT_ID = "";
+    }
+  });
+
+  it("guard: the rate limit blocks the confirmation page too (429, nothing spent)", async () => {
+    const user = await createUser(env.DB);
+    const domain = `irl${user.id}.example.org`;
+    fake.zones.push({ id: "zone-irl", name: domain });
+    const id = await makeDomain(user.id, domain, "tokirl");
+    const cookie = await sessionCookieFor(user.id);
+
+    const csrf = await getCsrf(`/dashboard/domains/${id}/dns`, cookie);
     const now = Date.now() / 1000;
     for (const [seconds, limit] of [
       [60, 3],
@@ -1455,26 +1526,116 @@ describe("cf-provision: Cloudflare OAuth credential", () => {
         )
         .run();
     }
-
-    const res = await provision(id, cookie);
+    const res = await post(`/dashboard/domains/${id}/dns`, cookie, {
+      "form-name": "cf-provision",
+      csrf_token: csrf,
+    });
     expect(res.status).toBe(429);
+    expect(fake.calls).toEqual([]);
+    expect(oauthCalls).toEqual([]);
+  });
+
+  it("zone not found names the account the user just authorized", async () => {
+    const user = await createUser(env.DB);
+    const domain = `inozone${user.id}.example.org`; // no fake.zones entry
+    const id = await makeDomain(user.id, domain, "tokinozone");
+    const cookie = await sessionCookieFor(user.id);
+
+    await runFlow(id, cookie);
+    expect(fake.writes()).toEqual([]);
+    const flashes = await getFlashes(cookie);
+    expect(flashes[0].category).toBe("error");
+    expect(flashes[0].message).toContain("Cloudflare account you authorized");
+    expect(flashes[0].message).not.toContain("operator's Cloudflare account");
+    expect(revokes()).toHaveLength(1);
+  });
+
+  it("the confirmation is one-time: the same nonce cannot start a second run", async () => {
+    const user = await createUser(env.DB);
+    const domain = `once${user.id}.example.org`;
+    fake.zones.push({ id: "zone-once", name: domain });
+    const id = await makeDomain(user.id, domain, "tokonce");
+    const cookie = await sessionCookieFor(user.id);
+
+    const { csrf, nonce } = confirmFields(await confirmPage(id, cookie));
+    const first = await post(START_PATH, cookie, {
+      csrf_token: csrf,
+      cf_nonce: nonce,
+    });
+    expect(first.status).toBe(302);
+    expect(first.headers.get("location")).toContain(
+      "dash.cloudflare.com/oauth2/auth",
+    );
+
+    const replay = await post(START_PATH, cookie, {
+      csrf_token: csrf,
+      cf_nonce: nonce,
+    });
+    expect(replay.status).toBe(302);
+    expect(replay.headers.get("location")).not.toContain("dash.cloudflare.com");
+    expect((await getFlashes(cookie)).at(-1)?.message).toContain(
+      "no longer valid",
+    );
+  });
+
+  it("without a rendered diff there is no hand-off: /start refuses a CSRF-valid POST carrying no nonce", async () => {
+    const user = await createUser(env.DB);
+    const domain = `nodiff${user.id}.example.org`;
+    fake.zones.push({ id: "zone-nodiff", name: domain });
+    const id = await makeDomain(user.id, domain, "toknodiff");
+    const cookie = await sessionCookieFor(user.id);
+
+    const csrf = await getCsrf(`/dashboard/domains/${id}/dns`, cookie);
+    const res = await post(START_PATH, cookie, { csrf_token: csrf });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).not.toContain("dash.cloudflare.com");
+    expect(oauthCalls).toEqual([]);
     expect(fake.calls).toEqual([]);
   });
 
-  it("half-configured OAuth (id without secret) is off: static token is used", async () => {
+  it("a plan that changed after the diff was rendered is not run", async () => {
+    const user = await createUser(env.DB);
+    const domain = `drift${user.id}.example.org`;
+    fake.zones.push({ id: "zone-drift", name: domain });
+    const id = await makeDomain(user.id, domain, "tokdrift");
+    const cookie = await sessionCookieFor(user.id);
+
+    const { csrf, nonce } = confirmFields(await confirmPage(id, cookie));
+    // ownership got verified in another tab: the diff no longer contains the
+    // sl-verification record the user was shown
+    await env.DB.prepare(
+      "UPDATE custom_domain SET ownership_verified = 1 WHERE id = ?1",
+    )
+      .bind(id)
+      .run();
+
+    const res = await post(START_PATH, cookie, {
+      csrf_token: csrf,
+      cf_nonce: nonce,
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(CONFIRM_PATH(id));
+    expect(oauthCalls).toEqual([]);
+    expect((await getFlashes(cookie)).at(-1)?.message).toContain(
+      "no longer what you were shown",
+    );
+  });
+
+  it("half-configured OAuth (id without secret) falls back to the static token", async () => {
     envx.CF_OAUTH_CLIENT_SECRET = "";
+    envx.CF_API_TOKEN = "test-cf-token";
     const user = await createUser(env.DB);
     const domain = `half${user.id}.example.org`;
     fake.zones.push({ id: "zone-half", name: domain });
-    await connect(user.id, "cf-oauth-at-1");
     const id = await makeDomain(user.id, domain, "tokhalf");
     const cookie = await sessionCookieFor(user.id);
 
-    const page = await get(`/dashboard/domains/${id}/dns`, cookie);
-    expect(await page.text()).not.toContain("Connect Cloudflare account");
-
+    // confirm, then run under CF_API_TOKEN (no consent screen to route a
+    // static operator credential through)
     const res = await provision(id, cookie);
     expect(res.status).toBe(302);
     expect(bearers()).toEqual(["Bearer test-cf-token"]);
+    expect(oauthCalls).toEqual([]);
+    expect(await domainFlags(id)).toEqual(ALL_FLAGS);
   });
 });

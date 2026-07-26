@@ -36,14 +36,17 @@ import {
   CfApiError,
   type CfCatchAllRule,
   CfClient,
-  type CfTokenProvider,
   catchAllConflict,
   ensureCatchAllToWorker,
   ensureEmailRouting,
   ensureTxtRecord,
   ForeignMxError,
 } from "../lib/cfapi";
-import { REFRESH_SKEW_SECS, resolveAccessToken } from "../lib/cfoauth";
+import {
+  CF_OAUTH_START_PATH,
+  cfOauthConfigured,
+  constantTimeEqual,
+} from "../lib/cfoauth";
 import { randomString, sanitizeEmail, tokenUrlsafe } from "../lib/crypto";
 import { addDays, nowStr, toDate, toStr } from "../lib/dates";
 import type { Env } from "../lib/env";
@@ -63,6 +66,7 @@ import type {
   PublicDomainRow,
   UserRow,
 } from "../lib/rows";
+import { getSession, saveSession } from "../lib/session";
 import {
   csrfTokenField,
   generateCsrfToken,
@@ -75,6 +79,7 @@ import {
   type CurrentUserCtx,
   flash,
   renderErrorPage,
+  safeDiagnostic,
   webRender,
 } from "../lib/web/render";
 import { urlFor } from "../lib/web/urls";
@@ -83,11 +88,6 @@ import {
   requireWebSudo,
   type WebEnv,
 } from "../lib/web/webauth";
-import {
-  type CfOauthPageStatus,
-  cfOauthPageStatus,
-  operatorAccountId,
-} from "./cloudflare-pages";
 
 export const webMailboxDomainPagesRoutes = new Hono<WebEnv>();
 
@@ -1837,107 +1837,472 @@ function domainCtx(cd: CustomDomainRow) {
 
 // ===========================================================================
 // One-click Cloudflare provisioning ("Auto-configure on Cloudflare"): the
-// dashboard-side port of scripts/provision-domain.mjs, run from route 7's
-// cf-provision form via src/lib/cfapi.ts.
+// dashboard-side port of scripts/provision-domain.mjs, reached from route 7's
+// cf-provision button -> the confirmation page (route 7b) -> either the
+// `cf-provision-confirmed` form or the OAuth hand-off, via src/lib/cfapi.ts.
+//
+// CREDENTIAL MODEL (rewritten 2026-07-26 — the operator's requirement was
+// "I don't want to store long-living tokens that let me change ppl's
+// domains"):
+//
+// 1. `token` — the operator set CF_API_TOKEN: the headless fallback. It is
+//    the OPERATOR's own credential, so no consent screen exists for it.
+// 2. `oauth` — no CF_API_TOKEN, but the operator registered an OAuth client
+//    AND pinned CF_ACCOUNT_ID: the click leads to Cloudflare, and the access
+//    token that comes back is spent inside that single request and revoked in
+//    a `finally` (src/web/cloudflare-pages.ts). NOTHING is persisted: there
+//    is no grant table, no refresh token, no connected-account state.
+// 3. `none` — neither. The button is not rendered and the POST branch behaves
+//    as an unknown form-name; the DNS page shows the manual instructions
+//    panel instead (which it also shows in cases 1 and 2, so there is ALWAYS
+//    a zero-credential route).
+//
+// BOTH credentialed modes go through the SAME confirmation page first (the
+// exact record diff, then one button) and the same guarded run — the preview
+// is a property of the feature, not of the OAuth hand-off.
+//
+// WHY `token` WINS when both are configured: Cloudflare Email Routing can
+// only deliver a zone's mail to a Worker in the SAME account (see
+// operatorAccountId), so an OAuth run can only ever succeed for a user who
+// can sign in to the account hosting this worker. On a multi-user instance
+// whose operator hosts members' zones, letting `oauth` supersede CF_API_TOKEN
+// would send every user to a consent screen that cannot help them while
+// hiding the credential that works. An operator who wants the one-shot flow
+// simply does not set CF_API_TOKEN.
 // ===========================================================================
 
 /**
- * Feature gate. EITHER credential enables the action (see
- * cfProvisionCredential for the preference order):
- * - the acting user's Cloudflare OAuth grant (src/lib/cfoauth.ts), or
- * - the operator-wide static API token (wrangler secret CF_API_TOKEN; ""
- *   counts as unset like the other presence-based vars, src/lib/env.ts).
- * With neither, the button is not rendered and the POST branch behaves as an
- * unknown form-name.
- *
- * A grant that exists but currently yields no access token (refresh failed)
- * still counts as available: the click then reports precisely what is wrong
- * instead of the button silently disappearing — and the panel says so up
- * front when the row itself already proves it (CfOauthPageStatus
- * `needs_reconnect`: expired with no refresh token).
+ * Per-user budget for a provisioning run: each one spends up to ~10
+ * authenticated Cloudflare API calls (of the user's own quota under the
+ * one-shot OAuth path, of the operator's under CF_API_TOKEN). Exported
+ * because the OAuth hand-off enforces the SAME budget — checked before the
+ * redirect to Cloudflare, checked and spent in the callback before the code
+ * is redeemed (src/web/cloudflare-pages.ts).
  */
-function cfProvisionAvailableWith(
-  envx: EnvX,
-  oauth: CfOauthPageStatus | null,
-): boolean {
-  return !!oauth?.connected || (envx.CF_API_TOKEN ?? "") !== "";
+export const CF_PROVISION_LIMITS = "3/minute;20/hour";
+
+/**
+ * Cloudflare's OWN "Onboard Domain" wizard for Email Routing — the genuinely
+ * zero-credential path: it shows the records it is about to add and writes
+ * them itself, inside the user's dashboard session. Verified 2026-07-26:
+ * Cloudflare dashboard deep links cannot carry record values (every route in
+ * the documented dash-routes list is a bare path), so this can only open the
+ * right screen; it does not cover the catch-all-to-worker rule nor our
+ * sl-verification / _dmarc TXT records, which the manual panel lists.
+ */
+const CF_EMAIL_ROUTING_WIZARD_URL =
+  "https://dash.cloudflare.com/?to=/:account/email-service/routing";
+
+/**
+ * The Cloudflare account that hosts CF_WORKER_NAME, or null when the
+ * operator did not pin one. Email Routing can only send a zone's mail to a
+ * Worker in the SAME account, so a zone outside this account can never
+ * complete a provisioning run (src/lib/env.ts CF_ACCOUNT_ID).
+ */
+function operatorAccountId(env: EnvX): string | null {
+  return (env.CF_ACCOUNT_ID ?? "").trim() || null;
 }
 
-/** Same predicate for callers that have not fetched the OAuth status. */
-async function cfProvisionAvailable(
-  envx: EnvX,
-  userId: number,
-): Promise<boolean> {
-  // the static token short-circuits the D1 read
-  if ((envx.CF_API_TOKEN ?? "") !== "") return true;
-  return cfProvisionAvailableWith(envx, await cfOauthPageStatus(envx, userId));
+/** Which credential the auto-configure action runs under (see the header). */
+type CfProvisionMode = "oauth" | "token" | "none";
+
+/**
+ * Precedence: CF_API_TOKEN first (see the header), then the one-shot
+ * authorization — and that one ONLY when CF_ACCOUNT_ID is pinned.
+ *
+ * CF_ACCOUNT_ID is a HARD PREREQUISITE for route A, not a nicety. The
+ * delegated token belongs to whatever account the user signs in with, so
+ * `findZone` normally succeeds on a zone that can never be finished: the
+ * Email-Routing enable would write and LOCK Cloudflare's MX set, and the
+ * catch-all PUT would then fail because the worker lives in another account,
+ * leaving the zone advertising Cloudflare MX with nothing behind them
+ * (inbound mail rejected) on every retry. Without a pinned account the
+ * per-zone guard in runCfProvision cannot fire (it has nothing to compare
+ * against), so the offer itself is withdrawn instead.
+ *
+ * The OAuth hand-off in src/web/cloudflare-pages.ts enforces the same thing
+ * through cfProvisionGate(…, "oauth").
+ */
+function cfProvisionMode(envx: EnvX): CfProvisionMode {
+  if ((envx.CF_API_TOKEN ?? "") !== "") return "token";
+  if (!cfOauthConfigured(envx)) return "none";
+  if (operatorAccountId(envx) === null) {
+    console.error(
+      "cf-provision: CF_OAUTH_CLIENT_ID/SECRET are set but CF_ACCOUNT_ID is " +
+        "not — the one-shot authorization is disabled, because a zone " +
+        "outside the worker's account cannot be provisioned and the account " +
+        "guard has nothing to compare against (docs/DOMAINS.md §3.1)",
+    );
+    return "none";
+  }
+  return "oauth";
 }
 
 /**
- * Which Cloudflare credential the provision action runs under, in preference
- * order:
- *
- * 1. the ACTING USER's OAuth grant — delegated, revocable by them from the
- *    Cloudflare dashboard, and limited to the account they connected;
- * 2. the operator-wide static CF_API_TOKEN.
- *
- * A grant that exists but yields NO token right now ("stale-grant") is a
- * refusal, NOT a silent downgrade: falling back would run the whole thing
- * under the operator's account-wide credential — the one that can "prove"
- * ownership of any zone it can edit — while both the panel and the DNS page
- * tell the user their delegated access is what is in use, and while a user
- * could force that downgrade at will by revoking the app at Cloudflare.
- *
- * The OAuth access token is resolved ONCE and then held for the run, and
- * re-resolved only when it actually enters the 60 s refresh skew window
- * (CfTokenProvider is called before every one of the ~10 API calls, and each
- * resolution otherwise costs a D1 read plus two AES-GCM decrypts — and, for
- * a short-lived token, a POST to the token endpoint plus a D1 write). A
- * token that ages out mid-run is therefore still replaced transparently.
- * It deliberately does NOT fall back to CF_API_TOKEN mid-run either —
- * switching identity halfway would finish writing to the zone under an
- * authorization the user never granted. A grant that dies mid-run surfaces
- * as a CfApiError 401, which handleCfProvision turns into the reconnect
- * flash.
+ * The credential a run executes with. Always a concrete token that the
+ * CALLER obtained: this module never resolves, stores or refreshes one.
+ * `source` only changes the wording of authorization-failure flashes (a user
+ * can fix their own delegated authorization; they cannot fix the operator's
+ * token).
  */
-type CfCredentialChoice =
-  | { source: "oauth"; provider: CfTokenProvider }
-  | { source: "token"; token: string }
-  /** grant row exists but produces no token: refuse, never downgrade */
-  | { source: "stale-grant" }
-  | { source: "none" };
+type CfProvisionCredential = {
+  source: "oauth" | "token";
+  token: string;
+};
 
-async function cfProvisionCredential(
-  envx: EnvX,
+/** Where every branch of a provisioning run lands. */
+export function cfProvisionDnsPath(customDomainId: number): string {
+  return urlFor("dashboard.domain_detail_dns", {
+    custom_domain_id: customDomainId,
+  });
+}
+
+/**
+ * The confirmation page (GET). A deviation route with no Flask counterpart,
+ * so — like /dashboard/cloudflare/{start,callback} — it is a constant here
+ * rather than an entry in the urlFor inventory (src/lib/web/urls.ts, which is
+ * the Flask endpoint map).
+ */
+function cfProvisionConfirmPath(customDomainId: number): string {
+  return `/dashboard/domains/${customDomainId}/cf-confirm`;
+}
+
+/** The owned custom_domain row, or null. Used by the OAuth callback, which
+ *  has no `custom_domain_id` route param and must re-check ownership after
+ *  the round trip to Cloudflare. */
+export async function loadOwnedCustomDomain(
+  db: D1Database,
   userId: number,
-): Promise<CfCredentialChoice> {
-  const status = await cfOauthPageStatus(envx, userId);
-  if (status.connected) {
-    const first = await resolveAccessToken(envx, userId);
-    if (!first) return { source: "stale-grant" };
-    let cached = first;
+  customDomainId: number,
+): Promise<CustomDomainRow | null> {
+  const cd = await getCustomDomainById(db, customDomainId);
+  return cd && cd.user_id === userId ? cd : null;
+}
+
+/**
+ * Lazily mint the ownership TXT token (route 7 does this on every GET/POST;
+ * the OAuth callback reaches a row without going through that route, and
+ * would otherwise plant "sl-verification=null").
+ */
+async function ensureOwnershipToken(
+  db: D1Database,
+  cd: CustomDomainRow,
+): Promise<CustomDomainRow> {
+  if (cd.ownership_verified || cd.ownership_txt_token) return cd;
+  const token = randomString(30);
+  await db
+    .prepare(
+      "UPDATE custom_domain SET ownership_txt_token = ?1, updated_at = ?2 WHERE id = ?3",
+    )
+    .bind(token, nowStr(), cd.id)
+    .run();
+  return { ...cd, ownership_txt_token: token };
+}
+
+/**
+ * THE SINGLE SOURCE OF TRUTH for "what will this run change?". The
+ * confirmation page renders it and runCfProvision writes from it, so the
+ * preview cannot drift from the writes — a value shown to the user is
+ * literally the value sent to Cloudflare.
+ *
+ * `mx` / `spf` are NOT written by us: they are what Cloudflare creates AND
+ * LOCKS when Email Routing is enabled for the name. They are in the plan
+ * because the user must be told that enabling routing rewrites their MX set
+ * (and because the manual panel needs the same table).
+ */
+interface CfProvisionPlan {
+  domain: string;
+  worker: string;
+  /** null once ownership is verified: the run then skips this record. */
+  ownership: { type: "TXT"; name: string; value: string } | null;
+  dmarc: { type: "TXT"; name: string; value: string };
+  /** created + locked by Cloudflare's Email Routing enable, not by us */
+  mx: Array<{ priority: number; target: string }>;
+  spf: { type: "TXT"; name: string; value: string };
+  wizard_url: string;
+}
+
+function cfProvisionPlan(envx: EnvX, cd: CustomDomainRow): CfProvisionPlan {
+  return {
+    domain: cd.domain,
+    worker: envx.CF_WORKER_NAME || "simplelogin",
+    ownership: cd.ownership_verified
+      ? null
+      : {
+          type: "TXT",
+          name: cd.domain,
+          value: `sl-verification=${cd.ownership_txt_token ?? ""}`,
+        },
+    dmarc: { type: "TXT", name: `_dmarc.${cd.domain}`, value: DMARC_RECORD },
+    mx: expectedMxRecords(envx).map((r) => ({
+      priority: r.priority,
+      target: r.recommended,
+    })),
+    spf: {
+      type: "TXT",
+      name: cd.domain,
+      value: `v=spf1 include:${SPF_INCLUDE_DOMAIN} ~all`,
+    },
+    wizard_url: CF_EMAIL_ROUTING_WIZARD_URL,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The one-time CONFIRM TOKEN: what binds a run to the diff the user read
+// ---------------------------------------------------------------------------
+
+/**
+ * Session slot holding the single pending confirmation. The confirmation page
+ * MINTS one every time it renders; the two hand-off endpoints (POST
+ * /dashboard/cloudflare/start for `oauth`, the `cf-provision-confirmed`
+ * branch of route 7 for `token`) CONSUME it.
+ *
+ * Why: without it the link between "the records you were shown" and "the run
+ * that happens" is UI-only. The hand-off used to trust a `custom_domain_id`
+ * posted by the client, so a page could render the diff for domain A and
+ * submit B, and anything holding the (session-wide, form-agnostic) CSRF token
+ * could start a run without the diff ever being rendered — precisely the
+ * review step this feature exists to add. Now the target domain comes out of
+ * the session slot, and the recorded plan hash makes a run refuse if what
+ * would be written no longer matches what was displayed.
+ *
+ * Single slot, like the pending OAuth attempt: opening the confirmation page
+ * for a second domain invalidates the first tab's button (it asks the user to
+ * review again) rather than keeping unbounded per-session state.
+ */
+const CF_CONFIRM_SESSION_KEY = "cf_confirm";
+
+/** A confirmation older than this must be re-read before it can be used. */
+const CF_CONFIRM_TTL_SECS = 900;
+
+interface CfConfirmSlot {
+  /** opaque one-time value, echoed by the form */
+  nonce: string;
+  /** the custom_domain row whose diff was rendered */
+  domainId: number;
+  /** hash of the plan as displayed (see cfPlanHash) */
+  planHash: string;
+  /** unix seconds, for the TTL check */
+  at: number;
+}
+
+/**
+ * Hash of everything the confirmation page showed. Compared at hand-off time
+ * so a plan that changed underneath the user (ownership got verified in
+ * another tab, the operator changed EMAIL_SERVERS_WITH_PRIORITY, …) sends
+ * them back to a freshly rendered diff instead of writing records they never
+ * saw.
+ */
+async function cfPlanHash(plan: CfProvisionPlan): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(plan)),
+  );
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Mint the confirm token for a rendered diff. Reads and writes the session
+ * FRESH from KV (never the middleware's snapshot — saving a stale snapshot
+ * would clobber flashes queued earlier in the same request; same reason
+ * generateCsrfToken is called without it).
+ */
+async function mintCfConfirm(
+  c: C,
+  cd: CustomDomainRow,
+  plan: CfProvisionPlan,
+): Promise<string> {
+  const nonce = tokenUrlsafe(32);
+  const session = (await getSession(c)) ?? {};
+  session.extra = {
+    ...session.extra,
+    [CF_CONFIRM_SESSION_KEY]: {
+      nonce,
+      domainId: cd.id,
+      planHash: await cfPlanHash(plan),
+      at: Math.floor(Date.now() / 1000),
+    } satisfies CfConfirmSlot,
+  };
+  await saveSession(c, session);
+  return nonce;
+}
+
+function readCfConfirm(
+  extra: Record<string, unknown> | undefined,
+): CfConfirmSlot | null {
+  const raw = extra?.[CF_CONFIRM_SESSION_KEY] as
+    | Partial<CfConfirmSlot>
+    | undefined;
+  if (
+    !raw ||
+    typeof raw.nonce !== "string" ||
+    typeof raw.domainId !== "number" ||
+    typeof raw.planHash !== "string" ||
+    typeof raw.at !== "number"
+  ) {
+    return null;
+  }
+  return {
+    nonce: raw.nonce,
+    domainId: raw.domainId,
+    planHash: raw.planHash,
+    at: raw.at,
+  };
+}
+
+/**
+ * Consume the confirm token. Returns the slot only for a nonce that matches
+ * (constant time) and has not expired; the slot is deleted BEFORE anything
+ * else happens, so a double-submitted form cannot start two runs.
+ *
+ * A NON-matching nonce consumes nothing — same trade as the OAuth `state`: a
+ * stray or forged POST must not be able to cancel the confirmation another
+ * tab is holding.
+ *
+ * The delete is applied to a FRESH read of the session and mirrored into the
+ * request's snapshot, so a later `saveSession` in this request cannot
+ * resurrect the slot.
+ */
+async function consumeCfConfirm(
+  c: C,
+  nonce: string | null,
+): Promise<CfConfirmSlot | null> {
+  if (!nonce) return null;
+  const session = (await getSession(c)) ?? {};
+  const slot = readCfConfirm(session.extra);
+  if (!slot || !constantTimeEqual(slot.nonce, nonce)) return null;
+  if (session.extra) delete session.extra[CF_CONFIRM_SESSION_KEY];
+  const snapshot = c.get("webSession");
+  if (snapshot?.extra) delete snapshot.extra[CF_CONFIRM_SESSION_KEY];
+  await saveSession(c, session);
+  if (Math.floor(Date.now() / 1000) - slot.at > CF_CONFIRM_TTL_SECS) {
+    return null;
+  }
+  return slot;
+}
+
+/**
+ * The gate EVERY entry point passes BEFORE anyone is asked to authorize
+ * anything: the credential-mode check, the SL-subdomain check and the
+ * string-level deployment-domain collision. Returns the redirect to send
+ * back, or the resolved (never "none") mode to proceed under. `want` pins the
+ * mode a caller can serve — the OAuth hand-off passes "oauth", so it refuses
+ * on an instance where CF_API_TOKEN now takes precedence.
+ *
+ * It exists because the checks used to live only in route 7's form branch,
+ * while POST /dashboard/cloudflare/start (the second entry point) checked
+ * ownership alone — so a hand-crafted POST, or a collision that appeared
+ * after the diff was rendered, could send a user through Cloudflare's consent
+ * screen, mint a token and spend a rate-limit unit for a run that
+ * runCfProvision was always going to refuse. Nothing was ever written (the
+ * guards inside the run still hold), but "a hopeless run never asks anyone
+ * for an authorization" is the property being restored here.
+ */
+async function cfProvisionGate(
+  c: C,
+  cd: CustomDomainRow,
+  want?: Exclude<CfProvisionMode, "none">,
+): Promise<Response | Exclude<CfProvisionMode, "none">> {
+  const envx = c.env as EnvX;
+  const back = () => c.redirect(cfProvisionDnsPath(cd.id), 302);
+  if (cd.is_sl_subdomain) {
+    // Born provisioned on a deployment public domain: there is nothing to
+    // configure, and the run would aim at the operator's own zone.
+    await flash(
+      c,
+      `Auto-configuration is not available for ${cd.domain}: SimpleLogin ` +
+        "subdomains are already set up on this instance's own domain",
+      "warning",
+    );
+    return back();
+  }
+  const mode = cfProvisionMode(envx);
+  if (mode === "none" || (want !== undefined && mode !== want)) {
+    await flash(
+      c,
+      mode === "none"
+        ? "Auto-configuration is not available on this instance: it holds " +
+            "no Cloudflare credentials. The records are listed below — you " +
+            "can add them yourself"
+        : "The way this instance configures Cloudflare changed while you " +
+            "were on that page. Nothing was changed — please start again " +
+            "from this page",
+      "error",
+    );
+    return back();
+  }
+  const collision = cfProvisionCollision(
+    await deploymentMailDomains(c.env.DB, envx),
+    cd.domain,
+  );
+  if (collision) {
+    await flash(
+      c,
+      `Auto-configuration is not available for ${cd.domain}: it overlaps ` +
+        `with this SimpleLogin deployment's own domain ${collision}. ` +
+        "Please set up the DNS records manually.",
+      "error",
+    );
+    return back();
+  }
+  return mode;
+}
+
+/**
+ * Turn a submitted confirm nonce into the row the run may configure, or into
+ * the refusal to send back. THE ONLY WAY a run starts: both hand-off
+ * endpoints (POST /dashboard/cloudflare/start and route 7's
+ * `cf-provision-confirmed`) go through this, so neither can act on a domain
+ * id chosen by the client, run twice off one confirmation, or run a plan that
+ * differs from the one that was displayed.
+ */
+export async function takeCfConfirmation(
+  c: C,
+  nonce: string | null,
+  want: Exclude<CfProvisionMode, "none">,
+  expectDomainId?: number,
+): Promise<{ cd: CustomDomainRow } | { refusal: Response }> {
+  const user = c.get("webUser");
+  const confirmed = await consumeCfConfirm(c, nonce);
+  const domainId = confirmed?.domainId;
+  const cd =
+    domainId !== undefined && (expectDomainId ?? domainId) === domainId
+      ? await loadOwnedCustomDomain(c.env.DB, user.id, domainId)
+      : null;
+  if (!confirmed || !cd) {
+    await flash(
+      c,
+      "That confirmation is no longer valid (it was already used, it " +
+        "expired, it was for another domain, or it was started in another " +
+        "browser session). Nothing was changed — please review the changes " +
+        "again",
+      "warning",
+    );
     return {
-      source: "oauth",
-      provider: async () => {
-        const staleAtMs =
-          cached.expiresAtMs === null
-            ? Number.POSITIVE_INFINITY
-            : cached.expiresAtMs - REFRESH_SKEW_SECS * 1000;
-        if (Date.now() < staleAtMs) return cached.token;
-        const fresh = await resolveAccessToken(envx, userId);
-        if (!fresh) {
-          throw new CfApiError(
-            "the Cloudflare OAuth grant is no longer usable",
-            401,
-          );
-        }
-        cached = fresh;
-        return fresh.token;
-      },
+      refusal: c.redirect(
+        expectDomainId === undefined
+          ? urlFor("dashboard.custom_domain")
+          : cfProvisionConfirmPath(expectDomainId),
+        302,
+      ),
     };
   }
-  const token = envx.CF_API_TOKEN ?? "";
-  return token !== "" ? { source: "token", token } : { source: "none" };
+  const gate = await cfProvisionGate(c, cd, want);
+  if (gate instanceof Response) return { refusal: gate };
+  const current = await cfPlanHash(cfProvisionPlan(c.env as EnvX, cd));
+  if (current !== confirmed.planHash) {
+    await flash(
+      c,
+      `What would be changed for ${cd.domain} is no longer what you were ` +
+        "shown. Nothing was changed — please review the current list and " +
+        "confirm again",
+      "warning",
+    );
+    return { refusal: c.redirect(cfProvisionConfirmPath(cd.id), 302) };
+  }
+  return { cd };
 }
 
 /**
@@ -1950,9 +2315,11 @@ async function cfProvisionCredential(
  * there (most plausibly the deployment's own zones) could hijack its mail
  * that way. Registration is closed on this deployment, but the code must not
  * assume that forever — and CF_API_TOKEN should additionally be zone-scoped
- * to only the zones the operator intends for SimpleLogin. A per-user OAuth
- * grant narrows the blast radius to the account that user connected, but
- * these guards apply to BOTH credentials (one code path). Two layers:
+ * to only the zones the operator intends for SimpleLogin. A one-shot OAuth
+ * authorization narrows the blast radius to the account the user just
+ * approved, but these guards apply to BOTH credentials (one code path, one
+ * gauntlet — runCfProvision is the only place that talks to CfClient). Two
+ * layers:
  *
  * 1. cfProvisionCollision (string-level, before any API call): refuse when
  *    the domain equals, is a subdomain of, or is a PARENT of any deployment
@@ -2018,39 +2385,82 @@ function cfProvisionZoneCollision(
 }
 
 /**
- * POST cf-provision: perform scripts/provision-domain.mjs server-side (zone
- * lookup -> read-only conflict preflight -> Email Routing -> catch-all ->
- * ownership TXT -> DMARC), then re-run the page's ownership/MX/SPF/DMARC
- * checks in-process, persisting the flags exactly like the manual check
- * buttons (success only — a failed re-check never clears a flag). Every
- * step is check-before-write (safe to re-click), every refusal condition
- * (foreign catch-all, foreign MX, deployment-zone collision) is evaluated
- * BEFORE the first write, and the final flash reports done/skipped per step
- * plus the two manual leftovers: Email Sending onboarding (no public write
- * API as of 2026-07-26) and destination-address verification
- * (docs/DOMAINS.md §1.4/§1.6).
+ * Perform scripts/provision-domain.mjs server-side (zone lookup -> read-only
+ * conflict preflight -> Email Routing -> catch-all -> ownership TXT ->
+ * DMARC), then re-run the page's ownership/MX/SPF/DMARC checks in-process,
+ * persisting the flags exactly like the manual check buttons (success only —
+ * a failed re-check never clears a flag). Every step is check-before-write
+ * (safe to re-run), every refusal condition (foreign catch-all, foreign MX,
+ * deployment-zone collision) is evaluated BEFORE the first write, and the
+ * final flash reports done/skipped per step plus the two manual leftovers:
+ * Email Sending onboarding (no public write API as of 2026-07-26) and
+ * destination-address verification (docs/DOMAINS.md §1.4/§1.6).
  *
- * Runs under the acting user's Cloudflare OAuth grant when they have one,
- * else the operator's CF_API_TOKEN (cfProvisionCredential) — and refuses
- * outright, rather than downgrading to CF_API_TOKEN, when a grant exists but
- * is no longer usable. The credential choice changes NOTHING else: both go
- * through the very same gauntlet (deployment-domain collision, zone-boundary
- * collision, worker-account check, read-only catch-all + foreign-MX
- * preflight before the first write, rate limit) — there is exactly one
- * provisioning code path.
+ * THE ONLY PROVISIONING PATH. Both entry points — route 7's
+ * `cf-provision-confirmed` form under the operator's CF_API_TOKEN, and the
+ * one-shot OAuth callback in src/web/cloudflare-pages.ts — call exactly this
+ * function with an already resolved token, and both got there through the
+ * confirmation page (takeCfConfirmation), so they run the identical gauntlet:
+ * SL-subdomain and pinned-account checks, deployment-domain collision,
+ * zone-boundary collision, worker-account check, read-only catch-all +
+ * foreign-MX preflight before the first write (with the 401/403 re-throw),
+ * and the same `web_cf_provision` rate limit spent by the caller before it
+ * gets here. The credential's `source` changes NOTHING except the wording of
+ * an authorization failure and of "no zone found".
+ *
+ * The RECORDS IT WRITES come from cfProvisionPlan — the same object the
+ * confirmation page rendered — so a user cannot be shown one value and have
+ * another one written.
  *
  * Flashes never include zone names/ids, tokens or raw Cloudflare API error
  * text (request paths contain zone ids; error bodies contain token-scope
  * details) — full errors go to console.error for the operator.
  */
-async function handleCfProvision(c: C, cd: CustomDomainRow): Promise<Response> {
+export async function runCfProvision(
+  c: C,
+  domain: CustomDomainRow,
+  credential: CfProvisionCredential,
+): Promise<Response> {
   const db = c.env.DB;
   const envx = c.env as EnvX;
-  const back = () =>
-    c.redirect(
-      urlFor("dashboard.domain_detail_dns", { custom_domain_id: cd.id }),
-      302,
+  const cd = await ensureOwnershipToken(db, domain);
+  const plan = cfProvisionPlan(envx, cd);
+  const back = () => c.redirect(cfProvisionDnsPath(cd.id), 302);
+
+  // 0a. The gates the entry points also apply, re-applied here because this
+  // is the single gauntlet every path funnels through (the callers refuse
+  // earlier only so a hopeless run never asks for an authorization).
+  if (cd.is_sl_subdomain) {
+    await flash(
+      c,
+      `Auto-configuration is not available for ${cd.domain}: SimpleLogin ` +
+        "subdomains are already set up on this instance's own domain",
+      "warning",
     );
+    return back();
+  }
+  // 0b. A delegated authorization belongs to whatever account the user signed
+  // in with, and Email Routing can only deliver to a Worker in the SAME
+  // account — without a pinned CF_ACCOUNT_ID the per-zone guard below cannot
+  // fire, so the run could enable (and LOCK) Cloudflare MX on a zone whose
+  // catch-all PUT is then guaranteed to fail. cfProvisionMode() already
+  // withholds the offer in that configuration; this is the backstop.
+  if (credential.source === "oauth" && operatorAccountId(envx) === null) {
+    console.error(
+      "cf-provision: refusing a delegated run because CF_ACCOUNT_ID is not " +
+        "set (docs/DOMAINS.md §3.1)",
+    );
+    await flash(
+      c,
+      "Auto-configuration through your own Cloudflare account is not " +
+        "correctly configured on this instance (the operator has not pinned " +
+        "the Cloudflare account that hosts the mail worker). Nothing was " +
+        "changed — the records are listed below, and you can add them " +
+        "yourself",
+      "error",
+    );
+    return back();
+  }
 
   const deployment = await deploymentMailDomains(db, envx);
   const collision = cfProvisionCollision(deployment, cd.domain);
@@ -2065,43 +2475,8 @@ async function handleCfProvision(c: C, cd: CustomDomainRow): Promise<Response> {
     return back();
   }
 
-  // Credential: the user's OAuth grant first, then the operator's token.
-  const credential = await cfProvisionCredential(envx, c.get("webUser").id);
-  if (credential.source === "none") {
-    // Only reachable when the grant went away between the page render (or
-    // the gate check) and this POST.
-    await flash(
-      c,
-      "Auto-configuration is not available right now: this SimpleLogin " +
-        "instance has no usable Cloudflare credential. Connect your " +
-        "Cloudflare account again, or ask the operator to configure one",
-      "error",
-    );
-    return back();
-  }
-  if (credential.source === "stale-grant") {
-    // A grant exists but produced no access token (refresh failed, or the
-    // authorization was revoked at Cloudflare). We do NOT quietly continue
-    // under the operator's account-wide CF_API_TOKEN: the pages say the
-    // delegated access is what runs, and a user must not be able to trade
-    // down to the operator's credential by revoking us at Cloudflare.
-    // Wording note: getValidAccessToken has usually just DELETED the dead
-    // row, so there is no Disconnect button left to press — never tell the
-    // user to "disconnect and reconnect", only to connect again.
-    await flash(
-      c,
-      "Your connected Cloudflare account could not be used (the " +
-        "authorization expired or was revoked at Cloudflare), so nothing " +
-        "was changed. Please connect your Cloudflare account again, then " +
-        "retry",
-      "error",
-    );
-    return back();
-  }
-  const client = new CfClient(
-    credential.source === "oauth" ? credential.provider : credential.token,
-  );
-  const worker = envx.CF_WORKER_NAME || "simplelogin";
+  const client = new CfClient(credential.token);
+  const worker = plan.worker;
   const done: string[] = [];
 
   try {
@@ -2109,16 +2484,26 @@ async function handleCfProvision(c: C, cd: CustomDomainRow): Promise<Response> {
     const zone = await client.findZone(cd.domain);
     if (!zone) {
       // The lookup ran against whichever account the CREDENTIAL belongs to,
-      // so name that one: under a grant it is the user's own connected
-      // account (which they can fix themselves), under CF_API_TOKEN the
-      // operator's (which they cannot).
+      // so name that one: under the one-shot authorization it is the account
+      // the user just approved, under CF_API_TOKEN the operator's.
+      //
+      // The delegated wording must NOT say "add the domain to that account":
+      // cross-account provisioning is impossible (Email Routing delivers only
+      // to a Worker in the same account), so following that advice would put
+      // the zone in the wrong place and either hit the CF_ACCOUNT_ID refusal
+      // or half-provision it. The account to sign in with is the one that
+      // hosts this instance's mail worker.
       await flash(
         c,
         credential.source === "oauth"
           ? `No zone for ${cd.domain} was found in the Cloudflare account ` +
-              "you connected. Add the domain to that Cloudflare account " +
-              "first (Account Home > Add a domain), then retry — or connect " +
-              "the Cloudflare account that holds this domain's zone"
+              "you authorized. This only works when you authorize the " +
+              "Cloudflare account that hosts this instance's mail worker — " +
+              "Email Routing can only deliver a zone's mail to a worker in " +
+              "the same account — so the zone has to live in that account, " +
+              "and you have to sign in to it. Start again and pick that " +
+              "account (switch accounts at Cloudflare first if you were " +
+              "signed in to another one), or set up the DNS records manually"
           : `No zone for ${cd.domain} was found in the operator's Cloudflare ` +
               "account. Add the domain to that Cloudflare account first " +
               "(Account Home > Add a domain), then retry",
@@ -2249,16 +2634,17 @@ async function handleCfProvision(c: C, cd: CustomDomainRow): Promise<Response> {
       return back();
     }
 
-    // 4. ownership TXT — plants the EXACT record the page displays and the
-    // check-ownership branch expects (sl-verification=<token>)
-    if (cd.ownership_verified) {
+    // 4. ownership TXT — plants the EXACT record the confirmation page
+    // showed (plan.ownership, which is also what the page displays and the
+    // check-ownership branch expects: sl-verification=<token>)
+    if (plan.ownership === null) {
       done.push("ownership TXT skipped (already verified)");
     } else {
       const ownership = await ensureTxtRecord(
         client,
         zone.id,
-        cd.domain,
-        `sl-verification=${cd.ownership_txt_token}`,
+        plan.ownership.name,
+        plan.ownership.value,
         { comment: "SimpleLogin ownership verification (auto-configure)" },
       );
       done.push(
@@ -2273,8 +2659,8 @@ async function handleCfProvision(c: C, cd: CustomDomainRow): Promise<Response> {
     const dmarc = await ensureTxtRecord(
       client,
       zone.id,
-      `_dmarc.${cd.domain}`,
-      DMARC_RECORD,
+      plan.dmarc.name,
+      plan.dmarc.value,
       { skipIfAnyAtName: true, comment: "SimpleLogin (auto-configure)" },
     );
     done.push(
@@ -2289,22 +2675,32 @@ async function handleCfProvision(c: C, cd: CustomDomainRow): Promise<Response> {
     // plus what already succeeded — completed steps are persisted at
     // Cloudflare and every step is safe to re-run.
     console.error(`cf-provision failed for ${cd.domain}: ${e.message}`);
+    // Cloudflare's own error text goes into a flash, i.e. into a
+    // `toastr.error("…")` JS string: same sanitizer as the OAuth provider
+    // diagnostics (a trailing backslash there would escape the closing
+    // quote). Not attacker-reachable today — the only user-controlled value
+    // that reaches Cloudflare is the domain, and isValidDomain restricts it
+    // to [A-Za-z0-9-] labels — but the treatment must not depend on that.
     const reason =
-      e.errors
-        .map((x) => x.message)
-        .filter(Boolean)
-        .join("; ") || "request failed";
+      safeDiagnostic(
+        e.errors
+          .map((x) => x.message)
+          .filter(Boolean)
+          .join("; "),
+        240,
+      ) || "request failed";
     const steps =
       done.length > 0
         ? ` Steps completed before the error: ${done.join("; ")}.`
         : "";
-    // AUTHORIZATION failure under a delegated grant: distinct from any other
-    // API error, because the user can fix it themselves (reconnect) and
-    // because of a specific Cloudflare permission trap — GET/POST
-    // /zones/{id}/email/routing[/enable|/dns] is gated on ZONE SETTINGS, not
-    // on Email Routing Rules, so an OAuth client registered without the
-    // zone-settings scopes authorizes fine and then 403s exactly at the
-    // routing-enable step (docs/DOMAINS.md §3, "one-click provisioning").
+    // AUTHORIZATION failure under the delegated one-shot authorization:
+    // distinct from any other API error, because the user can fix it
+    // themselves (run it again) and because of a specific Cloudflare
+    // permission trap — GET/POST /zones/{id}/email/routing[/enable|/dns] is
+    // gated on ZONE SETTINGS, not on Email Routing Rules, so an OAuth client
+    // registered without the zone-settings scopes authorizes fine and then
+    // 403s exactly at the routing-enable step (docs/DOMAINS.md §3,
+    // "one-click provisioning").
     // No token, no zone name and no zone id appear here.
     if (
       credential.source === "oauth" &&
@@ -2313,10 +2709,10 @@ async function handleCfProvision(c: C, cd: CustomDomainRow): Promise<Response> {
       await flash(
         c,
         `Cloudflare refused the request for ${cd.domain} (${reason}): the ` +
-          "connected Cloudflare account's authorization is missing a " +
-          "permission or has expired. Please connect your Cloudflare " +
-          "account again, then retry. If it keeps failing at the same step, " +
-          "ask the operator to check the OAuth client's scopes — enabling " +
+          "authorization you just approved is missing a permission (or " +
+          "already ran out). Please authorize your Cloudflare account again, " +
+          "then retry. If it keeps failing at the same step, ask the " +
+          "operator to check the OAuth client's scopes — enabling " +
           "Email Routing is gated on Zone Settings (zone-settings.read and " +
           "zone-settings.write), NOT on Email Routing Rules, while the " +
           "catch-all rule needs email-routing-rule.read and " +
@@ -2474,11 +2870,22 @@ async function renderDnsPage(
   const token = await generateCsrfToken(c);
   const mx = expectedMxRecords(envx);
   // SL subdomains are born fully provisioned on a deployment public domain:
-  // neither the provisioning button nor the Cloudflare-account panel has any
+  // neither the provisioning button nor the manual Cloudflare panel has any
   // purpose there, so the whole card stays out of that page.
-  const cfOauth = cd.is_sl_subdomain
-    ? null
-    : await cfOauthPageStatus(envx, c.get("webUser").id);
+  const mode: CfProvisionMode = cd.is_sl_subdomain
+    ? "none"
+    : cfProvisionMode(envx);
+  const plan = cd.is_sl_subdomain ? null : cfProvisionPlan(envx, cd);
+  // ONE CLICK: the record table below the button already IS the diff, so the
+  // confirm token is minted here rather than on a separate confirmation page
+  // — the button hands off directly (to Cloudflare in `oauth` mode, or
+  // straight into the run in `token` mode). The token still binds {domain,
+  // planHash}, so a run can only ever apply the plan that was on screen; if
+  // the plan moved on since render, takeCfConfirmation bounces the user to a
+  // freshly rendered diff instead of writing something unseen. The standalone
+  // confirmation page remains reachable as that bounce target.
+  const cfNonce =
+    plan && mode !== "none" ? await mintCfConfirm(c, cd, plan) : null;
   return render(
     c,
     "dashboard-mailbox/domain_detail_dns.html",
@@ -2497,17 +2904,86 @@ async function renderDnsPage(
         recommended: `${prefix}.${envx.EMAIL_DOMAIN}`,
       })),
       dmarc_record: DMARC_RECORD,
-      // SL subdomains live on a deployment public domain (already fully
-      // provisioned + verified at creation) — never offer provisioning.
-      cf_provision_available:
-        !cd.is_sl_subdomain && cfProvisionAvailableWith(envx, cfOauth),
-      // connect/disconnect panel (templates/dashboard-mailbox/
-      // _cloudflare_connect.html); null/unconfigured renders nothing
-      cf_oauth: cfOauth,
+      // The auto-configure card: `cf_mode` picks the button (or none), while
+      // `cf_plan` feeds the MANUAL panel, which renders in every mode so
+      // there is always a route that needs no credential at all. Suppressed
+      // wholesale for SL subdomains (already provisioned + verified).
+      cf_mode: mode,
+      cf_plan: plan,
+      cf_nonce: cfNonce,
+      cf_start_url: CF_OAUTH_START_PATH,
+      // The DNS-page copy of the record table is the DO-IT-YOURSELF one:
+      // imperative verbs, no "created by us" (in `none` mode nothing here can
+      // create anything, and in the other modes the automated offer is the
+      // card above it).
+      cf_manual: true,
       ...state,
     },
   );
 }
+
+/**
+ * The confirmation page: the exact record diff, then ONE button. Rendered by
+ * a GET (POST/Redirect/GET — the button that leads here is a POST, and
+ * re-rendering this page must not trigger a form-resubmission interstitial
+ * when the user presses Back from Cloudflare's consent screen). Being
+ * linkable is not a risk: it is read-only apart from minting the one-time
+ * confirm token, and every state-changing thing on it still needs the page's
+ * CSRF token plus that nonce.
+ *
+ * Its values come from cfProvisionPlan, the same object runCfProvision writes
+ * from, and the nonce it mints binds the hand-off to THIS diff (see
+ * CF_CONFIRM_SESSION_KEY).
+ */
+async function renderCfConfirmPage(
+  c: C,
+  cd: CustomDomainRow,
+  mode: Exclude<CfProvisionMode, "none">,
+): Promise<Response> {
+  const envx = c.env as EnvX;
+  const plan = cfProvisionPlan(envx, cd);
+  const nonce = await mintCfConfirm(c, cd, plan);
+  const token = await generateCsrfToken(c);
+  return render(
+    c,
+    "dashboard-mailbox/cf_provision_confirm.html",
+    "custom_domain",
+    {
+      domain_detail_page: "dns",
+      custom_domain: domainCtx(cd),
+      csrf_form: csrfForm(token),
+      cf_plan: plan,
+      cf_manual: false,
+      cf_mode: mode,
+      cf_nonce: nonce,
+      // `oauth` hands off to the OAuth start endpoint; `token` posts the
+      // confirmed form straight back to the DNS page, where the operator's
+      // credential runs it.
+      cf_submit_url:
+        mode === "oauth" ? CF_OAUTH_START_PATH : cfProvisionDnsPath(cd.id),
+      cf_cancel_url: cfProvisionDnsPath(cd.id),
+    },
+  );
+}
+
+// ===========================================================================
+// Route 7b: GET /domains/:id/cf-confirm — the confirmation page
+// ===========================================================================
+
+webMailboxDomainPagesRoutes.get(
+  "/domains/:custom_domain_id{[0-9]+}/cf-confirm",
+  requireWebLogin,
+  async (c) => {
+    const loaded = await loadOwnedDomain(c);
+    if (loaded instanceof Response) return loaded;
+    // The ownership TXT value is part of the diff, so mint it here too — the
+    // page must show the token the run will plant, not "sl-verification=".
+    const cd = await ensureOwnershipToken(c.env.DB, loaded);
+    const gate = await cfProvisionGate(c, cd);
+    if (gate instanceof Response) return gate;
+    return renderCfConfirmPage(c, cd, gate);
+  },
+);
 
 webMailboxDomainPagesRoutes.on(
   ["GET", "POST"],
@@ -2521,16 +2997,7 @@ webMailboxDomainPagesRoutes.on(
     let cd = loaded;
 
     // GET/POST side effect: lazily generate the ownership token
-    if (!cd.ownership_verified && !cd.ownership_txt_token) {
-      const token = randomString(30);
-      await db
-        .prepare(
-          "UPDATE custom_domain SET ownership_txt_token = ?1, updated_at = ?2 WHERE id = ?3",
-        )
-        .bind(token, nowStr(), cd.id)
-        .run();
-      cd = { ...cd, ownership_txt_token: token };
-    }
+    cd = await ensureOwnershipToken(db, cd);
 
     const state = dnsStateDefaults();
 
@@ -2712,21 +3179,30 @@ webMailboxDomainPagesRoutes.on(
         state.dmarc_ok = false;
         state.dmarc_errors = txt;
       } else if (
-        formName === "cf-provision" &&
+        (formName === "cf-provision" ||
+          formName === "cf-provision-confirmed") &&
         !cd.is_sl_subdomain &&
-        (await cfProvisionAvailable(envx, c.get("webUser").id))
+        cfProvisionMode(envx) !== "none"
       ) {
-        // Feature-gated: with neither a connected Cloudflare account nor
-        // CF_API_TOKEN (or for SL-subdomain rows, which are born verified on
-        // a deployment public domain) this form-name is unknown and falls
-        // through to the GET render like the other unknown form-names.
-        // Rate-limited: each click spends up to ~9 authenticated Cloudflare
-        // API calls of the operator's account-wide quota (1200 req/5min) —
-        // same webLimiter idiom as web_alias_export in alias-pages.ts.
+        // Feature-gated: with neither an OAuth client nor CF_API_TOKEN (or
+        // for SL-subdomain rows, which are born verified on a deployment
+        // public domain) these form-names are unknown and fall through to the
+        // GET render like the other unknown form-names — the manual panel is
+        // then the whole offer.
+        //
+        // Rate-limited: each RUN spends up to ~10 authenticated Cloudflare
+        // API calls (1200 req/5min per account) — same webLimiter idiom as
+        // web_alias_export in alias-pages.ts. Reading the diff is FREE (the
+        // budget is only checked, never spent, on the way to the confirmation
+        // page — spending it on a page render would let a user lock
+        // themselves out by reading the diff three times); it is spent by
+        // whichever endpoint actually runs: here for `token`, in the OAuth
+        // callback right before the code is redeemed for `oauth`
+        // (src/web/cloudflare-pages.ts).
         const limiter = await webLimiter(
           c,
           "web_cf_provision",
-          "3/minute;20/hour",
+          CF_PROVISION_LIMITS,
         );
         if (limiter.exceeded) {
           return renderErrorPage(
@@ -2735,8 +3211,42 @@ webMailboxDomainPagesRoutes.on(
             await buildCurrentUser(c, c.get("webUser")),
           );
         }
+        const gate = await cfProvisionGate(c, cd);
+        if (gate instanceof Response) return gate;
+
+        if (formName === "cf-provision") {
+          // The button: never runs anything. POST/Redirect/GET to the
+          // confirmation page, which renders the diff and mints the one-time
+          // token that the run then requires — in BOTH modes, so "you see
+          // which entries it'll add and only then commit" is a property of
+          // the feature, not of the OAuth hand-off.
+          return c.redirect(cfProvisionConfirmPath(cd.id), 302);
+        }
+
+        // formName === "cf-provision-confirmed": the confirmed run under the
+        // operator's own credential. `oauth` never posts here (its button
+        // goes to /dashboard/cloudflare/start), so a stray post in that mode
+        // is refused rather than silently run under some other credential.
+        if (gate !== "token") {
+          await flash(
+            c,
+            "Nothing was changed — please review the changes again",
+            "warning",
+          );
+          return c.redirect(cfProvisionConfirmPath(cd.id), 302);
+        }
+        const taken = await takeCfConfirmation(
+          c,
+          field(fd, "cf_nonce"),
+          "token",
+          cd.id,
+        );
+        if ("refusal" in taken) return taken.refusal;
         await limiter.deduct();
-        return handleCfProvision(c, cd);
+        return runCfProvision(c, taken.cd, {
+          source: "token",
+          token: envx.CF_API_TOKEN ?? "",
+        });
       }
     }
     return renderDnsPage(c, cd, state);

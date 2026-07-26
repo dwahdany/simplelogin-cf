@@ -1,0 +1,122 @@
+{# Confirmation page for "Auto-configure on Cloudflare" (deviation from
+   upstream). Rendered by renderCfConfirmPage (src/web/mailbox-domain-pages.ts)
+   as a GET (POST/Redirect/GET — pressing Back from Cloudflare's consent screen
+   must not raise a form-resubmission interstitial on the page whose whole job
+   is to make the user feel in control). Everything it claims will change comes
+   from `cf_plan`, the same object the run then writes from. The only button
+   that leaves this page carries the page CSRF token plus `cf_nonce`, the
+   one-time token minted for THIS rendering — the run is bound to the diff
+   above, not to a domain id the client picks.
+
+   Both credentialed modes land here: `oauth` hands off to Cloudflare,
+   `token` posts straight back to the DNS page, where the operator's own
+   credential runs it. #}
+{% extends "dashboard-mailbox/domain_detail_base.html" %}
+{% block title %}Auto-configure {{ custom_domain.domain }}{% endblock %}
+{% block domain_detail_content %}
+  <div class="p-4 mr-auto" style="max-width: 60rem;">
+    <h1 class="h2">Auto-configure {{ custom_domain.domain }} on Cloudflare</h1>
+    <div class="mb-4">
+      Nothing has happened yet. This is everything that will change in
+      {% if cf_mode == "oauth" %}
+        your Cloudflare account
+      {% else %}
+        Cloudflare
+      {% endif %}
+      if you continue.
+    </div>
+    <div id="cf-plan" class="alert alert-primary">
+      <div class="font-weight-bold mb-2">What will change</div>
+      {% include "dashboard-mailbox/_cf_records.html" %}
+    </div>
+    {% if cf_mode == "oauth" %}
+      <div id="cf-authorization" class="alert alert-warning">
+        <div class="font-weight-bold mb-2">About the authorization</div>
+        <ul class="mb-0">
+          <li>
+            <b>Sign in to the Cloudflare account that hosts this instance's
+            mail worker.</b> Cloudflare Email Routing can only deliver a
+            zone's mail to a Worker in the <em>same</em> account, so
+            <em>{{ custom_domain.domain }}</em>'s zone has to live in that
+            account and you have to authorize with it. A different (for
+            example personal) Cloudflare account cannot complete this — the
+            run is refused before anything is written. Ask the operator which
+            account that is if you are not sure.
+          </li>
+          <li>
+            You will approve this on <b>Cloudflare's own consent screen</b>.
+            That screen has <b>no zone picker</b>: it authorizes the whole
+            Cloudflare account you sign in with, not just
+            <em>{{ custom_domain.domain }}</em>. We ask for the narrowest set of
+            permissions the steps above need (zone, zone settings, DNS and email
+            routing rules), but for the duration of this one run the
+            authorization is account-wide. That is a Cloudflare limitation, and
+            it is why the authorization is thrown away immediately.
+          </li>
+          <li>
+            <b>It is never stored.</b> The access token exists only inside the
+            request that comes back from Cloudflare; it is not written to our
+            database, and no part of it survives the run.
+          </li>
+          <li>
+            <b>It cannot be renewed.</b> We deliberately do not ask for offline
+            access, so Cloudflare issues no refresh token — the authorization
+            expires by itself within about an hour even if everything else goes
+            wrong.
+          </li>
+          <li>
+            <b>It is revoked as soon as the run finishes</b>, whether the run
+            succeeded or failed: the access token is handed back to
+            Cloudflare's revocation endpoint before you see the result.
+            Cloudflare may still list this app under Manage Account &gt;
+            Authorized apps — that entry is the record of your approval, not a
+            live key, and you can remove it there. Removing it changes nothing
+            here, because we store nothing.
+          </li>
+          <li>
+            Every run asks again. There is no "remember me" here by design.
+          </li>
+        </ul>
+      </div>
+    {% else %}
+      <div id="cf-authorization" class="alert alert-warning">
+        <div class="font-weight-bold mb-2">About the credentials</div>
+        <ul class="mb-0">
+          <li>
+            This runs with the <b>operator's own Cloudflare credentials</b>.
+            You are not asked to connect a Cloudflare account, and nothing of
+            yours is stored — but it only works for zones inside the
+            operator's Cloudflare account.
+          </li>
+          <li>
+            Safe to run again at any time: every step is checked before it is
+            written, so steps already done are skipped.
+          </li>
+        </ul>
+      </div>
+    {% endif %}
+    <form method="post" action="{{ cf_submit_url }}" class="d-inline">
+      {{ csrf_form.csrf_token }}
+      <input type="hidden" name="cf_nonce" value="{{ cf_nonce }}">
+      {% if cf_mode != "oauth" %}
+        <input type="hidden" name="form-name" value="cf-provision-confirmed">
+      {% endif %}
+      <button type="submit" class="btn btn-primary">
+        {% if cf_mode == "oauth" %}
+          Continue at Cloudflare
+        {% else %}
+          Make these changes
+        {% endif %}
+      </button>
+    </form>
+    <a href="{{ cf_cancel_url }}" class="btn btn-outline-secondary">Cancel</a>
+    <div class="small-text mt-4">
+      Prefer to do it yourself? The DNS page lists the same records with
+      copy-paste values — or use Cloudflare's own
+      <a href="{{ cf_plan.wizard_url }}" target="_blank" rel="noopener noreferrer">Email Routing onboarding wizard</a>,
+      which shows you the records it will add and writes them itself. It does
+      not cover the catch-all route or the TXT records above; add those in
+      Cloudflare's DNS and Email Routing screens.
+    </div>
+  </div>
+{% endblock %}

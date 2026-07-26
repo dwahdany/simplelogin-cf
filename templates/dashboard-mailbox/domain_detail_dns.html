@@ -5,69 +5,107 @@
     <h1 class="h2">{{ custom_domain.domain }}</h1>
     <div>Please follow the steps below to set up your domain.</div>
     <div class="small-text mb-5">DNS changes could take up to 24 hours to update.</div>
-    {# One-click provisioning (deviation from upstream): server-side port of
+    {# Cloudflare setup card (deviation from upstream): server-side port of
        scripts/provision-domain.mjs — see the cf-provision branch in
-       src/web/mailbox-domain-pages.ts. Rendered when EITHER credential can
-       exist: the user's own Cloudflare OAuth grant (preferred) or the
-       operator's static CF_API_TOKEN. The card also carries the
-       connect/disconnect panel, so a user whose operator registered an OAuth
-       client can get from "no credential" to "connected" without leaving the
-       page. #}
-    {% if cf_provision_available or (cf_oauth and cf_oauth.configured) %}
+       src/web/mailbox-domain-pages.ts. `cf_mode` picks the automated offer:
+         oauth — one-shot authorization; the button leads to the confirmation
+                 page (the record diff) and from there to Cloudflare. Nothing
+                 is stored and the authorization is revoked when the run ends.
+         token — the operator's own CF_API_TOKEN; the button runs it directly.
+         none  — no credential: the manual panel is the whole offer.
+       The MANUAL panel renders in every mode, so there is always a route that
+       needs no credential at all. Suppressed wholesale for SL subdomains
+       (`cf_plan` is null there — they are born provisioned + verified). #}
+    {% if cf_plan %}
       <div id="cf-provision-form" class="alert alert-primary">
-        <div class="font-weight-bold">Auto-configure on Cloudflare</div>
-        {% if cf_provision_available %}
+        <div class="font-weight-bold">
+          {% if cf_mode == "none" %}
+            Set it up in Cloudflare
+          {% else %}
+            Auto-configure on Cloudflare
+          {% endif %}
+        </div>
+        {% if cf_mode == "oauth" %}
           <div class="mb-2">
             This instance can set up the Cloudflare side for you: find the
-            domain's zone in the Cloudflare account, enable Email Routing,
-            point the <em>zone-wide</em> catch-all route at this worker,
-            create the ownership TXT and DMARC records, then re-run the
-            ownership, MX, SPF and DMARC checks below. Safe to click again
-            at any time — steps already done are skipped, and it refuses
-            (rather than modifies) any existing mail setup that points
-            somewhere else: foreign MX records, or a catch-all rule with
-            another destination (even a disabled one). Two manual steps remain
-            afterwards, both for the operator: Email Sending onboarding in the
-            Cloudflare dashboard, needed for replies sent <em>from</em> this
-            domain's aliases, and verifying your mailboxes as Email Routing
-            destination addresses — Cloudflare only delivers forwarded mail to
-            verified destinations.
+            domain's zone, enable Email Routing, point the <em>zone-wide</em>
+            catch-all route at the mail worker, create the ownership TXT and
+            DMARC records, then re-run the ownership, MX, SPF and DMARC checks
+            below. You will see the exact records first, and only then be sent
+            to Cloudflare to approve the change. The authorization Cloudflare
+            gives us is used for that single run, is never stored, cannot be
+            renewed, and is revoked the moment the run finishes. You have to
+            approve it with the Cloudflare account that hosts this instance's
+            mail worker — Email Routing only delivers to a Worker in the same
+            account, so this domain's zone must live there.
           </div>
-          <form method="post" action="#cf-provision-form">
+          <div class="mb-2 text-muted">
+            The exact records are listed below — clicking takes you straight
+            to Cloudflare's approval screen.
+          </div>
+          {# Posts straight to the hand-off: the record table further down IS
+             the diff, so there is no interstitial confirmation page. cf_nonce
+             binds this click to the plan that was rendered above. #}
+          <form method="post" action="{{ cf_start_url }}">
             {{ csrf_form.csrf_token }}
-            <input type="hidden" name="form-name" value="cf-provision">
+            <input type="hidden" name="cf_nonce" value="{{ cf_nonce }}">
             <button type="submit" class="btn btn-primary">Auto-configure on Cloudflare</button>
           </form>
-        {% else %}
+        {% elif cf_mode == "token" %}
           <div class="mb-2">
-            Connect your Cloudflare account below and this instance can set up
-            the Cloudflare side of this domain for you in one click: zone
-            lookup, Email Routing, the zone-wide catch-all route, and the
-            ownership TXT plus DMARC records.
+            This instance can set up the Cloudflare side for you with the
+            operator's own Cloudflare credentials — so it only works for zones
+            inside the operator's Cloudflare account: zone lookup, Email
+            Routing, the <em>zone-wide</em> catch-all route at the mail worker,
+            the ownership TXT and DMARC records, then the ownership, MX, SPF
+            and DMARC checks below. The exact records are listed below. Safe
+            to run again at any time — steps already done are skipped, and it
+            refuses (rather than modifies) any existing mail setup that points
+            somewhere else: foreign MX records, or a catch-all rule with
+            another destination, even a disabled one.
           </div>
+          {# Runs immediately under the operator's own credential; cf_nonce
+             binds the click to the plan rendered on this page. #}
+          <form method="post" action="#cf-provision-form">
+            {{ csrf_form.csrf_token }}
+            <input type="hidden" name="form-name" value="cf-provision-confirmed">
+            <input type="hidden" name="cf_nonce" value="{{ cf_nonce }}">
+            <button type="submit" class="btn btn-primary">Auto-configure on Cloudflare</button>
+          </form>
         {% endif %}
-        {% include "dashboard-mailbox/_cloudflare_connect.html" %}
-        {# Only where connecting an account is actually possible: with no
-           OAuth client registered there is no choice to describe (and no
-           Connect button on this page — the partial self-suppresses). #}
-        {% if cf_oauth and cf_oauth.configured %}
-          <div class="small-text">
-            {% if cf_oauth.connected and not cf_oauth.needs_reconnect %}
-              Auto-configuration runs with the delegated access of the
-              connected account above; if that authorization has expired or
-              been revoked it refuses to run rather than falling back.
-            {% elif cf_oauth.connected %}
-              The connected authorization can no longer be renewed, so
-              auto-configuration will refuse to run until you connect the
-              account again above.
+        <div id="cf-manual" class="mt-3">
+          <div class="font-weight-bold">
+            {% if cf_mode == "none" %}
+              Set it up yourself in Cloudflare
             {% else %}
-              With no Cloudflare account connected, auto-configuration falls back to
-              this instance's own Cloudflare credentials{% if not cf_provision_available %}, which this instance does not have{% endif %} —
-              those can only reach zones inside the operator's Cloudflare
-              account.
+              …or set it up yourself
             {% endif %}
           </div>
-        {% endif %}
+          <div class="mb-2">
+            {% if cf_mode == "none" %}
+              This instance holds no Cloudflare credentials, so it cannot make
+              these changes for you. Everything that has to be in place, in
+              full — add it in your own Cloudflare dashboard:
+            {% else %}
+              Everything the automated run would do, in full — you can add it
+              yourself instead:
+            {% endif %}
+          </div>
+          {% include "dashboard-mailbox/_cf_records.html" %}
+          <div class="mb-2">
+            Cloudflare's own
+            <a href="{{ cf_plan.wizard_url }}"
+               target="_blank"
+               rel="noopener noreferrer">Email Routing onboarding wizard</a>
+            does the Email Routing part for you — it shows the records it will
+            add and writes them itself, inside your own Cloudflare session, so
+            no third party ever needs access to your account. It does not
+            cover the catch-all route to the worker
+            <code>{{ cf_plan.worker }}</code> or the two TXT records above;
+            add those under Email Routing &gt; Routing rules and DNS &gt;
+            Records.
+          </div>
+        </div>
       </div>
     {% endif %}
     {% if not custom_domain.ownership_verified %}

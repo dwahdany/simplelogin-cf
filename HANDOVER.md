@@ -115,10 +115,11 @@ Cloudflare DKIM instead of Postfix; `ts_vector` search → LIKE approximation.
   lock, KV sessions, models (subscription-precedence premium logic),
   serializers, mailer seam. Werkzeug 405-vs-404 parity in `src/index.ts`.
 - **Schema**: `migrations/0001_init.sql` (50 tables) + `0002_rate_limit.sql` +
-  `0003_web_tables.sql` + `0004_cf_oauth.sql` (table `cf_oauth_token`, one
-  row per user, `ON DELETE CASCADE`). **0004 is not applied on the live D1
-  yet** — run `npx wrangler d1 migrations apply simplelogin --remote` before
-  the next deploy.
+  `0003_web_tables.sql` + `0004_cf_oauth.sql` (table `cf_oauth_token`) +
+  `0005_drop_cf_oauth.sql`, which **drops that table again**: Cloudflare
+  authorizations are one-shot now and nothing is stored (§4a). Run
+  `npx wrangler d1 migrations apply simplelogin --remote` before the next
+  deploy.
 
 ## 3. Working on this codebase
 
@@ -195,22 +196,49 @@ Cloudflare DKIM instead of Postfix; `ts_vector` search → LIKE approximation.
   runbook), `test/cors.test.ts` (browser-extension CORS contract).
   The provisioning script also has a one-click dashboard port ("Auto-
   configure on Cloudflare" on the custom-domain DNS page) —
-  `src/lib/cfapi.ts` + the cf-provision branch in
+  `src/lib/cfapi.ts` + `runCfProvision` in
   `src/web/mailbox-domain-pages.ts`; guards, rate limit and token-scoping
-  requirements in `docs/DOMAINS.md` §3. It runs under **either** of two
-  credentials:
-  - the acting user's **Cloudflare OAuth grant** (preferred) — self-managed
-    OAuth, GA 2026-06-03: `src/lib/cfoauth.ts` (endpoints, PKCE, AES-GCM
-    grant storage in `cf_oauth_token`) + `src/web/cloudflare-pages.ts`
-    (`POST /dashboard/cloudflare/connect`, `GET .../callback`,
-    `POST .../disconnect`, mounted at `/dashboard` in `src/index.ts`) +
-    `templates/dashboard-mailbox/_cloudflare_connect.html`. Secrets:
-    `CF_OAUTH_CLIENT_ID`, `CF_OAUTH_CLIENT_SECRET`, plus `CF_ACCOUNT_ID`
-    (the account hosting this worker — cross-account zones cannot be
-    provisioned) and the optional `CF_OAUTH_SCOPES` override. Requires
-    migration `0004_cf_oauth.sql`. Not registered on the live deployment yet;
-    registration walkthrough in `docs/DOMAINS.md` §3.1–§3.4.
-  - the operator-wide `CF_API_TOKEN` secret (fallback, unchanged).
+  requirements in `docs/DOMAINS.md` §3. **Rewritten 2026-07-26 to a ONE-SHOT
+  authorization that is never stored** (the maintainer's requirement: no
+  long-lived tokens that can change other people's domains). Three routes,
+  picked by `cfProvisionMode()`, all going through the one guarded run — and
+  **both credentialed routes show the confirmation page first**: the button
+  POSTs and redirects (PRG) to `GET /dashboard/domains/<id>/cf-confirm`, which
+  renders the exact record diff (from `cfProvisionPlan`, the same object the
+  run writes from) and mints a ONE-TIME nonce carrying the target domain id
+  and a hash of the displayed plan. Every hand-off resolves the domain from
+  that nonce — no endpoint takes a `custom_domain_id` from the client, a
+  confirmation is single-use, and a plan that changed since it was shown sends
+  the user back to a fresh diff (`takeCfConfirmation`).
+  - the operator-wide `CF_API_TOKEN` secret — the headless credential, and the
+    one that WINS when both are configured (a delegated authorization only
+    works for someone who can sign in to the operator's account, so offering
+    it on top of `CF_API_TOKEN` would hide the credential that works). The
+    confirmed POST (`form-name=cf-provision-confirmed`) runs it.
+  - **one-shot user authorization**, offered only when there is no
+    `CF_API_TOKEN` *and* `CF_ACCOUNT_ID` is pinned (unpinned, a delegated run
+    could enable+lock Cloudflare MX on a zone whose catch-all PUT must then
+    fail): confirmation page → `POST /dashboard/cloudflare/start` (CSRF +
+    nonce; re-runs the mode/SL-subdomain/collision gates) → Cloudflare
+    authorize with `prompt=consent` and NO `offline_access` → `GET
+    /dashboard/cloudflare/callback` takes an atomic D1 claim on the state
+    (KV has no CAS, so two concurrent deliveries of the same callback would
+    otherwise both redeem the code), redeems it,
+    runs the provisioning inline and revokes the token in a `finally`.
+    Nothing reaches D1; `0005_drop_cf_oauth.sql` removed the grant table and
+    with it saveGrant/refresh/AES-GCM/connect/disconnect.
+    `src/lib/cfoauth.ts` + `src/web/cloudflare-pages.ts` (mounted at
+    `/dashboard` in `src/index.ts`). Secrets: `CF_OAUTH_CLIENT_ID`,
+    `CF_OAUTH_CLIENT_SECRET`, `CF_ACCOUNT_ID` (the account hosting this
+    worker — cross-account zones cannot be provisioned, so the USER must
+    authorize with that account; the confirmation page says so) and the
+    optional `CF_OAUTH_SCOPES` override (`offline_access` is stripped).
+    Not registered on the live deployment yet; walkthrough in
+    `docs/DOMAINS.md` §3.1–§3.5.
+  - **manual**: the copy-pasteable record table plus a deep link to
+    Cloudflare's own Email Routing onboarding wizard, rendered in ALL modes,
+    so there is always a route needing no credentials. Why not Domain
+    Connect: `docs/DOMAINS.md` §3.5.
 - **Test-env note**: wrangler vars merge into the vitest miniflare env; for
   presence-based flags `""` now means "unset" (`DISABLE_REGISTRATION`,
   `EMAIL_SERVERS_WITH_PRIORITY` are pinned to `""` in vitest.config.ts).
