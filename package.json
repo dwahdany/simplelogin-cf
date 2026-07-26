@@ -11,9 +11,10 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "build:templates": "node scripts/build-templates.mjs",
-    "build:assets": "node scripts/build-assets.mjs",
+    "build:assets": "node scripts/build-assets.mjs && node scripts/check-assets.mjs",
+    "check:assets": "node scripts/check-assets.mjs",
     "pretest": "node scripts/build-templates.mjs",
-    "predeploy": "node scripts/build-templates.mjs && node scripts/build-assets.mjs",
+    "predeploy": "node scripts/build-templates.mjs && node scripts/build-assets.mjs && node scripts/check-assets.mjs",
     "pretypecheck": "node scripts/build-templates.mjs"
   },
   "dependencies": {
@@ -28,10 +29,20 @@
     "@biomejs/biome": "^2.5.2",
     "@cloudflare/vitest-pool-workers": "^0.18.0",
     "@cloudflare/workers-types": "^4.20260702.1",
+    "@sentry/browser": "^5.30.0",
     "@types/nunjucks": "^3.2.6",
+    "bootbox": "^5.5.3",
+    "font-awesome": "^4.7.0",
+    "htmx.org": "^1.9.12",
+    "intro.js": "^2.9.3",
+    "multiple-select": "^1.7.0",
     "nunjucks": "^3.2.4",
+    "parsleyjs": "^2.9.2",
+    "qrious": "^4.0.2",
+    "toastr": "^2.1.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9",
+    "vue": "^2.7.16",
     "wrangler": "^4.107.0"
   }
 }
