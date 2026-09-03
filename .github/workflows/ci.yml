@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Templates are precompiled into src/generated/ (gitignored); the
+      # pretest/pretypecheck hooks build them, and build:assets also runs
+      # check-assets.mjs, which fails if a template references a static file
+      # that would 404 at runtime.
+      - run: npm run build:assets
+      - run: npm run typecheck
+      - run: npx @biomejs/biome check .
+      # The suite runs in real workerd via @cloudflare/vitest-pool-workers and
+      # reads wrangler.example.jsonc, so it needs no secrets and no account.
+      - run: npm test

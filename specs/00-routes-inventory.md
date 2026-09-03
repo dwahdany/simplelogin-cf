@@ -1,6 +1,12 @@
 # 00 — Canonical API Routes Inventory
 
-Source of truth: `app/api/` in the SimpleLogin Flask app (repo root `/Users/dariush/git/personal/simplelogin`).
+> **Reading these specs:** every path below is relative to the upstream
+> SimpleLogin Flask app, <https://github.com/simple-login/app>. Clone it
+> alongside this repo to follow the citations:
+> `git clone https://github.com/simple-login/app ../simplelogin-upstream`
+
+
+Source of truth: `app/api/` in the SimpleLogin Flask app (repo root the upstream Flask app (github.com/simple-login/app)).
 This document inventories **all 52 `@api_bp.route` decorators** (some cover multiple HTTP methods) and specifies, exactly, how the blueprint is registered, how authentication works, and CORS behavior. Per-route request/response schemas are in the per-file specs (01+); this file is the master list.
 
 ---

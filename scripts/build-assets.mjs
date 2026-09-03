@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 /**
- * Copy the Flask app's static assets (repo-root static/) into
- * cloudflare/public/static/ for Workers Assets to serve at /static/*.
+ * Copy static/ into public/static/ for Workers Assets to serve at /static/*.
  * Run before deploy: `npm run build:assets`.
+ *
+ * static/ is vendored from the upstream Flask app (see NOTICE). It is copied
+ * rather than served directly because public/ is the Workers Assets
+ * directory and also receives the front-end vendor libraries below.
  *
  * The Flask app ALSO serves front-end vendor libraries from
  * static/node_modules/, which it populates with its own `npm install` inside
@@ -27,7 +30,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const src = path.join(path.dirname(root), "static");
+const src = path.join(root, "static");
 const dest = path.join(root, "public", "static");
 
 rmSync(dest, { recursive: true, force: true });

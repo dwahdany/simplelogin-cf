@@ -4,3 +4,6 @@ dist/
 .dev.vars
 src/generated/
 public/
+
+# operator-specific deployment config (copy wrangler.example.jsonc)
+wrangler.jsonc

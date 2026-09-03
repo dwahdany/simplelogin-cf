@@ -1,0 +1,40 @@
+SimpleLogin on Cloudflare Workers
+Copyright (C) 2026 the simplelogin-cf contributors
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version. See LICENSE.
+
+--------------------------------------------------------------------------
+DERIVATION AND ATTRIBUTION
+--------------------------------------------------------------------------
+
+This project is a derivative work of SimpleLogin:
+
+    https://github.com/simple-login/app
+    Copyright (C) SimpleLogin / Proton AG
+    Licensed under the GNU Affero General Public License v3.0
+
+It is a ground-up reimplementation for the Cloudflare stack (TypeScript on
+Workers + D1 + KV + Email Routing/Sending) rather than a copy of the Python
+source, but it is a derivative work in substance and is therefore released
+under the same licence:
+
+  * Its compatibility contract was extracted from the upstream source. The
+    files under specs/ cite upstream paths and line numbers throughout, and
+    source comments cite the upstream function they port.
+  * It deliberately reproduces upstream's HTTP API field-for-field and
+    status-code-for-status-code, so that unmodified SimpleLogin client
+    applications work against it.
+  * The server-rendered dashboard templates under templates/ are ports of
+    upstream's Jinja templates (converted to nunjucks).
+  * static/ is vendored from upstream's static/ directory largely unchanged,
+    and retains the licences of its own bundled third-party components.
+
+Front-end vendor libraries are installed from npm at build time (see
+package.json and scripts/build-assets.mjs) and remain under their own
+licences.
+
+SimpleLogin is a trademark of its respective owners. This project is not
+affiliated with, endorsed by, or supported by SimpleLogin or Proton AG.

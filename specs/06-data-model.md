@@ -1,9 +1,9 @@
 # 06 — Data Model Spec (SimpleLogin → Cloudflare D1)
 
-Source of truth: `/Users/dariush/git/personal/simplelogin/app/models.py` (4198 lines),
-`/Users/dariush/git/personal/simplelogin/app/pw_models.py` (User password columns),
-`/Users/dariush/git/personal/simplelogin/app/utils.py` (random string helpers),
-`/Users/dariush/git/personal/simplelogin/app/email_utils.py` (reverse-alias generation).
+Source of truth: `app/models.py` (4198 lines),
+`app/pw_models.py` (User password columns),
+`app/utils.py` (random string helpers),
+`app/email_utils.py` (reverse-alias generation).
 
 This document lists the complete schema for every table needed by the REST API and the
 email-forwarding pipeline, followed by a full SQLite (Cloudflare D1) DDL translation.

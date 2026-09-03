@@ -1,50 +1,30 @@
-# Handover: SimpleLogin → Cloudflare Workers rewrite
+# Architecture notes: SimpleLogin on Cloudflare Workers
 
-**Goal:** Rebuild SimpleLogin as a Cloudflare-native serverless app (Workers +
-D1 + KV + Email Routing/Sending) with a **field/status-code-exact compatible
-API** so existing client apps (mobile apps, browser extensions) keep working
-unchanged.
+**Goal:** run SimpleLogin as a Cloudflare-native serverless app (Workers + D1
++ KV + Email Routing/Sending) with a **field/status-code-exact compatible
+API**, so unmodified SimpleLogin clients (mobile apps, browser extensions)
+work against it.
 
-**Branch:** `cloudflare-rewrite` (off `master`), everything under `cloudflare/`.
-**Status: functionally complete, deployed, and live.** 888 tests green in real
-workerd; `tsc` and Biome clean. All three layers (API, email worker, web
-dashboard) have been through an adversarial line-by-line diff against the
-original Flask source. A 2026-07-26 fix program added the missing operational
-half: a cron-driven D1 job runner (batch import now actually imports;
-mailbox/domain/account deletion complete; onboarding + user-report emails),
-DSN/bounce detection under the no-VERP model, transient-send retry, FWD-5
-signed unsubscribe proxy, PGP (openpgp.js), Email-Routing-aware custom-domain
-verification, and domain provisioning/backup tooling (see §4a).
+This is the engineering companion to the README: what the port consists of,
+which upstream behaviours it reproduces exactly, and — most importantly —
+where it deliberately diverges because the platform forces it to. Read §0
+before touching `src/email.ts`.
 
-## 0. Live deployment (as of 2026-07-06)
+**Status:** functionally complete and running in production by its author.
+964 tests green in real workerd; `tsc` and Biome clean. All three layers
+(API, email worker, web dashboard) have been through an adversarial
+line-by-line diff against the upstream Flask source, followed by a fix
+program adding the operational half: a cron-driven D1 job runner (alias
+batch import, mailbox/domain/account deletion, onboarding and user-report
+emails), DSN/bounce detection under the no-VERP model, transient-send retry,
+proxied unsubscribe, PGP, Email-Routing-aware custom-domain verification, and
+domain provisioning tooling (see §4a).
 
-- **URL:** https://simplelogin.example.workers.dev (Cloudflare account
-  `you@example.com`, worker name `simplelogin`).
-- **Alias/email domain:** `mail.example.com` — a **subdomain** of the
-  `example.com` zone. Email Routing + Email Sending are enabled on the
-  **subdomain only**; the apex `example.com` MX still points at Protonmail and
-  must not be touched. A zone catch-all rule routes `*@mail.example.com` to
-  the worker's `email` handler.
-- **Plan:** Workers **Paid** (enables Email Sending, higher CPU/D1 limits).
-- **Provisioned resources** (ids live in `wrangler.jsonc`): D1 `simplelogin`
-  (`2cafc7a6-…`), KV (`fcbb3c9c-…`), `send_email` binding `SEND_EMAIL`, static
-  `ASSETS`. Secrets set via `wrangler secret put`: `FLASK_SECRET`,
-  `DKIM_PRIVATE_KEY` (RSA-2048; public key published at
-  `dkim._domainkey.mail.example.com`).
-- **Verified end-to-end with real mail:** register → activation code → login →
-  API key → alias creation → inbound forward (reverse-alias From, Cloudflare
-  DKIM, DMARC pass) → reply through the reverse alias delivered to the contact.
-- **Test account:** `you@example.com` (change the password via the
-  dashboard). Test alias created: `slug_eagle137@mail.example.com`. The
-  account has `lifetime = 1` set directly in remote D1 (2026-07-26) — that is
-  the self-hosted "become premium" path (no billing backend is wired).
-- **Registration is closed** (`DISABLE_REGISTRATION` var) and **Workers Logs
-  observability is enabled** — both in `wrangler.jsonc` since 2026-07-26.
-- **Cron triggers**: `* * * * *` drains the D1 `job` queue (src/jobs/), and
-  `17 3 * * *` runs daily maintenance (trash purge, rate_limit/notification/
-  job-row trims). Wired via `scheduled()` in `src/index.ts`.
+> Deployment specifics (URLs, resource ids, account) are intentionally not in
+> this repo — see the README for setup and `wrangler.example.jsonc` for the
+> configuration surface.
 
-### Email delivery model — READ THIS before touching `src/email.ts`
+## 0. Platform constraints that shape the design
 
 Cloudflare's platform imposes two constraints that shape the whole email path:
 1. The `send_email` binding **requires the SMTP envelope sender to equal the
@@ -65,7 +45,7 @@ Cloudflare's platform imposes two constraints that shape the whole email path:
 - `passthrough` — `message.forward()` as-is (original sender in From, Reply
   goes to the sender); the free-tier fallback.
 
-## 1. The compatibility contract: `cloudflare/specs/`
+## 1. The compatibility contract: `specs/`
 
 Extracted from the Flask source by parallel readers; the **source of truth**.
 `specs/00`–`08` cover the API/data model/email pipeline/config; `specs/web/00`–
@@ -124,8 +104,8 @@ Cloudflare DKIM instead of Postfix; `ts_vector` search → LIKE approximation.
 ## 3. Working on this codebase
 
 - Node is NOT on PATH: prefix commands with `nix-shell -p nodejs_22 --run '...'`
-  from `cloudflare/`. (Deploy/DNS work used `nvm use 22` + `npx wrangler`.)
-- `npm test` (765 tests, workerd via `@cloudflare/vitest-pool-workers` 0.18 /
+  from the repo root, or use any Node 22 (`nvm use 22`).
+- `npm test` (964 tests, workerd via `@cloudflare/vitest-pool-workers` 0.18 /
   vitest 4 — config uses the `cloudflareTest()` vite plugin; `pretest` builds
   templates). `npx tsc --noEmit`. `npx @biomejs/biome check --write .`.
 - Test-time env vars are pinned in `vitest.config.ts` (fixtures assert
@@ -245,7 +225,7 @@ Cloudflare DKIM instead of Postfix; `ts_vector` search → LIKE approximation.
 
 ## 5. Redeploy / rotate runbook
 
-From `cloudflare/` with `nvm use 22` (or the equivalent Node 22):
+With Node 22 on PATH, from the repo root:
 - Deploy: `npm run deploy` (predeploy builds templates + assets).
 - Migrations: `npx wrangler d1 migrations apply simplelogin --remote`.
 - Secrets: `npx wrangler secret put FLASK_SECRET` / `DKIM_PRIVATE_KEY`.
@@ -259,7 +239,7 @@ From `cloudflare/` with `nvm use 22` (or the equivalent Node 22):
   DNS or email settings — use a scoped API token.
 - Backups: `scripts/backup-d1.sh` (dated `wrangler d1 export`); KV `file:*`
   blobs (batch-import uploads) are outside D1 backups.
-- Full setup notes also in `cloudflare/README.md`.
+- Full setup notes also in `README.md`.
 
 ## 6. Original Flask reference points
 

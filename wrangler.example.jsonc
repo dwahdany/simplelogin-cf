@@ -1,0 +1,79 @@
+{
+  // Copy to wrangler.jsonc and fill in your own values:
+  //   cp wrangler.example.jsonc wrangler.jsonc
+  // wrangler.jsonc is gitignored — it holds YOUR resource ids and domains.
+  // The test suite reads THIS file (vitest.config.ts) so it runs without one.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "simplelogin",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "simplelogin",
+      // npx wrangler d1 create simplelogin
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      // npx wrangler kv namespace create SESSIONS
+      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+    }
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "send_email": [
+    {
+      "name": "SEND_EMAIL"
+    }
+  ],
+  // Per-minute tick drains the D1 `job` queue (batch import, deletions,
+  // onboarding emails); the 03:17 tick runs daily maintenance (trash purge,
+  // table trims). Must stay in sync with MAINTENANCE_CRON in src/index.ts.
+  "triggers": {
+    "crons": ["* * * * *", "17 3 * * *"]
+  },
+  // Workers Logs: makes forward/reply failures queryable in the dashboard
+  // instead of tail-only.
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    // The domain aliases are created on. Must have Email Routing enabled with
+    // a catch-all route to this worker, and Email Sending onboarded (see
+    // docs/DOMAINS.md).
+    "EMAIL_DOMAIN": "mail.example.com",
+    "ALIAS_DOMAINS": "mail.example.com",
+    "PREMIUM_ALIAS_DOMAINS": "",
+    // Public URL of this worker — used in emails and as the OAuth redirect base.
+    "URL": "https://simplelogin.<your-subdomain>.workers.dev",
+    "MAX_NB_EMAIL_FREE_PLAN": "3",
+    // Presence-based (any value, even "0", closes signups). Recommended for a
+    // single-operator instance: remove the line to allow public registration.
+    "DISABLE_REGISTRATION": "1",
+    // Cloudflare Email Routing MX set — what a custom domain's zone shows
+    // once Email Routing is enabled. Priorities vary per zone; the MX check
+    // accepts any priority arrangement of these hosts.
+    "EMAIL_SERVERS_WITH_PRIORITY": "10 route1.mx.cloudflare.net.,20 route2.mx.cloudflare.net.,30 route3.mx.cloudflare.net.",
+    // "rewrite" = full parity (From = reverse alias) via SEND_EMAIL; requires
+    // the domain onboarded onto Email Sending or strict receivers reject the
+    // mail. "passthrough" = message.forward() as-is (free-tier fallback).
+    "FORWARD_MODE": "rewrite"
+    // Optional, for one-click domain provisioning (docs/DOMAINS.md §3):
+    //   CF_ACCOUNT_ID  — account hosting this worker; pins provisioning to it
+    //   CF_WORKER_NAME — defaults to "simplelogin"
+    //   CF_OAUTH_SCOPES — override the requested OAuth scope ids
+  }
+  // Secrets (never in this file — use `npx wrangler secret put NAME`):
+  //   FLASK_SECRET          required; signing key
+  //   DKIM_PRIVATE_KEY      optional; RSA-2048 PKCS#8 PEM
+  //   CF_API_TOKEN          optional; headless domain provisioning
+  //   CF_OAUTH_CLIENT_ID    optional; one-shot "Auto-configure" flow
+  //   CF_OAUTH_CLIENT_SECRET
+}

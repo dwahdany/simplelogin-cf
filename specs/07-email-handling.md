@@ -1,12 +1,12 @@
 # 07 — Email Handling (SMTP forward/reply pipeline)
 
 Source files:
-- `/Users/dariush/git/personal/simplelogin/email_handler.py` (aiosmtpd handler, no HTTP routes)
-- `/Users/dariush/git/personal/simplelogin/app/email_utils.py`
-- `/Users/dariush/git/personal/simplelogin/app/contact_utils.py`
-- `/Users/dariush/git/personal/simplelogin/app/alias_utils.py`
-- `/Users/dariush/git/personal/simplelogin/app/mailbox_utils.py`
-- `/Users/dariush/git/personal/simplelogin/app/models.py`
+- `email_handler.py` (aiosmtpd handler, no HTTP routes)
+- `app/email_utils.py`
+- `app/contact_utils.py`
+- `app/alias_utils.py`
+- `app/mailbox_utils.py`
+- `app/models.py`
 
 This component is **not a Flask route**. It is an SMTP server (aiosmtpd `Controller`, default port `20381`, size limit `config.SMTP_SIZE_LIMIT`) whose `MailHandler.handle_DATA` parses the raw message (`email.message_from_bytes(envelope.original_content)`) and returns an SMTP status **string** (e.g. `"250 Message accepted for delivery"`). On Cloudflare, this maps to an Email Workers `email()` handler; the SMTP status strings map to accept/reject decisions.
 

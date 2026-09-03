@@ -285,7 +285,7 @@ role **Super Administrator**, **Administrator** or **OAuth Client Write**.
      server-side Worker, i.e. a confidential client. (PKCE S256 is sent
      anyway.)
    - **Redirect URL**: `<URL var>/dashboard/cloudflare/callback`, e.g.
-     `https://simplelogin.example.workers.dev/dashboard/cloudflare/callback`.
+     `https://simplelogin.<your-subdomain>.workers.dev/dashboard/cloudflare/callback`.
      It is derived from the `URL` var, never from the request Host header, so
      it must match that var exactly.
    - **Scopes**: see §3.3 — and **not** `offline_access`.

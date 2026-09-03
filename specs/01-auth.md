@@ -1,8 +1,8 @@
 # Spec 01 — Authentication API
 
 Source files:
-- `/Users/dariush/git/personal/simplelogin/app/api/views/auth.py`
-- `/Users/dariush/git/personal/simplelogin/app/api/views/auth_mfa.py`
+- `app/api/views/auth.py`
+- `app/api/views/auth_mfa.py`
 
 Supporting code referenced (behavior inlined below):
 - `app/pw_models.py` (bcrypt password hashing)
