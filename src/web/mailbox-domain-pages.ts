@@ -25,8 +25,11 @@
  *   the MX check compares host SETS ignoring priorities (see
  *   isMxHostSetEquivalent), the expected SPF include is Cloudflare's
  *   _spf.mx.cloudflare.net instead of Flask's {EMAIL_DOMAIN} (see
- *   SPF_INCLUDE_DOMAIN), and DKIM verifies on the primary dkim._domainkey
- *   CNAME alone (see the check-dkim branch). Rationale at each site.
+ *   SPF_INCLUDE_DOMAIN), DKIM is not the user's job at all (Cloudflare Email
+ *   Sending signs custom domains — the section is informational and there is
+ *   no check-dkim branch), and the DMARC check accepts any valid policy
+ *   because Email Routing publishes its own (see hasDmarcPolicy). Rationale
+ *   at each site.
  */
 
 import type { Context, MiddlewareHandler } from "hono";
@@ -818,7 +821,7 @@ async function getCnameRecord(name: string): Promise<string | null> {
 
 /**
  * DNS client used by the custom-domain DNS checks (route 7 check-ownership /
- * check-mx / check-spf / check-dkim / check-dmarc and the cf-provision
+ * check-mx / check-spf / check-dmarc and the cf-provision
  * re-verification), with the same test-seam pattern as setMailboxDnsClient
  * below. Production resolves over DoH; tests substitute an in-memory view.
  */
@@ -938,11 +941,27 @@ export function isMxHostSetEquivalent(
   return true;
 }
 
-const DKIM_PREFIXES = [
-  "dkim._domainkey",
-  "dkim02._domainkey",
-  "dkim03._domainkey",
-];
+/**
+ * Whether a _dmarc TXT record set constitutes a working DMARC policy.
+ *
+ * Upstream compares against config.DMARC_RECORD verbatim. That is wrong here:
+ * enabling Email Routing makes CLOUDFLARE publish its own DMARC record
+ * (observed on a provisioned zone: `v=DMARC1; p=reject;` — stricter than our
+ * recommended `p=quarantine`), and our own provisioning creates the record
+ * only if absent, so the exact-match check then reported a correctly
+ * configured domain as "The TXT record is not correctly set".
+ *
+ * So accept ANY syntactically valid DMARC policy: `v=DMARC1` (case-insensitive
+ * per RFC 7489 §6.4, which also allows whitespace around the tag) plus a `p=`
+ * policy tag. The recommended value is still shown on the page.
+ */
+export function hasDmarcPolicy(txt: string[]): boolean {
+  return txt.some((raw) => {
+    const r = raw.trim();
+    if (!/^v\s*=\s*DMARC1\s*;/i.test(r)) return false;
+    return /(^|;)\s*p\s*=\s*(none|quarantine|reject)\s*(;|$)/i.test(r);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // forms rendered by the templates
@@ -2804,7 +2823,7 @@ export async function runCfProvision(
     done.push("DMARC already verified");
   } else {
     const txt = await domainDnsClient.getTxtRecords(`_dmarc.${cd.domain}`);
-    if (txt.includes(DMARC_RECORD)) {
+    if (hasDmarcPolicy(txt)) {
       await db
         .prepare(
           "UPDATE custom_domain SET dmarc_verified = 1, updated_at = ?1 WHERE id = ?2",
@@ -2842,8 +2861,6 @@ interface DnsPageState {
   mx_errors: string[];
   spf_ok: boolean;
   spf_errors: string[];
-  dkim_ok: boolean;
-  dkim_errors: Array<{ custom_record: string; retrieved_cname: string }>;
   dmarc_ok: boolean;
   dmarc_errors: string[];
 }
@@ -2855,8 +2872,6 @@ const dnsStateDefaults = (): DnsPageState => ({
   mx_errors: [],
   spf_ok: true,
   spf_errors: [],
-  dkim_ok: true,
-  dkim_errors: [],
   dmarc_ok: true,
   dmarc_errors: [],
 });
@@ -2899,10 +2914,6 @@ async function renderDnsPage(
       },
       expected_mx_records: mx,
       spf_record: `v=spf1 include:${SPF_INCLUDE_DOMAIN} ~all`,
-      dkim_records: DKIM_PREFIXES.map((prefix) => ({
-        domain: prefix,
-        recommended: `${prefix}.${envx.EMAIL_DOMAIN}`,
-      })),
       dmarc_record: DMARC_RECORD,
       // The auto-configure card: `cf_mode` picks the button (or none), while
       // `cf_plan` feeds the MANUAL panel, which renders in every mode so
@@ -3097,65 +3108,21 @@ webMailboxDomainPagesRoutes.on(
         state.spf_ok = false;
         const ownershipRecord = `sl-verification=${cd.ownership_txt_token}`;
         state.spf_errors = txt.filter((r) => r !== ownershipRecord);
-      } else if (formName === "check-dkim") {
-        const errors: Array<{
-          custom_record: string;
-          retrieved_cname: string;
-        }> = [];
-        for (const prefix of DKIM_PREFIXES) {
-          const host = `${prefix}.${cd.domain}`;
-          const expected = `${prefix}.${envx.EMAIL_DOMAIN}`;
-          const cname = await domainDnsClient.getCnameRecord(host);
-          if (cname !== expected) {
-            errors.push({
-              custom_record: host,
-              retrieved_cname: cname ?? "empty",
-            });
-          }
-        }
-        if (errors.length === 0) {
-          await db
-            .prepare(
-              "UPDATE custom_domain SET dkim_verified = 1, updated_at = ?1 WHERE id = ?2",
-            )
-            .bind(nowStr(), cd.id)
-            .run();
-          await flash(c, "DKIM is setup correctly.", "success");
-          return c.redirect(
-            urlFor("dashboard.domain_detail_dns", { custom_domain_id: cd.id }),
-            302,
-          );
-        }
-        // DELIBERATE DEVIATION from Flask (custom_domain_validation.py
-        // L170-192: a NEW verification needs all three CNAMEs; only domains
-        // that are already dkim_verified keep the flag when just
-        // dkim._domainkey is still correct — the "legacy grace"): this worker
-        // only DKIM-signs with the single EMAIL_DOMAIN key, and custom-domain
-        // DKIM actually comes from Cloudflare Email Sending onboarding, so
-        // dkim02/dkim03 are pure legacy here. The primary record alone
-        // verifies (first time too), while missing dkim02/03 records are
-        // still reported below like Flask's grace path does.
-        const mainOk = !errors.some(
-          (e) => e.custom_record === `dkim._domainkey.${cd.domain}`,
-        );
-        const newVerified = mainOk ? 1 : 0;
-        await db
-          .prepare(
-            "UPDATE custom_domain SET dkim_verified = ?1, updated_at = ?2 WHERE id = ?3",
-          )
-          .bind(newVerified, nowStr(), cd.id)
-          .run();
-        cd = { ...cd, dkim_verified: newVerified };
-        await flash(
-          c,
-          "DKIM: the CNAME record is not correctly set",
-          "warning",
-        );
-        state.dkim_ok = false;
-        state.dkim_errors = errors;
+        // NO check-dkim BRANCH. Upstream verifies dkim*._domainkey CNAMEs
+        // pointing at SimpleLogin's own signing domain, because upstream's
+        // Postfix signs every domain with one key. Here dkimSignOutbound
+        // (src/lib/dkim.ts) signs ONLY for EMAIL_DOMAIN / ALIAS_DOMAINS, so a
+        // custom domain's mail is never signed with our key — its DKIM comes
+        // from Cloudflare Email Sending, which manages its own keys and
+        // records. Asking for those CNAMEs published our public key on the
+        // user's domain where it signed nothing, then reported the correctly
+        // absent records as a DNS error. The section is informational now
+        // (templates/dashboard-mailbox/domain_detail_dns.html) and the
+        // dkim_verified column is left untouched — nothing in the mail path
+        // reads it.
       } else if (formName === "check-dmarc") {
         const txt = await domainDnsClient.getTxtRecords(`_dmarc.${cd.domain}`);
-        if (txt.includes(DMARC_RECORD)) {
+        if (hasDmarcPolicy(txt)) {
           await db
             .prepare(
               "UPDATE custom_domain SET dmarc_verified = 1, updated_at = ?1 WHERE id = ?2",

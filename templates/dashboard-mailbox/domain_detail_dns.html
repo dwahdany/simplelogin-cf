@@ -276,70 +276,34 @@
         {% endif %}
       </div>
       <hr />
+      {# DKIM needs NOTHING from the user on this deployment, so this
+         section asks for nothing and can never "fail".
+
+         Upstream SimpleLogin runs its own Postfix and signs every domain's
+         outbound mail with ONE key, so a custom domain CNAMEs its
+         dkim._domainkey at SimpleLogin's. That model does not exist here:
+         src/lib/dkim.ts dkimSignOutbound signs only when the From domain is
+         EMAIL_DOMAIN or an ALIAS_DOMAINS member (isOwnEmailDomain), so a
+         custom domain's mail is NEVER signed with our key. Its DKIM comes
+         from Cloudflare Email Sending, which signs with Cloudflare's own
+         per-domain keys once the operator onboards the domain — and adds
+         whatever records that needs itself.
+
+         So the old CNAME table asked the user to publish OUR public key for
+         THEIR domain, where it would sign nothing, and then flagged the
+         (correctly) absent records as "Your DNS is not correctly set".
+         dkim_verified is informational only — nothing in the mail path reads
+         it (grep: only src/lib/rows.ts). #}
       <div id="dkim-form">
-        <div class="font-weight-bold">
-          3. DKIM (Optional)
-          {% if custom_domain.dkim_verified %}
-            <span class="cursor" data-toggle="tooltip" data-original-title="DKIM Verified">✅</span>
-          {% else %}
-            <span class="cursor" data-toggle="tooltip" data-original-title="DKIM Not Verified">🚫</span>
-          {% endif %}
+        <div class="font-weight-bold">3. DKIM</div>
+        <div class="alert alert-info mb-0">
+          Nothing to do here. On this deployment DKIM signatures for your
+          domain are produced by <em>Cloudflare Email Sending</em>, which
+          manages its own signing keys and DNS records once the operator
+          onboards the domain (<code>scripts/provision-domain.mjs</code>
+          prints that step). There are no DKIM records for you to add, and
+          none are checked.
         </div>
-        <div class="mb-2">Add the following CNAME DNS records to your domain.</div>
-        {# Deviation from upstream: only dkim._domainkey is required here —
-           custom-domain DKIM signatures come from Cloudflare Email Sending
-           onboarding, not from this worker's single EMAIL_DOMAIN key. #}
-        <div class="alert alert-info">
-          On this deployment, DKIM signatures for your domain are added by
-          <em>Cloudflare Email Sending</em> once the domain is onboarded by the
-          operator (see <code>scripts/provision-domain.mjs</code>). Only the
-          first record (<em>dkim._domainkey</em>) is required for verification;
-          <em>dkim02</em>/<em>dkim03</em> are legacy records and optional.
-        </div>
-        {% for dkim in dkim_records %}
-          <div class="mb-2 p-3 dns-record">
-            Record: CNAME
-            <br />
-            Domain: <em data-toggle="tooltip"
-                        title="Click to copy"
-                        class="clipboard"
-                        data-clipboard-text="{{ dkim.domain }}">{{ dkim.domain }}</em>
-            <br />
-            Value:
-            <em data-toggle="tooltip"
-                title="Click to copy"
-                class="clipboard"
-                data-clipboard-text="{{ dkim.recommended }}."
-                style="overflow-wrap: break-word">{{ dkim.recommended }}.</em>
-          </div>
-        {% endfor %}
-        <form method="post" action="#dkim-form">
-          {{ csrf_form.csrf_token }}
-          <input type="hidden" name="form-name" value="check-dkim">
-          {% if custom_domain.dkim_verified %}
-            <button type="submit" class="btn btn-outline-primary">Re-verify</button>
-          {% else %}
-            <button type="submit" class="btn btn-primary">Verify</button>
-          {% endif %}
-        </form>
-        {% if not dkim_ok %}
-          <div class="text-danger mt-4">
-            <p>Your DNS is not correctly set.</p>
-            <ul>
-              {% for e in dkim_errors %}
-                <li>
-                  The CNAME record we obtain for <em>{{ e.custom_record }}</em> is {{ e.retrieved_cname }}
-                </li>
-              {% endfor %}
-            </ul>
-            {% if custom_domain.dkim_verified %}
-              Without DKIM setup, emails you sent from your alias might end up in Spam/Junk folder.
-            {% endif %}
-          </div>
-          {% if custom_domain.dkim_verified %}
-            <div class="text-danger mt-4">DKIM is still enabled. Please update your DKIM settings with all CNAME records</div>
-          {% endif %}
-        {% endif %}
       </div>
       <hr />
       <div id="dmarc-form">

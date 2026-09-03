@@ -14,6 +14,7 @@ import { createSession } from "../src/lib/session";
 import type { WebEnv } from "../src/lib/web/webauth";
 import {
   expectedMxRecords,
+  hasDmarcPolicy,
   isMxHostSetEquivalent,
   setMailboxDnsClient,
 } from "../src/web/mailbox-domain-pages";
@@ -1133,7 +1134,13 @@ describe("route 7: /dashboard/domains/<id>/dns", () => {
     expect(html).toContain("mx2.sl.example.com.");
     // Cloudflare deviation: the SPF include is Email Sending's, not EMAIL_DOMAIN
     expect(html).toContain("v=spf1 include:_spf.mx.cloudflare.net ~all");
-    expect(html).toContain("dkim._domainkey.sl.example.com");
+    // NO DKIM records are offered: on this deployment Cloudflare Email
+    // Sending signs custom domains, so the section is informational and asks
+    // for nothing (src/web/mailbox-domain-pages.ts, no check-dkim branch).
+    expect(html).not.toContain("dkim._domainkey.sl.example.com");
+    expect(html).not.toContain('value="check-dkim"');
+    expect(html).toContain("Cloudflare Email Sending");
+    // the recommended DMARC value is still shown
     expect(html).toContain("v=DMARC1; p=quarantine; pct=100; adkim=s; aspf=s");
     // Cloudflare Email Routing note on the MX section
     expect(html).toContain("Email Routing");
@@ -2288,5 +2295,48 @@ describe("route 14: /dashboard/refused_email", () => {
     );
     expect(res2.status).toBe(200);
     expect(await res2.text()).toContain("highlight-row");
+  });
+});
+
+describe("hasDmarcPolicy (DMARC check accepts any valid policy)", () => {
+  /**
+   * The exact-match check this replaced reported a correctly configured
+   * domain as broken: enabling Email Routing makes CLOUDFLARE publish its own
+   * DMARC record, observed on a provisioned zone as `v=DMARC1; p=reject;` —
+   * stricter than the value this app recommends, and our provisioning
+   * (create-if-absent) therefore leaves it alone.
+   */
+  it("accepts the record Cloudflare Email Routing actually publishes", () => {
+    expect(hasDmarcPolicy(["v=DMARC1; p=reject;"])).toBe(true);
+  });
+
+  it("accepts this app's recommended record and other valid policies", () => {
+    expect(
+      hasDmarcPolicy(["v=DMARC1; p=quarantine; pct=100; adkim=s; aspf=s"]),
+    ).toBe(true);
+    expect(hasDmarcPolicy(["v=DMARC1; p=none; rua=mailto:a@b.example"])).toBe(
+      true,
+    );
+    // RFC 7489 §6.4: tag names are case-insensitive, whitespace is allowed
+    expect(hasDmarcPolicy([" V=DMARC1 ; P = Reject ; "])).toBe(true);
+  });
+
+  it("ignores unrelated TXT records alongside a real one", () => {
+    expect(hasDmarcPolicy(["sl-verification=abc", "v=DMARC1; p=reject;"])).toBe(
+      true,
+    );
+  });
+
+  it("rejects a missing, malformed or policy-less record", () => {
+    expect(hasDmarcPolicy([])).toBe(false);
+    expect(hasDmarcPolicy(["v=spf1 include:_spf.mx.cloudflare.net ~all"])).toBe(
+      false,
+    );
+    // no p= tag: not an enforceable policy
+    expect(hasDmarcPolicy(["v=DMARC1; rua=mailto:a@b.example"])).toBe(false);
+    // p= must be a real policy value
+    expect(hasDmarcPolicy(["v=DMARC1; p=whatever;"])).toBe(false);
+    // DMARC1 must be the first tag
+    expect(hasDmarcPolicy(["p=reject; v=DMARC1;"])).toBe(false);
   });
 });
