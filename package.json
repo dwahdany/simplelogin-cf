@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "description": "SimpleLogin rebuilt as a Cloudflare-native serverless application (Workers + D1 + KV + Email Routing)",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dwahdany/simplelogin-cf.git"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
